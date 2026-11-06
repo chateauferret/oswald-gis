@@ -1,0 +1,8 @@
+{
+    "cmake.generator": "Ninja",
+    "cmake.buildDirectory": "${workspaceFolder}/build/ninja",
+    "git.repositoryScanMaxDepth": 0,
+    "git.repositoryScanIgnoredFolders": [
+        "build"
+    ]
+}

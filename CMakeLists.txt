@@ -1,0 +1,143 @@
+cmake_minimum_required(VERSION 3.20)
+project(oswald_gis LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(FetchContent)
+
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG 3.4
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(glfw)
+
+FetchContent_Declare(
+    glad
+    GIT_REPOSITORY https://github.com/Dav1dde/glad.git
+    GIT_TAG v2.0.8
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR cmake
+)
+FetchContent_MakeAvailable(glad)
+glad_add_library(glad_gl_core_45 STATIC REPRODUCIBLE LOADER API gl:core=4.5)
+
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG 1.0.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(glm)
+
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.90.4
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
+add_library(imgui_lib STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(imgui_lib PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui_lib PUBLIC glfw)
+
+FetchContent_Declare(
+    qhull
+    GIT_REPOSITORY https://github.com/qhull/qhull.git
+    GIT_TAG v8.0.2
+    GIT_SHALLOW TRUE
+)
+function(oswald_fetch_qhull)
+    # Qhull 8.0.2 predates CMake 4's removal of pre-3.5 policy compatibility.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0 AND
+       (NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.5))
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    endif()
+    FetchContent_MakeAvailable(qhull)
+    # Only build linked Qhull targets, not its tools or pre-C++20 C++ wrapper.
+    set_property(DIRECTORY "${qhull_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+    target_include_directories(qhullstatic_r INTERFACE "$<BUILD_INTERFACE:${qhull_SOURCE_DIR}/src>")
+endfunction()
+oswald_fetch_qhull()
+
+set(NANOFLANN_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(NANOFLANN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# Qhull owns the uninstall target; nanoflann attaches its own cleanup to it.
+set(MASTER_PROJECT_HAS_TARGET_UNINSTALL ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    nanoflann
+    GIT_REPOSITORY https://github.com/jlblancoc/nanoflann.git
+    GIT_TAG v1.5.5
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(nanoflann)
+
+find_package(OpenGL REQUIRED)
+
+add_library(oswald_model STATIC src/SphericalGrid.cpp)
+target_include_directories(oswald_model PUBLIC include)
+target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r)
+
+add_library(oswald_view STATIC src/ColorMap.cpp src/GlobeRenderer.cpp)
+target_include_directories(oswald_view PUBLIC include)
+target_link_libraries(oswald_view PUBLIC oswald_model glad_gl_core_45)
+
+set(OSWALD_RESOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/resources")
+foreach(resource shaders/globe.vert shaders/globe.frag assets/colormaps/default.map)
+    configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
+endforeach()
+
+add_executable(oswald_gis src/main.cpp)
+target_compile_definitions(oswald_gis PRIVATE
+    GLFW_INCLUDE_NONE
+    OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
+)
+target_link_libraries(oswald_gis PRIVATE
+    oswald_view
+    oswald_model
+    glfw
+    glad_gl_core_45
+    glm::glm
+    imgui_lib
+    nanoflann::nanoflann
+    OpenGL::GL
+)
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Threads REQUIRED)
+    add_executable(spherical_grid_tests tests/SphericalGridTests.cpp)
+    target_link_libraries(spherical_grid_tests PRIVATE oswald_model Threads::Threads)
+    add_test(NAME spherical_grid COMMAND spherical_grid_tests)
+    add_test(NAME spherical_grid_scale COMMAND spherical_grid_tests --scale)
+    set_tests_properties(spherical_grid_scale PROPERTIES LABELS scale TIMEOUT 180)
+
+    add_executable(globe_renderer_tests tests/GlobeRendererTests.cpp)
+    target_link_libraries(globe_renderer_tests PRIVATE oswald_view glfw)
+    target_compile_definitions(globe_renderer_tests PRIVATE
+        GLFW_INCLUDE_NONE
+        OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
+    )
+    add_test(NAME color_map COMMAND globe_renderer_tests)
+    add_test(NAME globe_renderer COMMAND globe_renderer_tests --gpu)
+    set_tests_properties(globe_renderer PROPERTIES LABELS gpu TIMEOUT 60)
+endif()

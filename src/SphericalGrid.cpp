@@ -186,6 +186,24 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options)
     tree_.buildIndex();
 }
 
+SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source,
+                                             std::span<const float> elevations)
+    : options_(source.options_), vertices_(source.vertices_), halfEdges_(source.halfEdges_),
+      triangleIndices_(source.triangleIndices_), adaptor_{vertices_},
+      tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
+          10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+    if (elevations.size() != vertices_.size()) {
+        throw std::invalid_argument("Elevation count must match the grid vertex count.");
+    }
+    for (std::size_t i = 0; i < elevations.size(); ++i) {
+        if (!std::isfinite(elevations[i]) || elevations[i] < -32767.0F || elevations[i] > 32767.0F) {
+            throw std::invalid_argument("Elevations must be finite and in the range [-32767, 32767].");
+        }
+        vertices_[i].elevation = elevations[i];
+    }
+    tree_.buildIndex();
+}
+
 std::size_t SphericalGridSnapshot::FindNearest(glm::dvec3 direction) const {
     const glm::vec3 query(unitDirection(direction));
     std::size_t index = 0;
@@ -230,6 +248,11 @@ SphericalFibonacciGrid::SphericalFibonacciGrid(const GridOptions& options) {
 
 void SphericalFibonacciGrid::GenerateGrid(const GridOptions& options) {
     snapshot_.store(std::make_shared<const SphericalGridSnapshot>(options));
+}
+
+void SphericalFibonacciGrid::SetElevations(std::span<const float> elevations) {
+    const auto current = GetSnapshot();
+    snapshot_.store(std::make_shared<const SphericalGridSnapshot>(*current, elevations));
 }
 
 std::shared_ptr<const SphericalGridSnapshot> SphericalFibonacciGrid::GetSnapshot() const {

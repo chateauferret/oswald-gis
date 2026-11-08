@@ -91,11 +91,23 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nanoflann)
 
+FetchContent_Declare(
+    stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG 4e9b368bfc071e97206ea5c6adba68dd0cbf8897
+)
+FetchContent_MakeAvailable(stb)
+
 find_package(OpenGL REQUIRED)
 
-add_library(oswald_model STATIC src/SphericalGrid.cpp)
+add_library(oswald_model STATIC src/SphericalGrid.cpp src/ElevationRaster.cpp)
 target_include_directories(oswald_model PUBLIC include)
+target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
 target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r)
+
+add_library(oswald_controller STATIC src/CameraController.cpp)
+target_include_directories(oswald_controller PUBLIC include)
+target_link_libraries(oswald_controller PUBLIC glm::glm)
 
 add_library(oswald_view STATIC src/ColorMap.cpp src/GlobeRenderer.cpp)
 target_include_directories(oswald_view PUBLIC include)
@@ -106,7 +118,7 @@ foreach(resource shaders/globe.vert shaders/globe.frag assets/colormaps/default.
     configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
 endforeach()
 
-add_executable(oswald_gis src/main.cpp)
+add_executable(oswald_gis src/main.cpp src/UIManager.cpp)
 target_compile_definitions(oswald_gis PRIVATE
     GLFW_INCLUDE_NONE
     OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
@@ -114,6 +126,7 @@ target_compile_definitions(oswald_gis PRIVATE
 target_link_libraries(oswald_gis PRIVATE
     oswald_view
     oswald_model
+    oswald_controller
     glfw
     glad_gl_core_45
     glm::glm
@@ -130,6 +143,14 @@ if(BUILD_TESTING)
     add_test(NAME spherical_grid COMMAND spherical_grid_tests)
     add_test(NAME spherical_grid_scale COMMAND spherical_grid_tests --scale)
     set_tests_properties(spherical_grid_scale PROPERTIES LABELS scale TIMEOUT 180)
+
+    add_executable(camera_controller_tests tests/CameraControllerTests.cpp)
+    target_link_libraries(camera_controller_tests PRIVATE oswald_controller)
+    add_test(NAME camera_controller COMMAND camera_controller_tests)
+
+    add_executable(elevation_raster_tests tests/ElevationRasterTests.cpp)
+    target_link_libraries(elevation_raster_tests PRIVATE oswald_model)
+    add_test(NAME elevation_raster COMMAND elevation_raster_tests)
 
     add_executable(globe_renderer_tests tests/GlobeRendererTests.cpp)
     target_link_libraries(globe_renderer_tests PRIVATE oswald_view glfw)

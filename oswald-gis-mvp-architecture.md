@@ -40,6 +40,7 @@ The software stack integrates industry-standard libraries managed directly via C
 | **User Interface** | Dear ImGui `1.90.4` | Immediate-mode UI layout (`imgui_impl_glfw` + `imgui_impl_opengl3`). |
 | **Spatial Indexing** | `nanoflann 1.5.5` | Header-only 3D k-d tree spatial index over vertex arrays for $O(\log N)$ queries. |
 | **Spherical Triangulation** | Qhull `8.0.2` | Reentrant 3D convex hull, yielding spherical Delaunay triangles for the half-edge graph. |
+| **Raster Decoding** | `stb_image` | Single-header decoding of common equirectangular image formats. |
 
 ### 2.2 VS Code & Copilot Workflow Integration
 
@@ -526,6 +527,27 @@ reported as a test failure, not silently skipped. On headless systems run CPU
 project tests with
 `ctest --test-dir build/ninja -R '^(spherical_grid(_scale)?|color_map)$' --output-on-failure`.
 
+### 10.6 Phase 4 and 5 Verification
+
+`File -> Open Raster...` (or Ctrl+O) opens a path-entry dialog. The selected
+image is decoded with stb_image and resampled to a 2048 x 1024 equirectangular
+luminosity raster. The app maps longitude periodically across the image seam,
+clamps latitude at the poles, bilinearly samples each Fibonacci vertex, and
+maps luminosity to elevations in [-32767, 32767]. Applying new grid settings
+resamples the currently loaded raster onto the regenerated grid. Raster
+elevation replacement publishes a new immutable model snapshot and updates the
+renderer elevation buffer with `glNamedBufferSubData` without re-uploading
+positions or triangle indices.
+
+The CPU-only `elevation_raster` test checks image decoding, 2:1 resampling,
+Rec. 709 luminance, bilinear sampling, seam wrapping, pole clamping, elevation
+ranges, grid population, and snapshot lifetime. The GPU `globe_renderer` test
+also verifies elevation-only buffer updates. Run the CPU checks with:
+
+```bash
+ctest --test-dir build/ninja -R '^(spherical_grid(_scale)?|camera_controller|elevation_raster|color_map)$' --output-on-failure
+```
+
 ---
 
 ## 11. Implementation Roadmap
@@ -534,4 +556,4 @@ project tests with
 2. **Phase 2: Model Implementation**: Implement `SphericalFibonacciGrid` point distribution math, spatial jittering, and half-edge graph structures. Integrate the `nanoflann` 3D k-d tree adaptor.
 3. **Phase 3: Render Viewport & Shaders**: Set up OpenGL DSA buffer lifecycle (`glCreateBuffers`, `glNamedBufferData`), compile the GLSL hypsometric elevation shader pair, and establish orthographic camera projection.
 4. **Phase 4: Controller & UI Interactivity**: Implement pitch-clamped mouse drag rotation, scroll-wheel zoom, double-click raycast re-centering, and the Dear ImGui `File -> Settings...` dialog.
-5. **Phase 5: Raster Ingestion & Verification**: Add equirectangular image loading via `File -> Open...`, map luminosity to elevation range $[-32,767, +32,767]$, and verify raster population on the Fibonacci point cloud.
+5. **Phase 5: Raster Ingestion & Verification**: Decode and resample equirectangular images via `File -> Open Raster...`, map luminosity to elevation range $[-32,767, +32,767]$, and upload sampled elevations to the model and GPU.

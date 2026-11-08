@@ -2,7 +2,13 @@
 
 #include <GLFW/glfw3.h>
 
+#include "CameraController.hpp"
 #include "GlobeRenderer.hpp"
+#include "UIManager.hpp"
+
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
 
 #include <exception>
 #include <iostream>
@@ -20,6 +26,61 @@ void resizeFramebuffer(GLFWwindow*, int width, int height) {
 
 struct GlfwSession {
     ~GlfwSession() { glfwTerminate(); }
+};
+
+CameraController* activeCamera = nullptr;
+
+void mouseButton(GLFWwindow* window, int button, int action, int) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT || activeCamera == nullptr) {
+        return;
+    }
+    double x = 0.0;
+    double y = 0.0;
+    glfwGetCursorPos(window, &x, &y);
+    int width = 0;
+    int height = 0;
+    glfwGetWindowSize(window, &width, &height);
+    const bool captured = ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureMouse;
+    activeCamera->HandleMouseButton(action == GLFW_PRESS, x, y, glfwGetTime(), width, height, captured);
+}
+
+void cursorPosition(GLFWwindow* window, double x, double y) {
+    if (activeCamera == nullptr) {
+        return;
+    }
+    const bool down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    const bool captured = ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureMouse;
+    activeCamera->HandleCursorPosition(x, y, down, captured);
+}
+
+void scroll(GLFWwindow*, double, double yOffset) {
+    if (activeCamera == nullptr) {
+        return;
+    }
+    const bool captured = ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureMouse;
+    activeCamera->HandleScroll(yOffset, captured);
+}
+
+struct ImGuiSession {
+    explicit ImGuiSession(GLFWwindow* window) {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::StyleColorsDark();
+        if (!ImGui_ImplGlfw_InitForOpenGL(window, true)) {
+            ImGui::DestroyContext();
+            throw std::runtime_error("Failed to initialize Dear ImGui GLFW backend.");
+        }
+        if (!ImGui_ImplOpenGL3_Init("#version 450 core")) {
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            throw std::runtime_error("Failed to initialize Dear ImGui OpenGL backend.");
+        }
+    }
+    ~ImGuiSession() {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+    }
 };
 
 } // namespace
@@ -62,6 +123,13 @@ int runApplication() {
     }
 
     glfwSetFramebufferSizeCallback(window.get(), resizeFramebuffer);
+    CameraController camera;
+    activeCamera = &camera;
+    glfwSetMouseButtonCallback(window.get(), mouseButton);
+    glfwSetCursorPosCallback(window.get(), cursorPosition);
+    glfwSetScrollCallback(window.get(), scroll);
+    const ImGuiSession imgui(window.get());
+
     int framebufferWidth = 0;
     int framebufferHeight = 0;
     glfwGetFramebufferSize(window.get(), &framebufferWidth, &framebufferHeight);
@@ -71,17 +139,28 @@ int runApplication() {
     GlobeRenderer renderer(resources / "shaders");
     renderer.UploadGrid(*snapshot);
     renderer.SetColorMap(ColorMap::Load(resources / "assets/colormaps/default.map"));
+    UIManager ui(snapshot->GetOptions());
 
     while (glfwWindowShouldClose(window.get()) == GLFW_FALSE) {
+        glfwPollEvents();
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        if (ui.Render(grid, renderer)) {
+            glfwSetWindowShouldClose(window.get(), GLFW_TRUE);
+        }
+
         glfwGetFramebufferSize(window.get(), &framebufferWidth, &framebufferHeight);
         glClearColor(0.06F, 0.08F, 0.12F, 1.0F);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        renderer.Draw(framebufferWidth, framebufferHeight);
+        renderer.Draw(framebufferWidth, framebufferHeight, camera.GetModelMatrix(), camera.GetZoom());
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window.get());
-        glfwPollEvents();
     }
 
+    activeCamera = nullptr;
     return 0;
 }
 

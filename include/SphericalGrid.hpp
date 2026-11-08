@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 struct GridVertex {
@@ -44,6 +45,8 @@ using KDTree3D = nanoflann::KDTreeSingleIndexAdaptor<
 class SphericalGridSnapshot {
 public:
     explicit SphericalGridSnapshot(const GridOptions& options);
+    SphericalGridSnapshot(const SphericalGridSnapshot& source,
+                          std::span<const float> elevations);
     SphericalGridSnapshot(const SphericalGridSnapshot&) = delete;
     SphericalGridSnapshot& operator=(const SphericalGridSnapshot&) = delete;
     SphericalGridSnapshot(SphericalGridSnapshot&&) = delete;
@@ -71,6 +74,7 @@ class SphericalFibonacciGrid {
 public:
     explicit SphericalFibonacciGrid(const GridOptions& options = {});
     void GenerateGrid(const GridOptions& options);
+    void SetElevations(std::span<const float> elevations);
     std::shared_ptr<const SphericalGridSnapshot> GetSnapshot() const;
 
 private:

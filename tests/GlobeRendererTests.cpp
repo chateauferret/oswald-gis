@@ -180,6 +180,26 @@ void testGpu() {
 
     // Constant-elevation meshes isolate the colour map from elevation interpolation.
     auto vertices = snapshot->GetVertices();
+    auto elevationUpdate = vertices;
+    for (auto& vertex : elevationUpdate) {
+        vertex.elevation = 32767.0F;
+    }
+    renderer.UpdateElevations(elevationUpdate);
+    clear();
+    renderer.Draw(width, height);
+    const auto updatedPixel = pixel(width / 2, height / 2);
+        check(std::abs(static_cast<int>(updatedPixel[0]) - static_cast<int>(center[0])) > 50 &&
+            std::abs(static_cast<int>(updatedPixel[0]) - static_cast<int>(updatedPixel[1])) <= 2 &&
+            std::abs(static_cast<int>(updatedPixel[1]) - static_cast<int>(updatedPixel[2])) <= 6,
+          "Elevation-only GPU subdata update did not change the rendered globe.");
+    renderer.UpdateElevations(snapshot->GetVertices());
+    expectFailure([&] {
+        renderer.UpdateElevations(std::span<const GridVertex>(elevationUpdate).first(
+            elevationUpdate.size() - 1));
+    });
+    elevationUpdate[0].elevation = std::numeric_limits<float>::quiet_NaN();
+    expectFailure([&] { renderer.UpdateElevations(elevationUpdate); });
+
     for (const float elevation : {-40000.0F, -32767.0F, -16383.5F, -.01F, 0.0F,
                                   6553.4F, 13106.8F, 19660.2F, 26213.6F, 32767.0F, 40000.0F}) {
         for (auto& vertex : vertices) {

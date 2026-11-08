@@ -10,7 +10,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 namespace {
@@ -73,7 +72,8 @@ GLsizeiptr bufferSize(std::span<const T> data) {
 
 GlobeRenderer::Resources::~Resources() {
     glDeleteVertexArrays(1, &vao);
-    glDeleteBuffers(1, &vertexBuffer);
+    glDeleteBuffers(1, &positionBuffer);
+    glDeleteBuffers(1, &elevationBuffer);
     glDeleteBuffers(1, &indexBuffer);
     glDeleteBuffers(1, &colorBuffer);
     if (program != 0) {
@@ -110,19 +110,20 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
     landCountLocation_ = uniform(resources_.program, "uLandStopCount");
 
     glCreateVertexArrays(1, &resources_.vao);
-    glCreateBuffers(1, &resources_.vertexBuffer);
+    glCreateBuffers(1, &resources_.positionBuffer);
+    glCreateBuffers(1, &resources_.elevationBuffer);
     glCreateBuffers(1, &resources_.indexBuffer);
     glCreateBuffers(1, &resources_.colorBuffer);
-    static_assert(std::is_standard_layout_v<GridVertex>);
     glEnableVertexArrayAttrib(resources_.vao, 0);
     glVertexArrayAttribFormat(resources_.vao, 0, 3, GL_FLOAT, GL_FALSE,
-                             static_cast<GLuint>(offsetof(GridVertex, position)));
+                             0);
     glVertexArrayAttribBinding(resources_.vao, 0, 0);
     glEnableVertexArrayAttrib(resources_.vao, 1);
     glVertexArrayAttribFormat(resources_.vao, 1, 1, GL_FLOAT, GL_FALSE,
-                             static_cast<GLuint>(offsetof(GridVertex, elevation)));
-    glVertexArrayAttribBinding(resources_.vao, 1, 0);
-    glVertexArrayVertexBuffer(resources_.vao, 0, resources_.vertexBuffer, 0, sizeof(GridVertex));
+                             0);
+    glVertexArrayAttribBinding(resources_.vao, 1, 1);
+    glVertexArrayVertexBuffer(resources_.vao, 0, resources_.positionBuffer, 0, sizeof(glm::vec3));
+    glVertexArrayVertexBuffer(resources_.vao, 1, resources_.elevationBuffer, 0, sizeof(float));
     glVertexArrayElementBuffer(resources_.vao, resources_.indexBuffer);
     checkGl("Creating globe resources");
 }
@@ -147,12 +148,40 @@ void GlobeRenderer::UploadMesh(std::span<const GridVertex> vertices,
     if (std::any_of(indices.begin(), indices.end(), [&](auto index) { return index >= vertices.size(); })) {
         throw std::invalid_argument("Mesh contains an out-of-range index.");
     }
-    const auto vertexBytes = bufferSize(vertices);
     const auto indexBytes = bufferSize(indices);
-    glNamedBufferData(resources_.vertexBuffer, vertexBytes, vertices.data(), GL_DYNAMIC_DRAW);
+    std::vector<glm::vec3> positions;
+    std::vector<float> elevations;
+    positions.reserve(vertices.size());
+    elevations.reserve(vertices.size());
+    for (const auto& vertex : vertices) {
+        positions.push_back(vertex.position);
+        elevations.push_back(vertex.elevation);
+    }
+    const auto positionBytes = bufferSize(std::span<const glm::vec3>(positions));
+    const auto elevationBytes = bufferSize(std::span<const float>(elevations));
+    glNamedBufferData(resources_.positionBuffer, positionBytes, positions.data(), GL_STATIC_DRAW);
+    glNamedBufferData(resources_.elevationBuffer, elevationBytes, elevations.data(), GL_DYNAMIC_DRAW);
     glNamedBufferData(resources_.indexBuffer, indexBytes, indices.data(), GL_STATIC_DRAW);
     checkGl("Uploading globe mesh");
     indexCount_ = static_cast<GLsizei>(indices.size());
+    vertexCount_ = vertices.size();
+}
+
+void GlobeRenderer::UpdateElevations(std::span<const GridVertex> vertices) {
+    if (vertices.size() != vertexCount_ || vertices.empty()) {
+        throw std::invalid_argument("Elevation update must match the uploaded vertex count.");
+    }
+    std::vector<float> elevations;
+    elevations.reserve(vertices.size());
+    for (const auto& vertex : vertices) {
+        if (!std::isfinite(vertex.elevation)) {
+            throw std::invalid_argument("Elevation update contains a non-finite value.");
+        }
+        elevations.push_back(vertex.elevation);
+    }
+    const auto bytes = bufferSize(std::span<const float>(elevations));
+    glNamedBufferSubData(resources_.elevationBuffer, 0, bytes, elevations.data());
+    checkGl("Updating globe elevations");
 }
 
 void GlobeRenderer::SetColorMap(const ColorMap& map) {
@@ -181,9 +210,13 @@ void GlobeRenderer::SetColorMap(const ColorMap& map) {
     hasColorMap_ = true;
 }
 
-void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight) {
+void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
+                         const glm::mat4& modelMatrix, float zoom) {
     if (framebufferWidth < 0 || framebufferHeight < 0) {
         throw std::invalid_argument("Framebuffer dimensions must be nonnegative.");
+    }
+    if (!std::isfinite(zoom) || zoom <= 0.0F) {
+        throw std::invalid_argument("Globe zoom must be finite and positive.");
     }
     if (framebufferWidth == 0 || framebufferHeight == 0) {
         return;
@@ -192,12 +225,12 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight) {
         throw std::logic_error("Upload a mesh and colour map before drawing the globe.");
     }
     const float aspect = static_cast<float>(framebufferWidth) / framebufferHeight;
-    const float horizontal = 1.15F * std::max(aspect, 1.0F);
-    const float vertical = 1.15F * std::max(1.0F / aspect, 1.0F);
+    const float horizontal = 1.15F * std::max(aspect, 1.0F) / zoom;
+    const float vertical = 1.15F * std::max(1.0F / aspect, 1.0F) / zoom;
     const auto projection = glm::ortho(-horizontal, horizontal, -vertical, vertical, 0.1F, 10.0F);
     const auto view = glm::lookAt(glm::vec3(0.0F, -3.0F, 0.0F),
                                   glm::vec3(0.0F), glm::vec3(0.0F, 0.0F, 1.0F));
-    const auto matrix = projection * view;
+    const auto matrix = projection * view * modelMatrix;
     glViewport(0, 0, framebufferWidth, framebufferHeight);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);

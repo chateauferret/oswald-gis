@@ -1,9 +1,14 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 4.0)
 project(oswald_gis LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Downloaded dependencies still declare policy versions deprecated by CMake 4.
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.10)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+endif()
 
 include(FetchContent)
 
@@ -67,11 +72,6 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 function(oswald_fetch_qhull)
-    # Qhull 8.0.2 predates CMake 4's removal of pre-3.5 policy compatibility.
-    if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0 AND
-       (NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.5))
-        set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-    endif()
     FetchContent_MakeAvailable(qhull)
     # Only build linked Qhull targets, not its tools or pre-C++20 C++ wrapper.
     set_property(DIRECTORY "${qhull_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
@@ -118,7 +118,7 @@ foreach(resource shaders/globe.vert shaders/globe.frag assets/colormaps/default.
     configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
 endforeach()
 
-add_executable(oswald_gis src/main.cpp src/UIManager.cpp)
+add_executable(oswald_gis src/main.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
 target_compile_definitions(oswald_gis PRIVATE
     GLFW_INCLUDE_NONE
     OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
@@ -151,6 +151,19 @@ if(BUILD_TESTING)
     add_executable(elevation_raster_tests tests/ElevationRasterTests.cpp)
     target_link_libraries(elevation_raster_tests PRIVATE oswald_model)
     add_test(NAME elevation_raster COMMAND elevation_raster_tests)
+
+    add_executable(raster_file_browser_tests tests/RasterFileBrowserTests.cpp src/RasterFileBrowser.cpp)
+    target_include_directories(raster_file_browser_tests PRIVATE include)
+    add_test(NAME raster_file_browser COMMAND raster_file_browser_tests)
+
+    add_executable(ui_manager_tests tests/UIManagerTests.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
+    target_link_libraries(ui_manager_tests PRIVATE oswald_view imgui_lib glfw)
+    target_compile_definitions(ui_manager_tests PRIVATE
+        GLFW_INCLUDE_NONE
+        OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
+    )
+    add_test(NAME raster_file_dialog COMMAND ui_manager_tests)
+    set_tests_properties(raster_file_dialog PROPERTIES LABELS gpu TIMEOUT 60)
 
     add_executable(globe_renderer_tests tests/GlobeRendererTests.cpp)
     target_link_libraries(globe_renderer_tests PRIVATE oswald_view glfw)

@@ -529,8 +529,16 @@ project tests with
 
 ### 10.6 Phase 4 and 5 Verification
 
-`File -> Open Raster...` (or Ctrl+O) opens a path-entry dialog. The selected
-image is decoded with stb_image and resampled to a 2048 x 1024 equirectangular
+`File -> Open Raster...` (or Ctrl+O) opens an in-app file dialog. It starts in
+the working directory and remembers the last browsed folder. Use Up to navigate
+to the parent folder, or select a folder and choose Open Folder. Open loads the
+selected image; Enter or double-click also opens folders and files. Refresh
+reloads the folder listing; Cancel or
+Escape closes the dialog without changing the raster. The listing shows folders
+and supported PNG, JPEG, BMP, TGA, PSD, GIF, HDR, PIC, and binary PPM/PGM/PNM
+images, including uppercase extensions. TIFF/GeoTIFF is not supported by the
+current stb_image decoder. Navigation and decoding errors appear in the dialog.
+The selected image is decoded with stb_image and resampled to a 2048 x 1024 equirectangular
 luminosity raster. The app maps longitude periodically across the image seam,
 clamps latitude at the poles, bilinearly samples each Fibonacci vertex, and
 maps luminosity to elevations in [-32767, 32767]. Applying new grid settings
@@ -541,12 +549,19 @@ positions or triangle indices.
 
 The CPU-only `elevation_raster` test checks image decoding, 2:1 resampling,
 Rec. 709 luminance, bilinear sampling, seam wrapping, pole clamping, elevation
-ranges, grid population, and snapshot lifetime. The GPU `globe_renderer` test
-also verifies elevation-only buffer updates. Run the CPU checks with:
+ranges, grid population, and snapshot lifetime. The CPU `raster_file_browser`
+test covers format filtering, directory ordering, navigation, refresh, and
+failed navigation. The GPU `raster_file_dialog` test exercises Ctrl+O, folder
+navigation, image selection, decoding errors, double-click, and cancellation
+using a hidden OpenGL window. The GPU `globe_renderer` test also verifies
+elevation-only buffer updates. Run the CPU checks with:
 
 ```bash
-ctest --test-dir build/ninja -R '^(spherical_grid(_scale)?|camera_controller|elevation_raster|color_map)$' --output-on-failure
+ctest --test-dir build/ninja -R '^(spherical_grid(_scale)?|camera_controller|elevation_raster|raster_file_browser|color_map)$' --output-on-failure
 ```
+
+With a working display and OpenGL 4.5, run the dialog interaction check with
+`ctest --test-dir build/ninja -R '^raster_file_dialog$' --output-on-failure`.
 
 ---
 

@@ -2,8 +2,8 @@
 
 #include "GlobeRenderer.hpp"
 #include "ElevationRaster.hpp"
+#include "RasterFileBrowser.hpp"
 
-#include <array>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -17,10 +17,14 @@ public:
     bool Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer);
 
 private:
+    void NavigateRasterDirectory(const std::filesystem::path& directory);
+
     GridOptions options_;
     bool settingsOpen_ = false;
     bool rasterOpen_ = false;
-    std::array<char, 4096> rasterPathInput_{};
+    RasterFileBrowser rasterBrowser_;
+    std::filesystem::path selectedRasterPath_;
+    bool selectedRasterIsDirectory_ = false;
     std::optional<ElevationRaster> raster_;
     std::filesystem::path loadedRasterPath_;
     std::string errorMessage_;

@@ -1,6 +1,7 @@
 #include "GlobeRenderer.hpp"
 
 #include <GLFW/glfw3.h>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include <array>
 #include <chrono>
@@ -59,30 +60,52 @@ const std::filesystem::path resources(OSWALD_RESOURCE_DIR);
 
 void testColorMap() {
     const auto map = ColorMap::Load(resources / "assets/colormaps/default.map");
-    check(map.GetOceanStops().size() == 2 && map.GetLandStops().size() == 4,
+        check(map.GetStops().size() == 6,
           "Default map has incorrect stops.");
-    check(map.GetOceanStops()[0] == glm::vec4(0, .02F, .08F, .25F),
-          "Default deep ocean colour changed.");
-    check(map.GetLandStops()[1] == glm::vec4(.4F, .72F, .68F, .42F),
-          "Default land colour changed.");
+        check(map.GetStops()[0] == glm::vec4(-32767, .02F, .08F, .25F),
+            "Default minimum-elevation colour changed.");
+        check(map.GetStops()[3] == glm::vec4(13106.8F, .72F, .68F, .42F),
+            "Default intermediate colour changed.");
     TemporaryDirectory temporary;
     const auto comments = ColorMap::Load(temporary.write("comments.map",
-        " # comment\n[land] # land first\n0 1 0 0\n1 0 1 0\n\n"
-        "[ocean]\n0 0 0 1\n1 1 1 1 # endpoint\n"));
-    check(comments.GetLandStops()[0].y == 1.0F && comments.GetOceanStops()[0].w == 1.0F,
-          "Sections or comments parsed incorrectly.");
+          " # comment\n-32767 1.0 0 0\n-100.5 0 1.0 0\n\n"
+          "2500 0 0 1.0\n+32767 1.0 1 1 # endpoint\n"));
+        check(comments.GetStops().size() == 4 && comments.GetStops()[1].x == -100.5F &&
+            comments.GetStops()[2].x == 2500.0F && comments.GetStops()[3].w == 1.0F,
+            "Signed elevations or comments parsed incorrectly.");
     expectFailure([&] { ColorMap::Load(temporary.path / "missing.map"); });
+    const auto encodings = ColorMap::Load(temporary.write("encodings.map",
+        "\t# standalone comment\r\n"
+        "-32767\t0000FF# pure blue\r\n"
+        "-100\v255\t128\f0 # decimal bytes\n"
+        "0 0.0\t5e-1 1.0 # normalized floats\n"
+        "100\tabcdef # lowercase hex\n"
+        "200 808080 # digit-only hex is unambiguous\n"
+        "300 0 1 0 # integer one means one byte\n"
+        "+32767 FFFFFF # white\n"));
+    check(encodings.GetStops()[0] == glm::vec4(-32767, 0, 0, 1) &&
+          encodings.GetStops()[1] == glm::vec4(-100, 1, 128.0F / 255.0F, 0) &&
+          encodings.GetStops()[2] == glm::vec4(0, 0, .5F, 1) &&
+          encodings.GetStops()[3] == glm::vec4(100, 171.0F / 255.0F,
+                                             205.0F / 255.0F, 239.0F / 255.0F) &&
+          encodings.GetStops()[4] == glm::vec4(200, glm::vec3(128.0F / 255.0F)) &&
+          encodings.GetStops()[5] == glm::vec4(300, 0, 1.0F / 255.0F, 0) &&
+          encodings.GetStops()[6] == glm::vec4(32767, 1, 1, 1),
+          "RGB encodings, whitespace or trailing comments parsed incorrectly.");
     for (const auto invalid : {
-             "", "[land]\n0 0 0 0\n1 1 1 1\n", "0 0 0 0\n",
-             "[ocean] junk\n", "[unknown]\n", "[ocean]\n0 0 0 0 extra\n",
-             "[ocean]\n0 0 0\n", "[ocean]\n0 2 0 0\n",
-             "[ocean]\n0 nan 0 0\n", "[ocean]\n0 inf 0 0\n",
-             "[ocean]\n0 0 0 0\n0 1 1 1\n",
-             "[ocean]\n1 0 0 0\n0 1 1 1\n",
-             "[ocean]\n0.1 0 0 0\n1 1 1 1\n[land]\n0 0 0 0\n1 1 1 1\n",
-             "[ocean]\n0 0 0 0\n0.9 1 1 1\n[land]\n0 0 0 0\n1 1 1 1\n",
-             "[ocean]\n0 0 0 0\n1 1 1 1\n[ocean]\n",
-             "[ocean]\n0 0 0 0\n1 1 1 1\n[land]\n0 0 0 0\n[land]\n"}) {
+             "", "-32767 0 0 0\n", "0 0 0 0\n1 1 1 1\n",
+             "[ocean]\n", "[land]\n", "[unknown]\n", "-32767 0 0 0 extra\n",
+             "-32767 0 0\n", "-32767 2.0 0 0\n", "-32767 0 -0.1 0\n",
+             "-32767 256 0 0\n", "-32767 -1 0 0\n", "-32767 1.0 255 0\n",
+             "-32767 FF 00 00\n", "-32767 0xFF 0 0\n",
+             "-32767 FFFFF\n", "-32767 FFFFFFF\n", "-32767 GG0000\n",
+             "-32767 0x0000FF\n", "-32767 0000FF extra\n", "-32767\n",
+             "-32767 0 0 1.1\n", "-32767 nan 0 0\n", "-32767 0 inf 0\n",
+             "nan 0 0 0\n", "inf 0 0 0\n", "-32768 0 0 0\n", "32768 0 0 0\n",
+             "-32767 0 0 0\n0 0 0 0\n0 1 1 1\n32767 1 1 1\n",
+             "-32767 0 0 0\n100 0 0 0\n-100 1 1 1\n32767 1 1 1\n",
+             "-32766 0 0 0\n32767 1 1 1\n",
+             "-32767 0 0 0\n32766 1 1 1\n"}) {
         expectFailure([&] { ColorMap::Load(temporary.write("invalid.map", invalid)); });
     }
 }
@@ -113,18 +136,21 @@ void clear() {
 }
 
 glm::vec3 expectedColor(float elevation) {
-    if (elevation < 0) {
-        return glm::mix(glm::vec3(.02F, .08F, .25F), glm::vec3(.15F, .55F, .65F),
-                        glm::clamp((elevation + 32767.0F) / 32767.0F, 0.0F, 1.0F));
+    const std::array stops{
+        glm::vec4(-32767, .02F, .08F, .25F), glm::vec4(-1, .15F, .55F, .65F),
+        glm::vec4(0, .18F, .48F, .18F), glm::vec4(13106.8F, .72F, .68F, .42F),
+        glm::vec4(26213.6F, .45F, .38F, .30F), glm::vec4(32767, .95F, .95F, .98F)};
+    const float t = glm::clamp(elevation, stops.front().x, stops.back().x);
+    for (std::size_t i = 1; i < stops.size(); ++i) {
+        if (t <= stops[i].x) {
+            const auto& low = stops[i - 1];
+            const auto& high = stops[i];
+            return glm::mix(glm::vec3(low.y, low.z, low.w),
+                            glm::vec3(high.y, high.z, high.w),
+                            (t - low.x) / (high.x - low.x));
+        }
     }
-    const float t = glm::clamp(elevation / 32767.0F, 0.0F, 1.0F);
-    if (t < .4F) {
-        return glm::mix(glm::vec3(.18F, .48F, .18F), glm::vec3(.72F, .68F, .42F), t / .4F);
-    }
-    if (t < .8F) {
-        return glm::mix(glm::vec3(.72F, .68F, .42F), glm::vec3(.45F, .38F, .30F), (t - .4F) / .4F);
-    }
-    return glm::mix(glm::vec3(.45F, .38F, .30F), glm::vec3(.95F, .95F, .98F), (t - .8F) / .2F);
+    throw std::logic_error("Expected colour lookup failed.");
 }
 
 void testGpu() {
@@ -170,13 +196,33 @@ void testGpu() {
     const auto center = pixel(width / 2, height / 2);
     check(center[1] > center[0] * 2 && center[1] > center[2] * 2,
           "Zero-elevation globe is not coastal green.");
-    check(std::abs(static_cast<int>(center[1]) - 97) <= 4,
-          "Depth, winding, or lighting did not show the front-facing hemisphere.");
+        check(std::abs(static_cast<int>(center[1]) - .48F * 255.0F) <= 1,
+            "Ambient illumination did not preserve the coastal green colour.");
     const auto corner = pixel(0, 0);
     check(std::abs(static_cast<int>(corner[0]) - 15) <= 1 &&
           std::abs(static_cast<int>(corner[1]) - 20) <= 1 &&
           std::abs(static_cast<int>(corner[2]) - 31) <= 1,
           "Globe overwrote background outside its silhouette.");
+
+    // Every visible region must retain its map colour, including after rotation.
+    for (const float angle : {0.0F, 1.5F, 3.0F, 4.5F}) {
+        const auto rotation = glm::rotate(glm::mat4(1.0F), angle,
+                                          glm::normalize(glm::vec3(1.0F, 0.0F, 1.0F)));
+        clear();
+        renderer.Draw(width, height, rotation);
+        for (const float x : {-.65F, 0.0F, .65F}) {
+            for (const float y : {-.65F, 0.0F, .65F}) {
+                const auto actual = pixel(
+                    static_cast<int>((.5F + x / 2.3F) * width),
+                    static_cast<int>((.5F + y / 2.3F) * height));
+                const auto expected = expectedColor(0.0F);
+                for (int channel = 0; channel < 3; ++channel) {
+                    check(std::abs(actual[channel] - expected[channel] * 255.0F) <= 1.0F,
+                          "Ambient globe colour varies with surface position or rotation.");
+                }
+            }
+        }
+    }
 
     // Constant-elevation meshes isolate the colour map from elevation interpolation.
     auto vertices = snapshot->GetVertices();
@@ -188,10 +234,11 @@ void testGpu() {
     clear();
     renderer.Draw(width, height);
     const auto updatedPixel = pixel(width / 2, height / 2);
-        check(std::abs(static_cast<int>(updatedPixel[0]) - static_cast<int>(center[0])) > 50 &&
-            std::abs(static_cast<int>(updatedPixel[0]) - static_cast<int>(updatedPixel[1])) <= 2 &&
-            std::abs(static_cast<int>(updatedPixel[1]) - static_cast<int>(updatedPixel[2])) <= 6,
-          "Elevation-only GPU subdata update did not change the rendered globe.");
+    const auto updatedColor = expectedColor(32767.0F);
+    for (int channel = 0; channel < 3; ++channel) {
+        check(std::abs(updatedPixel[channel] - updatedColor[channel] * 255.0F) <= 1.0F,
+              "Elevation-only GPU subdata update did not change the rendered globe.");
+    }
     renderer.UpdateElevations(snapshot->GetVertices());
     expectFailure([&] {
         renderer.UpdateElevations(std::span<const GridVertex>(elevationUpdate).first(
@@ -200,7 +247,7 @@ void testGpu() {
     elevationUpdate[0].elevation = std::numeric_limits<float>::quiet_NaN();
     expectFailure([&] { renderer.UpdateElevations(elevationUpdate); });
 
-    for (const float elevation : {-40000.0F, -32767.0F, -16383.5F, -.01F, 0.0F,
+    for (const float elevation : {-40000.0F, -32767.0F, -16383.5F, -1.0F, -.5F, -.01F, 0.0F,
                                   6553.4F, 13106.8F, 19660.2F, 26213.6F, 32767.0F, 40000.0F}) {
         for (auto& vertex : vertices) {
             vertex.elevation = elevation;
@@ -210,31 +257,33 @@ void testGpu() {
         renderer.Draw(width, height);
         const auto actual = pixel(width / 2, height / 2);
         const auto expected = expectedColor(elevation);
-        const float lighting = static_cast<float>(center[1]) / (.48F * 255.0F);
         for (int channel = 0; channel < 3; ++channel) {
-            check(std::abs(actual[channel] - expected[channel] * lighting * 255.0F) <= 2.0F,
-                  "GPU colour does not match original piecewise hypsometric mapping.");
+            check(std::abs(actual[channel] - expected[channel] * 255.0F) <= 2.0F,
+                  "GPU colour does not match the continuous elevation mapping.");
         }
     }
 
     const auto alternate = ColorMap::Load(temporary.write("alternate.map",
-        "[ocean]\n0 0 0 1\n0.25 0 0 1\n1 0 0 1\n"
-        "[land]\n0 1 0 0\n0.1 1 0 0\n0.9 1 0 0\n1 1 0 0\n"));
+        "-32767 0000FF\n1000 0 0 255\n3000 1.0 0 0\n32767 FF0000\n"));
     renderer.SetColorMap(alternate);
     clear();
     renderer.Draw(width, height);
     const auto red = pixel(width / 2, height / 2);
     check(red[0] > 100 && red[1] == 0 && red[2] == 0,
-          "Replacing palette did not update rendered land colour.");
-    for (auto& vertex : vertices) {
-        vertex.elevation = -100.0F;
+          "Replacing palette did not update the maximum-elevation colour.");
+    for (const float elevation : {-100.0F, 0.0F, 100.0F, 1000.0F, 2000.0F, 3000.0F}) {
+        for (auto& vertex : vertices) {
+            vertex.elevation = elevation;
+        }
+        renderer.UploadMesh(vertices, snapshot->GetTriangleIndices());
+        clear();
+        renderer.Draw(width, height);
+        const auto actual = pixel(width / 2, height / 2);
+        const float blend = glm::clamp((elevation - 1000.0F) / 2000.0F, 0.0F, 1.0F);
+        check(std::abs(actual[0] - blend * 255.0F) <= 1.0F && actual[1] == 0 &&
+              std::abs(actual[2] - (1.0F - blend) * 255.0F) <= 1.0F,
+              "Palette transition was incorrectly tied to zero elevation.");
     }
-    renderer.UploadMesh(vertices, snapshot->GetTriangleIndices());
-    clear();
-    renderer.Draw(width, height);
-    const auto blue = pixel(width / 2, height / 2);
-    check(blue[2] > 100 && blue[0] == 0 && blue[1] == 0,
-          "Replacing palette did not update rendered ocean colour.");
     expectFailure([&] { renderer.UploadMesh({}, {}); });
     const std::array<std::uint32_t, 3> badIndices{0, 1, 1000};
     expectFailure([&] { renderer.UploadMesh(vertices, badIndices); });
@@ -248,11 +297,10 @@ void testGpu() {
     expectFailure([&] { renderer.UploadMesh(vertices, std::span(badIndices).first(2)); });
 
     const auto irregular = ColorMap::Load(temporary.write("irregular.map",
-        "[ocean]\n0 0 0 1\n1 0 1 1\n"
-        "[land]\n0 1 0 0\n0.1 0 1 0\n0.9 0 0 1\n1 1 1 1\n"));
+        "-32767 0000FF\n-2000 FF0000\n2000 00FF00\n29000 0000FF\n32767 FFFFFF\n"));
     renderer.SetColorMap(irregular);
     for (auto& vertex : vertices) {
-        vertex.elevation = .05F * 32767.0F;
+        vertex.elevation = 0.0F;
     }
     renderer.UploadMesh(vertices, snapshot->GetTriangleIndices());
     clear();
@@ -260,7 +308,7 @@ void testGpu() {
     const auto interpolated = pixel(width / 2, height / 2);
     check(interpolated[0] > 50 && std::abs(static_cast<int>(interpolated[0]) -
           static_cast<int>(interpolated[1])) <= 1 && interpolated[2] == 0,
-          "Shader ignored irregular external stop positions.");
+          "Shader ignored irregular stops or failed to interpolate across zero.");
 
     renderer.SetColorMap(ColorMap::Load(resources / "assets/colormaps/default.map"));
     renderer.UploadGrid(*snapshot);

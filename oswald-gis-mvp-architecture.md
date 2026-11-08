@@ -281,46 +281,52 @@ glVertexArrayElementBuffer(vao, ebo);
 
 The maintained GLSL 450 core shader pair is
 [globe.vert](./shaders/globe.vert) and [globe.frag](./shaders/globe.frag).
-The vertex shader applies `uModelViewProjection` and passes elevation and
-surface normal to the fragment shader. Interpolated normals are normalized
-before directional lighting, with a minimum diffuse factor of 0.15.
+The vertex shader applies `uModelViewProjection` and passes elevation to the
+fragment shader. Full ambient illumination preserves palette colours across
+the entire globe, independent of position and rotation.
 
 Colour values and stop positions are external shader data, not GLSL constants.
-The fragment shader binary-searches the relevant ocean/land stop range in a
+The fragment shader binary-searches a single elevation stop list in a
 read-only `std430` shader storage buffer and interpolates adjacent RGB values
-exactly, without a sampled lookup texture. Elevation is clamped to the original
-range [-32767, +32767]. Negative elevations use the ocean ramp; zero and above
-use the land ramp, preserving the discontinuity at sea level.
+exactly, without a sampled lookup texture. Elevation is clamped to
+[-32767, +32767]. Zero is treated like any other elevation: there is no
+ocean/land split or implicit sea-level threshold.
 
 ### 7.3 External Colour-Map Format
 
-[default.map](./assets/colormaps/default.map) preserves the original palette.
-Each map contains one `[ocean]` section and one `[land]` section, in either order:
+[default.map](./assets/colormaps/default.map) retains the original colours,
+with an explicit narrow blue-to-green transition. Each map contains a single
+list of elevation/RGB stops, without section headers:
 
 ```text
-# position red green blue
-[ocean]
-0.0 0.02 0.08 0.25
-1.0 0.15 0.55 0.65
-
-[land]
-0.0 0.18 0.48 0.18
-0.4 0.72 0.68 0.42
-0.8 0.45 0.38 0.30
-1.0 0.95 0.95 0.98
+# elevation red green blue
+-32767 0.02 0.08 0.25
+-1 0.15 0.55 0.65
+0 0.18 0.48 0.18
+13106.8 0.72 0.68 0.42
+26213.6 0.45 0.38 0.30
++32767 0.95 0.95 0.98
 ```
 
-Positions and RGB components are finite normalized values in [0, 1]. Ocean
-positions run from deepest elevation to sea level from below; land positions
-run from sea level to maximum elevation. Each section needs at least two
-strictly increasing positions with endpoints exactly 0 and 1. Blank lines and
-`#` comments (including trailing comments) are supported. Extra fields,
-unknown or duplicate sections, missing endpoints, and invalid numbers are
-explicit errors with the file path and line number.
+Elevations are finite values in [-32767, +32767], nominally in feet, and may
+be fractional. Each line accepts either three finite normalized RGB floats
+in [0, 1], three decimal byte integers in [0, 255], or one six-digit hexadecimal
+`RRGGBB` colour (case-insensitive, without a prefix). For example, `0000FF`,
+`0 0 255`, and `0.0 0.0 1.0` all specify pure blue. A decimal point or exponent
+in any of the three components selects normalized floats for that line;
+otherwise all three are decimal bytes (`0 0 1` means blue intensity 1/255).
+Encodings may differ between lines. Values may be separated by any whitespace,
+including spaces and tabs. Hex colours must be a single token. The
+list needs at least two strictly increasing elevations, with endpoints exactly
+-32767 and +32767. No stop at zero is required, and any colour transition may
+be placed at any elevation. Blank lines and `#` comments (including trailing
+comments) are supported. Section headers, extra fields, missing endpoints,
+and invalid numbers are explicit errors with the file path and line number.
 
 `ColorMap::Load(path)` parses and validates the file without an OpenGL context.
-`GlobeRenderer::SetColorMap(map)` uploads ocean stops followed by land stops
-and updates the counts. A future menu can load a selected map and call this
+`ColorMap::GetStops()` exposes the ordered elevation/RGB list.
+`GlobeRenderer::SetColorMap(map)` uploads the stops and updates a single count.
+A future menu can load a selected map and call this
 method without rebuilding the mesh or recompiling shaders. There is no fixed
 application stop-count cap; maps must fit the GPU storage-buffer and shader
 integer-indexing limits, which are checked explicitly. Failed file loading
@@ -562,13 +568,3 @@ ctest --test-dir build/ninja -R '^(spherical_grid(_scale)?|camera_controller|ele
 
 With a working display and OpenGL 4.5, run the dialog interaction check with
 `ctest --test-dir build/ninja -R '^raster_file_dialog$' --output-on-failure`.
-
----
-
-## 11. Implementation Roadmap
-
-1. **Phase 1: Build System & Context Setup**: Configure CMake with `FetchContent` for GLFW, GLAD (OpenGL 4.5 Core), GLM, Dear ImGui, and `nanoflann`. Verify window creation and basic rendering loop.
-2. **Phase 2: Model Implementation**: Implement `SphericalFibonacciGrid` point distribution math, spatial jittering, and half-edge graph structures. Integrate the `nanoflann` 3D k-d tree adaptor.
-3. **Phase 3: Render Viewport & Shaders**: Set up OpenGL DSA buffer lifecycle (`glCreateBuffers`, `glNamedBufferData`), compile the GLSL hypsometric elevation shader pair, and establish orthographic camera projection.
-4. **Phase 4: Controller & UI Interactivity**: Implement pitch-clamped mouse drag rotation, scroll-wheel zoom, double-click raycast re-centering, and the Dear ImGui `File -> Settings...` dialog.
-5. **Phase 5: Raster Ingestion & Verification**: Decode and resample equirectangular images via `File -> Open Raster...`, map luminosity to elevation range $[-32,767, +32,767]$, and upload sampled elevations to the model and GPU.

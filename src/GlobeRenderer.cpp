@@ -105,9 +105,7 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
     glDetachShader(resources_.program, vertex.id);
     glDetachShader(resources_.program, fragment.id);
     matrixLocation_ = uniform(resources_.program, "uModelViewProjection");
-    lightLocation_ = uniform(resources_.program, "uLightDir");
-    oceanCountLocation_ = uniform(resources_.program, "uOceanStopCount");
-    landCountLocation_ = uniform(resources_.program, "uLandStopCount");
+    stopCountLocation_ = uniform(resources_.program, "uStopCount");
 
     glCreateVertexArrays(1, &resources_.vao);
     glCreateBuffers(1, &resources_.positionBuffer);
@@ -185,17 +183,13 @@ void GlobeRenderer::UpdateElevations(std::span<const GridVertex> vertices) {
 }
 
 void GlobeRenderer::SetColorMap(const ColorMap& map) {
-    const auto ocean = map.GetOceanStops();
-    const auto land = map.GetLandStops();
-    if (ocean.size() < 2 || land.size() < 2) {
-        throw std::invalid_argument("Colour map must contain both ocean and land stops.");
+    const auto stops = map.GetStops();
+    if (stops.size() < 2) {
+        throw std::invalid_argument("Colour map must contain at least two stops.");
     }
-    if (ocean.size() > static_cast<std::size_t>(std::numeric_limits<GLint>::max()) ||
-        land.size() > static_cast<std::size_t>(std::numeric_limits<GLint>::max()) - ocean.size()) {
+    if (stops.size() > static_cast<std::size_t>(std::numeric_limits<GLint>::max())) {
         throw std::invalid_argument("Colour map exceeds shader indexing limits.");
     }
-    std::vector<glm::vec4> stops(ocean.begin(), ocean.end());
-    stops.insert(stops.end(), land.begin(), land.end());
     static_assert(sizeof(glm::vec4) == 4 * sizeof(float));
     const auto bytes = bufferSize(std::span<const glm::vec4>(stops));
     GLint64 maximumBytes = 0;
@@ -204,8 +198,7 @@ void GlobeRenderer::SetColorMap(const ColorMap& map) {
         throw std::invalid_argument("Colour map exceeds this GPU's storage buffer limit.");
     }
     glNamedBufferData(resources_.colorBuffer, bytes, stops.data(), GL_DYNAMIC_DRAW);
-    glProgramUniform1i(resources_.program, oceanCountLocation_, static_cast<GLint>(ocean.size()));
-    glProgramUniform1i(resources_.program, landCountLocation_, static_cast<GLint>(land.size()));
+    glProgramUniform1i(resources_.program, stopCountLocation_, static_cast<GLint>(stops.size()));
     checkGl("Uploading colour map");
     hasColorMap_ = true;
 }
@@ -239,7 +232,6 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
     glFrontFace(GL_CCW);
     glUseProgram(resources_.program);
     glProgramUniformMatrix4fv(resources_.program, matrixLocation_, 1, GL_FALSE, glm::value_ptr(matrix));
-    glProgramUniform3f(resources_.program, lightLocation_, -0.3F, -1.0F, 0.7F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, resources_.colorBuffer);
     glBindVertexArray(resources_.vao);
     glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);

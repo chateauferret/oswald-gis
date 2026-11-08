@@ -38,9 +38,7 @@ private:
         ~Resources();
     } resources_;
     GLint matrixLocation_ = -1;
-    GLint lightLocation_ = -1;
-    GLint oceanCountLocation_ = -1;
-    GLint landCountLocation_ = -1;
+    GLint stopCountLocation_ = -1;
     GLsizei indexCount_ = 0;
     std::size_t vertexCount_ = 0;
     bool hasColorMap_ = false;

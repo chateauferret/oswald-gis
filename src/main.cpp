@@ -29,9 +29,11 @@ struct GlfwSession {
 };
 
 CameraController* activeCamera = nullptr;
+UIManager* activeUiManager = nullptr;
 
 void mouseButton(GLFWwindow* window, int button, int action, int) {
-    if (button != GLFW_MOUSE_BUTTON_LEFT || activeCamera == nullptr) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT || activeCamera == nullptr ||
+        (activeUiManager != nullptr && activeUiManager->IsBrushActive())) {
         return;
     }
     double x = 0.0;
@@ -45,7 +47,8 @@ void mouseButton(GLFWwindow* window, int button, int action, int) {
 }
 
 void cursorPosition(GLFWwindow* window, double x, double y) {
-    if (activeCamera == nullptr) {
+    if (activeCamera == nullptr ||
+        (activeUiManager != nullptr && activeUiManager->IsBrushActive())) {
         return;
     }
     const bool down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
@@ -140,13 +143,14 @@ int runApplication() {
     renderer.UploadGrid(*snapshot);
     renderer.SetColorMap(ColorMap::Load(resources / "assets/colormaps/default.map"));
     UIManager ui(snapshot->GetOptions());
+    activeUiManager = &ui;
 
     while (glfwWindowShouldClose(window.get()) == GLFW_FALSE) {
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-        if (ui.Render(grid, renderer)) {
+        if (ui.Render(grid, renderer, camera.GetModelMatrix(), camera.GetZoom())) {
             glfwSetWindowShouldClose(window.get(), GLFW_TRUE);
         }
 
@@ -161,6 +165,7 @@ int runApplication() {
     }
 
     activeCamera = nullptr;
+    activeUiManager = nullptr;
     return 0;
 }
 

@@ -1,0 +1,4 @@
+# Elevation (nominally feet) and RGB components normalized to [0, 1].
+# Basic grayscale palette.
+-32767  0.0     0.0     0.0
+ 32767  1.0     1.0     1.0

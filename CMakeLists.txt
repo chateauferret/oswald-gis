@@ -100,7 +100,7 @@ FetchContent_MakeAvailable(stb)
 
 find_package(OpenGL REQUIRED)
 
-add_library(oswald_model STATIC src/SphericalGrid.cpp src/ElevationRaster.cpp)
+add_library(oswald_model STATIC src/SphericalGrid.cpp src/ElevationRaster.cpp src/BrushTool.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
 target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r)
@@ -152,9 +152,17 @@ if(BUILD_TESTING)
     target_link_libraries(elevation_raster_tests PRIVATE oswald_model)
     add_test(NAME elevation_raster COMMAND elevation_raster_tests)
 
+    add_executable(brush_tool_tests tests/BrushToolTests.cpp)
+    target_link_libraries(brush_tool_tests PRIVATE oswald_model)
+    add_test(NAME brush_tool COMMAND brush_tool_tests)
+
     add_executable(raster_file_browser_tests tests/RasterFileBrowserTests.cpp src/RasterFileBrowser.cpp)
     target_include_directories(raster_file_browser_tests PRIVATE include)
     add_test(NAME raster_file_browser COMMAND raster_file_browser_tests)
+
+    add_executable(undo_stack_tests tests/UndoStackTests.cpp)
+    target_include_directories(undo_stack_tests PRIVATE include)
+    add_test(NAME undo_stack COMMAND undo_stack_tests)
 
     add_executable(ui_manager_tests tests/UIManagerTests.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
     target_link_libraries(ui_manager_tests PRIVATE oswald_view imgui_lib glfw)

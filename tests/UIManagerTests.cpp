@@ -108,6 +108,12 @@ void testDialog() {
         ImGui::GetIO().AddKeyEvent(key, false);
         frame();
     };
+    auto shortcut = [&](ImGuiKey keyCode) {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        key(keyCode);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        frame();
+    };
     auto dialogOpen = [] {
         return ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
                                           ImGuiPopupFlags_AnyPopupLevel);
@@ -158,6 +164,12 @@ void testDialog() {
           "Selecting a compatible raster did not close the dialog.");
     check(grid.GetSnapshot()->GetVertices()[0].elevation == 32767.0F,
           "Selected raster did not update grid elevations.");
+        shortcut(ImGuiKey_Z);
+        check(grid.GetSnapshot()->GetVertices()[0].elevation == 0.0F,
+            "Ctrl+Z did not undo the raster import.");
+        shortcut(ImGuiKey_Y);
+        check(grid.GetSnapshot()->GetVertices()[0].elevation == 32767.0F,
+            "Ctrl+Y did not redo the raster import.");
     openDialog();
     for (int i = 0; i < 30; ++i) {
         frame();

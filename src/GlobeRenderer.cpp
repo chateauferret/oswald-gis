@@ -74,8 +74,10 @@ GlobeRenderer::Resources::~Resources() {
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &positionBuffer);
     glDeleteBuffers(1, &elevationBuffer);
+    glDeleteBuffers(1, &selectionBuffer);
     glDeleteBuffers(1, &indexBuffer);
     glDeleteBuffers(1, &colorBuffer);
+    glDeleteBuffers(1, &selectionColorBuffer);
     if (program != 0) {
         glDeleteProgram(program);
     }
@@ -106,12 +108,16 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
     glDetachShader(resources_.program, fragment.id);
     matrixLocation_ = uniform(resources_.program, "uModelViewProjection");
     stopCountLocation_ = uniform(resources_.program, "uStopCount");
+    selectionStopCountLocation_ = uniform(resources_.program, "uSelectionStopCount");
+    selectionActiveLocation_ = uniform(resources_.program, "uSelectionActive");
 
     glCreateVertexArrays(1, &resources_.vao);
     glCreateBuffers(1, &resources_.positionBuffer);
     glCreateBuffers(1, &resources_.elevationBuffer);
+    glCreateBuffers(1, &resources_.selectionBuffer);
     glCreateBuffers(1, &resources_.indexBuffer);
     glCreateBuffers(1, &resources_.colorBuffer);
+    glCreateBuffers(1, &resources_.selectionColorBuffer);
     glEnableVertexArrayAttrib(resources_.vao, 0);
     glVertexArrayAttribFormat(resources_.vao, 0, 3, GL_FLOAT, GL_FALSE,
                              0);
@@ -120,18 +126,22 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
     glVertexArrayAttribFormat(resources_.vao, 1, 1, GL_FLOAT, GL_FALSE,
                              0);
     glVertexArrayAttribBinding(resources_.vao, 1, 1);
+    glEnableVertexArrayAttrib(resources_.vao, 2);
+    glVertexArrayAttribFormat(resources_.vao, 2, 1, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(resources_.vao, 2, 2);
     glVertexArrayVertexBuffer(resources_.vao, 0, resources_.positionBuffer, 0, sizeof(glm::vec3));
     glVertexArrayVertexBuffer(resources_.vao, 1, resources_.elevationBuffer, 0, sizeof(float));
+    glVertexArrayVertexBuffer(resources_.vao, 2, resources_.selectionBuffer, 0, sizeof(float));
     glVertexArrayElementBuffer(resources_.vao, resources_.indexBuffer);
     checkGl("Creating globe resources");
 }
 
 void GlobeRenderer::UploadGrid(const SphericalGridSnapshot& snapshot) {
-    UploadMesh(snapshot.GetVertices(), snapshot.GetTriangleIndices());
+    UploadMesh(snapshot.GetVertices(), snapshot.GetTriangleIndices(), snapshot.HasSelection());
 }
 
 void GlobeRenderer::UploadMesh(std::span<const GridVertex> vertices,
-                               std::span<const std::uint32_t> indices) {
+                               std::span<const std::uint32_t> indices, bool selectionActive) {
     if (vertices.empty() || indices.empty() || indices.size() % 3 != 0 ||
         indices.size() > static_cast<std::size_t>(std::numeric_limits<GLsizei>::max())) {
         throw std::invalid_argument("Mesh must contain vertices and complete indexed triangles.");
@@ -149,20 +159,49 @@ void GlobeRenderer::UploadMesh(std::span<const GridVertex> vertices,
     const auto indexBytes = bufferSize(indices);
     std::vector<glm::vec3> positions;
     std::vector<float> elevations;
+    std::vector<float> selectionWeights;
     positions.reserve(vertices.size());
     elevations.reserve(vertices.size());
+    selectionWeights.reserve(vertices.size());
     for (const auto& vertex : vertices) {
         positions.push_back(vertex.position);
         elevations.push_back(vertex.elevation);
+        if (!std::isfinite(vertex.selectionWeight) ||
+            vertex.selectionWeight < 0.0F || vertex.selectionWeight > 1.0F) {
+            throw std::invalid_argument("Selection weights must be finite and in the range [0, 1].");
+        }
+        selectionWeights.push_back(vertex.selectionWeight);
     }
     const auto positionBytes = bufferSize(std::span<const glm::vec3>(positions));
     const auto elevationBytes = bufferSize(std::span<const float>(elevations));
     glNamedBufferData(resources_.positionBuffer, positionBytes, positions.data(), GL_STATIC_DRAW);
     glNamedBufferData(resources_.elevationBuffer, elevationBytes, elevations.data(), GL_DYNAMIC_DRAW);
+    const auto selectionBytes = bufferSize(std::span<const float>(selectionWeights));
+    glNamedBufferData(resources_.selectionBuffer, selectionBytes, selectionWeights.data(), GL_DYNAMIC_DRAW);
     glNamedBufferData(resources_.indexBuffer, indexBytes, indices.data(), GL_STATIC_DRAW);
     checkGl("Uploading globe mesh");
     indexCount_ = static_cast<GLsizei>(indices.size());
     vertexCount_ = vertices.size();
+    selectionActive_ = selectionActive;
+}
+
+void GlobeRenderer::UpdateSelection(std::span<const GridVertex> vertices, bool active) {
+    if (vertices.size() != vertexCount_ || vertices.empty()) {
+        throw std::invalid_argument("Selection update must match the uploaded vertex count.");
+    }
+    std::vector<float> selectionWeights;
+    selectionWeights.reserve(vertices.size());
+    for (const auto& vertex : vertices) {
+        if (!std::isfinite(vertex.selectionWeight) ||
+            vertex.selectionWeight < 0.0F || vertex.selectionWeight > 1.0F) {
+            throw std::invalid_argument("Selection weights must be finite and in the range [0, 1].");
+        }
+        selectionWeights.push_back(vertex.selectionWeight);
+    }
+    const auto bytes = bufferSize(std::span<const float>(selectionWeights));
+    glNamedBufferSubData(resources_.selectionBuffer, 0, bytes, selectionWeights.data());
+    checkGl("Updating globe selection");
+    selectionActive_ = active;
 }
 
 void GlobeRenderer::UpdateElevations(std::span<const GridVertex> vertices) {
@@ -183,6 +222,16 @@ void GlobeRenderer::UpdateElevations(std::span<const GridVertex> vertices) {
 }
 
 void GlobeRenderer::SetColorMap(const ColorMap& map) {
+    UploadColorMap(map, resources_.colorBuffer, stopCountLocation_);
+    hasColorMap_ = true;
+}
+
+void GlobeRenderer::SetSelectionColorMap(const ColorMap& map) {
+    UploadColorMap(map, resources_.selectionColorBuffer, selectionStopCountLocation_);
+    hasSelectionColorMap_ = true;
+}
+
+void GlobeRenderer::UploadColorMap(const ColorMap& map, GLuint buffer, GLint countLocation) {
     const auto stops = map.GetStops();
     if (stops.size() < 2) {
         throw std::invalid_argument("Colour map must contain at least two stops.");
@@ -197,10 +246,9 @@ void GlobeRenderer::SetColorMap(const ColorMap& map) {
     if (bytes > maximumBytes) {
         throw std::invalid_argument("Colour map exceeds this GPU's storage buffer limit.");
     }
-    glNamedBufferData(resources_.colorBuffer, bytes, stops.data(), GL_DYNAMIC_DRAW);
-    glProgramUniform1i(resources_.program, stopCountLocation_, static_cast<GLint>(stops.size()));
+    glNamedBufferData(buffer, bytes, stops.data(), GL_DYNAMIC_DRAW);
+    glProgramUniform1i(resources_.program, countLocation, static_cast<GLint>(stops.size()));
     checkGl("Uploading colour map");
-    hasColorMap_ = true;
 }
 
 void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
@@ -216,6 +264,9 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
     }
     if (indexCount_ == 0 || !hasColorMap_) {
         throw std::logic_error("Upload a mesh and colour map before drawing the globe.");
+    }
+    if (selectionActive_ && !hasSelectionColorMap_) {
+        throw std::logic_error("Upload a selection colour map before drawing an active selection.");
     }
     const float aspect = static_cast<float>(framebufferWidth) / framebufferHeight;
     const float horizontal = 1.15F * std::max(aspect, 1.0F) / zoom;
@@ -233,6 +284,8 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
     glUseProgram(resources_.program);
     glProgramUniformMatrix4fv(resources_.program, matrixLocation_, 1, GL_FALSE, glm::value_ptr(matrix));
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, resources_.colorBuffer);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, resources_.selectionColorBuffer);
+    glProgramUniform1i(resources_.program, selectionActiveLocation_, selectionActive_ ? 1 : 0);
     glBindVertexArray(resources_.vao);
     glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
     glBindVertexArray(0);

@@ -51,6 +51,31 @@ void testPitchClampAndZoom() {
     check(camera.GetZoom() == capturedZoom, "Captured UI scroll changed the zoom.");
 }
 
+void testMiddleButtonNavigation() {
+    CameraController camera;
+    camera.HandleMouseButton(true, 400, 300, 1.0, 800, 600, false, false);
+    camera.HandleCursorPosition(450, 320, true, false);
+    check(std::abs(camera.GetYaw() - 0.25F) < 1e-6F &&
+          std::abs(camera.GetPitch() - 0.1F) < 1e-6F,
+          "Middle-button drag did not rotate the globe.");
+    camera.HandleMouseButton(false, 450, 320, 1.05, 800, 600, false, false);
+    camera.HandleMouseButton(true, 450, 320, 1.2, 800, 600, false, false);
+    check(std::abs(camera.GetYaw() - 0.25F) < 1e-6F &&
+          std::abs(camera.GetPitch() - 0.1F) < 1e-6F,
+          "Repeated middle clicks recentered the globe.");
+    camera.HandleCursorPosition(470, 320, true, false);
+    check(std::abs(camera.GetYaw() - 0.35F) < 1e-6F,
+          "Repeated middle clicks prevented further dragging.");
+    camera.HandleMouseButton(false, 470, 320, 1.3, 800, 600, false, false);
+    camera.HandleCursorPosition(500, 350, false, false);
+    check(std::abs(camera.GetYaw() - 0.35F) < 1e-6F,
+          "Middle-button release did not stop dragging.");
+    camera.HandleMouseButton(true, 470, 320, 2.0, 800, 600, true, false);
+    camera.HandleCursorPosition(500, 350, true, true);
+    check(std::abs(camera.GetYaw() - 0.35F) < 1e-6F,
+          "Captured middle-button input rotated the globe.");
+}
+
 void testDoubleClickRecentering() {
     CameraController camera;
     constexpr int width = 800;
@@ -82,6 +107,7 @@ int main() {
     try {
         testDragAndCapture();
         testPitchClampAndZoom();
+        testMiddleButtonNavigation();
         testDoubleClickRecentering();
         std::cout << "Camera controller tests passed.\n";
         return EXIT_SUCCESS;

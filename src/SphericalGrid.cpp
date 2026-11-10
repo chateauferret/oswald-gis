@@ -189,17 +189,48 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options)
 SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source,
                                              std::span<const float> elevations)
     : options_(source.options_), vertices_(source.vertices_), halfEdges_(source.halfEdges_),
-      triangleIndices_(source.triangleIndices_), adaptor_{vertices_},
+      triangleIndices_(source.triangleIndices_), selectionActive_(source.selectionActive_),
+      adaptor_{vertices_},
       tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
           10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
     if (elevations.size() != vertices_.size()) {
         throw std::invalid_argument("Elevation count must match the grid vertex count.");
     }
     for (std::size_t i = 0; i < elevations.size(); ++i) {
-        if (!std::isfinite(elevations[i]) || elevations[i] < -32767.0F || elevations[i] > 32767.0F) {
+        if (!std::isfinite(elevations[i]) || elevations[i] < -32767.0F ||
+            elevations[i] > 32767.0F) {
             throw std::invalid_argument("Elevations must be finite and in the range [-32767, 32767].");
         }
         vertices_[i].elevation = elevations[i];
+    }
+    tree_.buildIndex();
+}
+
+SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source,
+                                             std::span<const float> elevations,
+                                             std::vector<float> selectionWeights,
+                                             bool selectionActive)
+    : options_(source.options_), vertices_(source.vertices_), halfEdges_(source.halfEdges_),
+      triangleIndices_(source.triangleIndices_), selectionActive_(selectionActive),
+      adaptor_{vertices_},
+      tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
+          10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+    if (elevations.size() != vertices_.size()) {
+        throw std::invalid_argument("Elevation count must match the grid vertex count.");
+    }
+    if (selectionWeights.size() != vertices_.size()) {
+        throw std::invalid_argument("Selection weight count must match the grid vertex count.");
+    }
+    for (std::size_t i = 0; i < elevations.size(); ++i) {
+        if (!std::isfinite(elevations[i]) || elevations[i] < -32767.0F || elevations[i] > 32767.0F) {
+            throw std::invalid_argument("Elevations must be finite and in the range [-32767, 32767].");
+        }
+        if (!std::isfinite(selectionWeights[i]) ||
+            selectionWeights[i] < 0.0F || selectionWeights[i] > 1.0F) {
+            throw std::invalid_argument("Selection weights must be finite and in the range [0, 1].");
+        }
+        vertices_[i].elevation = elevations[i];
+        vertices_[i].selectionWeight = selectionActive ? selectionWeights[i] : 0.0F;
     }
     tree_.buildIndex();
 }
@@ -253,6 +284,19 @@ void SphericalFibonacciGrid::GenerateGrid(const GridOptions& options) {
 void SphericalFibonacciGrid::SetElevations(std::span<const float> elevations) {
     const auto current = GetSnapshot();
     snapshot_.store(std::make_shared<const SphericalGridSnapshot>(*current, elevations));
+}
+
+void SphericalFibonacciGrid::SetSelectionWeights(std::span<const float> selectionWeights,
+                                                 bool active) {
+    const auto current = GetSnapshot();
+    std::vector<float> elevations;
+    elevations.reserve(current->GetVertices().size());
+    for (const auto& vertex : current->GetVertices()) {
+        elevations.push_back(vertex.elevation);
+    }
+    snapshot_.store(std::make_shared<const SphericalGridSnapshot>(
+        *current, elevations, std::vector<float>(selectionWeights.begin(), selectionWeights.end()),
+        active));
 }
 
 std::shared_ptr<const SphericalGridSnapshot> SphericalFibonacciGrid::GetSnapshot() const {

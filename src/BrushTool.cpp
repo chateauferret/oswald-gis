@@ -69,6 +69,9 @@ std::vector<std::size_t> applyBrush(
         if (innerRadius < outerRadius && distance > innerRadius) {
             falloff = std::clamp((outerRadius - distance) / (outerRadius - innerRadius), 0.0, 1.0);
         }
+        if (grid.HasSelection()) {
+            falloff *= vertices[index].selectionWeight;
+        }
         const float current = elevations[index];
         const float updated = operation(current, falloff);
         if (updated != elevations[index]) {

@@ -13,6 +13,7 @@
 struct GridVertex {
     glm::vec3 position;
     float elevation = 0.0F;
+    float selectionWeight = 0.0F;
 };
 
 struct HalfEdge {
@@ -47,6 +48,10 @@ public:
     explicit SphericalGridSnapshot(const GridOptions& options);
     SphericalGridSnapshot(const SphericalGridSnapshot& source,
                           std::span<const float> elevations);
+    SphericalGridSnapshot(const SphericalGridSnapshot& source,
+                          std::span<const float> elevations,
+                          std::vector<float> selectionWeights,
+                          bool selectionActive);
     SphericalGridSnapshot(const SphericalGridSnapshot&) = delete;
     SphericalGridSnapshot& operator=(const SphericalGridSnapshot&) = delete;
     SphericalGridSnapshot(SphericalGridSnapshot&&) = delete;
@@ -56,6 +61,7 @@ public:
     const std::vector<HalfEdge>& GetHalfEdges() const { return halfEdges_; }
     const std::vector<std::uint32_t>& GetTriangleIndices() const { return triangleIndices_; }
     const GridOptions& GetOptions() const { return options_; }
+    bool HasSelection() const { return selectionActive_; }
 
     std::size_t FindNearest(glm::dvec3 direction) const;
     std::vector<std::size_t> FindWithinRadius(
@@ -66,6 +72,7 @@ private:
     std::vector<GridVertex> vertices_;
     std::vector<HalfEdge> halfEdges_;
     std::vector<std::uint32_t> triangleIndices_;
+    bool selectionActive_ = false;
     PointCloudAdaptor adaptor_;
     KDTree3D tree_;
 };
@@ -75,6 +82,7 @@ public:
     explicit SphericalFibonacciGrid(const GridOptions& options = {});
     void GenerateGrid(const GridOptions& options);
     void SetElevations(std::span<const float> elevations);
+    void SetSelectionWeights(std::span<const float> selectionWeights, bool active = true);
     std::shared_ptr<const SphericalGridSnapshot> GetSnapshot() const;
 
 private:

@@ -174,6 +174,41 @@ private:
     std::vector<float> after_;
 };
 
+class SelectionCommand final : public UndoableCommand {
+public:
+    SelectionCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+                     std::vector<float> before, bool beforeActive,
+                     std::vector<float> after, bool afterActive)
+        : grid_(grid), renderer_(renderer), before_(std::move(before)),
+          beforeActive_(beforeActive), after_(std::move(after)),
+          afterActive_(afterActive) {}
+
+    void redo() override { Apply(after_, afterActive_); }
+    void undo() override { Apply(before_, beforeActive_); }
+
+private:
+    void Apply(const std::vector<float>& weights, bool active) {
+        grid_.SetSelectionWeights(weights, active);
+        renderer_.UpdateSelection(grid_.GetSnapshot()->GetVertices(), active);
+    }
+
+    SphericalFibonacciGrid& grid_;
+    GlobeRenderer& renderer_;
+    std::vector<float> before_;
+    bool beforeActive_;
+    std::vector<float> after_;
+    bool afterActive_;
+};
+
+std::vector<float> selectionWeightsOf(const SphericalGridSnapshot& snapshot) {
+    std::vector<float> weights;
+    weights.reserve(snapshot.GetVertices().size());
+    for (const auto& vertex : snapshot.GetVertices()) {
+        weights.push_back(vertex.selectionWeight);
+    }
+    return weights;
+}
+
 UIManager::UIManager(const GridOptions& options) : options_(options) {}
 
 void UIManager::NavigateRasterDirectory(const std::filesystem::path& directory) {
@@ -258,6 +293,124 @@ void UIManager::RenderBrushPanel() {
     }
 }
 
+void UIManager::RenderSelectionPanel() {
+    if (selectionMode_ == SelectionMode::None) {
+        return;
+    }
+    bool open = true;
+    const char* title = selectionMode_ == SelectionMode::Radius
+                            ? "Radius Selection###SelectionOptions"
+                            : "Polygon Selection###SelectionOptions";
+    if (ImGui::Begin(title, &open)) {
+        if (selectionMode_ == SelectionMode::Radius) {
+            int unit = static_cast<int>(selectionSettings_.distanceUnit);
+            constexpr std::array unitNames{"Kilometres", "Miles"};
+            if (ImGui::Combo("Distance unit", &unit, unitNames.data(),
+                             static_cast<int>(unitNames.size()))) {
+                if (unit != static_cast<int>(selectionSettings_.distanceUnit)) {
+                    selectionSettings_.radius *= unit == static_cast<int>(BrushDistanceUnit::Miles)
+                                                     ? 0.621371192 : 1.609344;
+                    selectionSettings_.distanceUnit = static_cast<BrushDistanceUnit>(unit);
+                }
+            }
+            float radius = static_cast<float>(selectionSettings_.radius);
+            const float maximumRadius = selectionSettings_.distanceUnit ==
+                                                BrushDistanceUnit::Kilometres
+                                            ? 20020.0F : 12500.0F;
+            if (ImGui::DragFloat("Outer radius", &radius, 10.0F, 0.1F,
+                                 maximumRadius, "%.1f")) {
+                selectionSettings_.radius = std::clamp(static_cast<double>(radius), 0.1,
+                                                        static_cast<double>(maximumRadius));
+            }
+            float falloff = static_cast<float>(selectionSettings_.falloffPercent);
+            if (ImGui::SliderFloat("Falloff (%)", &falloff, 0.0F, 100.0F, "%.0f%%")) {
+                selectionSettings_.falloffPercent = falloff;
+            }
+            ImGui::TextWrapped("Left-drag to select. Hold Shift when starting to add to the existing selection. The inner radius is fully selected; the outer edge feathers to zero.");
+        } else {
+            ImGui::TextWrapped("Click the globe to add polygon points. Hold Shift on the first point to add to the existing selection. Double-click or press Enter to finish; press Escape to cancel.");
+            ImGui::Text("Points: %zu", polygonPoints_.size());
+        }
+    }
+    ImGui::End();
+    if (!open) {
+        SetSelectionMode(SelectionMode::None);
+    }
+}
+
+void UIManager::SetSelectionMode(SelectionMode mode) {
+    brushTools_.SetActive(false);
+    selectionMode_ = mode;
+    polygonPoints_.clear();
+    polygonAdditive_ = false;
+}
+
+void UIManager::RenderValueSelectionDialog(SphericalFibonacciGrid& grid,
+                                           GlobeRenderer& renderer) {
+    if (valueSelectionOpen_) {
+        valueSelectionError_.clear();
+        ImGui::OpenPopup("Select By Value");
+        valueSelectionOpen_ = false;
+    }
+    if (ImGui::BeginPopupModal("Select By Value", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const float inputOffset = ImGui::GetCursorPosX() + ImGui::CalcTextSize("Between").x +
+                                  ImGui::GetStyle().ItemSpacing.x;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Between");
+        ImGui::SameLine(inputOffset);
+        ImGui::InputDouble("##LowerBound", &selectionLowerBound_, 0.0, 0.0, "%.3f");
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("and");
+        ImGui::SameLine(inputOffset);
+        ImGui::InputDouble("##UpperBound", &selectionUpperBound_, 0.0, 0.0, "%.3f");
+        ImGui::SliderFloat("Feather (%)", &selectionFeatherPercent_, 0.0F, 100.0F, "%.0f%%");
+        ImGui::TextWrapped("0%% selects the entire range with hard edges. 100%% tapers linearly from full selection at the range midpoint to zero at both bounds.");
+        if (!valueSelectionError_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+            ImGui::TextWrapped("%s", valueSelectionError_.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (ImGui::Button("OK")) {
+            try {
+                if (selectionLowerBound_ > selectionUpperBound_) {
+                    std::swap(selectionLowerBound_, selectionUpperBound_);
+                }
+                const auto snapshot = grid.GetSnapshot();
+                auto after = SelectByValue(*snapshot, selectionLowerBound_,
+                                          selectionUpperBound_, selectionFeatherPercent_);
+                undoStack_.Execute(std::make_unique<SelectionCommand>(
+                    grid, renderer, selectionWeightsOf(*snapshot), snapshot->HasSelection(),
+                    std::move(after), true));
+                polygonPoints_.clear();
+                ImGui::CloseCurrentPopup();
+            } catch (const std::exception& error) {
+                valueSelectionError_ = error.what();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void UIManager::FinishPolygonSelection(SphericalFibonacciGrid& grid, GlobeRenderer& renderer) {
+    if (polygonPoints_.size() >= 3) {
+        const auto snapshot = grid.GetSnapshot();
+        auto after = SelectSphericalPolygon(*snapshot, polygonPoints_);
+        auto before = selectionWeightsOf(*snapshot);
+        if (polygonAdditive_ && snapshot->HasSelection()) {
+            std::transform(after.begin(), after.end(), before.begin(), after.begin(),
+                           [](float added, float existing) { return std::max(added, existing); });
+        }
+        undoStack_.Execute(std::make_unique<SelectionCommand>(
+            grid, renderer, std::move(before), snapshot->HasSelection(),
+            std::move(after), true));
+    }
+    SetSelectionMode(SelectionMode::None);
+}
+
 void UIManager::ProcessBrushInput(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
                                   const glm::mat4& modelMatrix, float zoom) {
     auto& io = ImGui::GetIO();
@@ -333,6 +486,138 @@ void UIManager::ProcessBrushInput(SphericalFibonacciGrid& grid, GlobeRenderer& r
     }
 }
 
+void UIManager::ProcessSelectionInput(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+                                      const glm::mat4& modelMatrix, float zoom) {
+    auto& io = ImGui::GetIO();
+    const auto mvp = brushMvp(io.DisplaySize, modelMatrix, zoom);
+    const bool captured = io.WantCaptureMouse;
+    const bool radiusMode = selectionMode_ == SelectionMode::Radius;
+    const bool polygonMode = selectionMode_ == SelectionMode::Polygon;
+
+    if (selectionStroke_ && (ImGui::IsMouseReleased(ImGuiMouseButton_Left) || !radiusMode)) {
+        auto before = std::move(selectionStroke_->before);
+        auto after = std::move(selectionStroke_->working);
+        const bool wasActive = selectionStroke_->wasActive;
+        selectionStroke_.reset();
+        if (before != after || !wasActive) {
+            undoStack_.Execute(std::make_unique<SelectionCommand>(
+                grid, renderer, std::move(before), wasActive, std::move(after), true));
+        }
+    }
+
+    std::optional<glm::dvec3> cursorCenter;
+    if (radiusMode || polygonMode) {
+        cursorCenter = pickSphere(io.MousePos, io.DisplaySize, mvp);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !cursorCenter) {
+            if (io.KeyShift) {
+                return;
+            }
+            selectionStroke_.reset();
+            polygonPoints_.clear();
+            const auto snapshot = grid.GetSnapshot();
+            if (snapshot->HasSelection()) {
+                auto before = selectionWeightsOf(*snapshot);
+                std::vector<float> after(before.size(), 0.0F);
+                undoStack_.Execute(std::make_unique<SelectionCommand>(
+                    grid, renderer, std::move(before), true, std::move(after), false));
+            } else {
+                renderer.UpdateSelection(snapshot->GetVertices(), false);
+            }
+            return;
+        }
+    }
+
+    if (radiusMode && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        !captured && cursorCenter) {
+        const auto snapshot = grid.GetSnapshot();
+        SelectionStroke stroke;
+        stroke.before = selectionWeightsOf(*snapshot);
+        stroke.wasActive = snapshot->HasSelection();
+        if (io.KeyShift && stroke.wasActive) {
+            stroke.working = stroke.before;
+        } else {
+            stroke.working.assign(stroke.before.size(), 0.0F);
+        }
+        stroke.renderVertices = snapshot->GetVertices();
+        selectionStroke_ = std::move(stroke);
+    }
+
+    if (radiusMode && selectionStroke_ && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        !captured && cursorCenter) {
+        const auto snapshot = grid.GetSnapshot();
+        const auto changed = radiusSelectionTool_.Apply(
+            *snapshot, *cursorCenter, selectionStroke_->working, selectionSettings_);
+        if (!changed.empty()) {
+            for (std::size_t i = 0; i < selectionStroke_->working.size(); ++i) {
+                selectionStroke_->renderVertices[i].selectionWeight =
+                    selectionStroke_->working[i];
+            }
+            renderer.UpdateSelection(selectionStroke_->renderVertices, true);
+        }
+    }
+
+    if (polygonMode && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        !captured && cursorCenter) {
+        if (polygonPoints_.empty()) {
+            polygonAdditive_ = io.KeyShift;
+        }
+        const auto addPoint = [&] {
+            if (polygonPoints_.empty() ||
+                glm::length(polygonPoints_.back() - *cursorCenter) > 1e-8) {
+                polygonPoints_.push_back(*cursorCenter);
+            }
+        };
+        addPoint();
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            FinishPolygonSelection(grid, renderer);
+        }
+    }
+
+    if (polygonMode && !captured && ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+        FinishPolygonSelection(grid, renderer);
+    } else if (polygonMode && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        SetSelectionMode(SelectionMode::None);
+    }
+
+    if (radiusMode && cursorCenter && !captured) {
+        const double planetRadius = selectionSettings_.distanceUnit ==
+                                            BrushDistanceUnit::Kilometres
+                                        ? earthRadiusKilometres : earthRadiusMiles;
+        const double outerRadius = selectionSettings_.radius;
+        const double innerRadius = outerRadius *
+                                   (1.0 - selectionSettings_.falloffPercent / 100.0);
+        constexpr ImU32 selectionRing = IM_COL32(255, 190, 40, 240);
+        drawBrushRing(*cursorCenter, outerRadius, planetRadius, modelMatrix, mvp,
+                      io.DisplaySize, selectionRing);
+        drawBrushRing(*cursorCenter, innerRadius, planetRadius, modelMatrix, mvp,
+                      io.DisplaySize, selectionRing);
+    }
+
+    if (polygonMode && !polygonPoints_.empty()) {
+        auto* drawList = ImGui::GetForegroundDrawList();
+        ImVec2 previous{};
+        bool previousVisible = false;
+        for (const auto point : polygonPoints_) {
+            ImVec2 projected{};
+            bool visible = false;
+            if (projectPoint(point, modelMatrix, mvp, io.DisplaySize, projected, visible) &&
+                visible && previousVisible) {
+                drawList->AddLine(previous, projected, IM_COL32(255, 190, 40, 240), 2.0F);
+            }
+            previous = projected;
+            previousVisible = visible;
+        }
+        if (cursorCenter && previousVisible) {
+            ImVec2 projected{};
+            bool visible = false;
+            if (projectPoint(*cursorCenter, modelMatrix, mvp, io.DisplaySize, projected, visible) &&
+                visible) {
+                drawList->AddLine(previous, projected, IM_COL32(255, 190, 40, 180), 1.5F);
+            }
+        }
+    }
+}
+
 bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
                        const glm::mat4& modelMatrix, float zoom) {
     bool requestExit = false;
@@ -343,7 +628,8 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         rasterOpen_ = true;
         errorMessage_.clear();
     }
-    if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl) {
+    if (!ImGui::IsPopupOpen("Select By Value") &&
+        !ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
             undo();
         } else if (ImGui::IsKeyPressed(ImGuiKey_Y)) {
@@ -377,12 +663,53 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
             ImGui::EndDisabled();
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Select")) {
+            if (ImGui::MenuItem("Radius Selection", nullptr,
+                                selectionMode_ == SelectionMode::Radius)) {
+                SetSelectionMode(selectionMode_ == SelectionMode::Radius
+                                     ? SelectionMode::None : SelectionMode::Radius);
+            }
+            if (ImGui::MenuItem("Polygon Selection", nullptr,
+                                selectionMode_ == SelectionMode::Polygon)) {
+                SetSelectionMode(selectionMode_ == SelectionMode::Polygon
+                                     ? SelectionMode::None : SelectionMode::Polygon);
+            }
+            if (ImGui::MenuItem("By value...")) {
+                valueSelectionOpen_ = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear Selection")) {
+                const auto snapshot = grid.GetSnapshot();
+                if (snapshot->HasSelection()) {
+                    auto before = selectionWeightsOf(*snapshot);
+                    std::vector<float> after(before.size(), 0.0F);
+                    undoStack_.Execute(std::make_unique<SelectionCommand>(
+                        grid, renderer, std::move(before), true, std::move(after), false));
+                }
+            }
+            if (ImGui::MenuItem("Invert Selection")) {
+                const auto snapshot = grid.GetSnapshot();
+                auto before = selectionWeightsOf(*snapshot);
+                auto after = before;
+                if (snapshot->HasSelection()) {
+                    std::transform(after.begin(), after.end(), after.begin(),
+                                   [](float weight) { return 1.0F - weight; });
+                } else {
+                    std::fill(after.begin(), after.end(), 1.0F);
+                }
+                undoStack_.Execute(std::make_unique<SelectionCommand>(
+                    grid, renderer, std::move(before), snapshot->HasSelection(),
+                    std::move(after), true));
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Tools")) {
             for (const auto& tool : brushTools_.GetTools()) {
                 const std::string name(tool->GetName());
                 const bool selected = brushTools_.IsActive() &&
                     brushTools_.GetSelectedTool().GetName() == name;
                 if (ImGui::MenuItem(name.c_str(), nullptr, selected)) {
+                    SetSelectionMode(SelectionMode::None);
                     brushTools_.SelectTool(name);
                     brushTools_.SetActive(!selected);
                 }
@@ -559,9 +886,16 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         }
         ImGui::EndPopup();
     }
-    if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings")) {
+    const bool valueSelectionDialog = valueSelectionOpen_ || ImGui::IsPopupOpen("Select By Value");
+    RenderValueSelectionDialog(grid, renderer);
+    if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings") &&
+        !valueSelectionDialog) {
         RenderBrushPanel();
+        RenderSelectionPanel();
     }
-    ProcessBrushInput(grid, renderer, modelMatrix, zoom);
+    if (!valueSelectionDialog) {
+        ProcessBrushInput(grid, renderer, modelMatrix, zoom);
+        ProcessSelectionInput(grid, renderer, modelMatrix, zoom);
+    }
     return requestExit;
 }

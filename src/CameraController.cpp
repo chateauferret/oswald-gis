@@ -16,7 +16,7 @@ constexpr double doubleClickDistance = 6.0;
 
 void CameraController::HandleMouseButton(bool pressed, double cursorX, double cursorY,
                                          double time, int viewportWidth, int viewportHeight,
-                                         bool captureMouse) {
+                                         bool captureMouse, bool allowRecentering) {
     if (!std::isfinite(cursorX) || !std::isfinite(cursorY) || !std::isfinite(time)) {
         dragging_ = false;
         lastClickTime_ = -1.0;
@@ -34,7 +34,7 @@ void CameraController::HandleMouseButton(bool pressed, double cursorX, double cu
 
     const double dx = cursorX - lastClickX_;
     const double dy = cursorY - lastClickY_;
-    if (lastClickTime_ >= 0.0 && time >= lastClickTime_ &&
+    if (allowRecentering && lastClickTime_ >= 0.0 && time >= lastClickTime_ &&
         time - lastClickTime_ <= doubleClickSeconds &&
         dx * dx + dy * dy <= doubleClickDistance * doubleClickDistance) {
         Recenter(cursorX, cursorY, viewportWidth, viewportHeight);
@@ -43,7 +43,7 @@ void CameraController::HandleMouseButton(bool pressed, double cursorX, double cu
         return;
     }
 
-    lastClickTime_ = time;
+    lastClickTime_ = allowRecentering ? time : -1.0;
     lastClickX_ = cursorX;
     lastClickY_ = cursorY;
     lastCursorX_ = cursorX;
@@ -52,13 +52,13 @@ void CameraController::HandleMouseButton(bool pressed, double cursorX, double cu
 }
 
 void CameraController::HandleCursorPosition(double cursorX, double cursorY,
-                                            bool leftButtonDown, bool captureMouse) {
+                                            bool buttonDown, bool captureMouse) {
     if (!std::isfinite(cursorX) || !std::isfinite(cursorY)) {
         dragging_ = false;
         lastClickTime_ = -1.0;
         return;
     }
-    if (!leftButtonDown || !dragging_) {
+    if (!buttonDown || !dragging_) {
         return;
     }
     if (captureMouse) {

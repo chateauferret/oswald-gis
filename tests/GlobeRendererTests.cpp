@@ -224,6 +224,51 @@ void testGpu() {
         }
     }
 
+    auto selectionVertices = snapshot->GetVertices();
+    renderer.UpdateSelection(selectionVertices, true);
+    expectFailure([&] { renderer.Draw(width, height); });
+    renderer.SetSelectionColorMap(ColorMap::Load(resources / "assets/colormaps/grayscale.map"));
+    for (const float elevation : {-32767.0F, -16383.5F, 0.0F, 16383.5F, 32767.0F}) {
+        for (auto& vertex : selectionVertices) {
+            vertex.elevation = elevation;
+        }
+        renderer.UpdateElevations(selectionVertices);
+        for (const float weight : {0.0F, 0.25F, 0.5F, 1.0F}) {
+            for (auto& vertex : selectionVertices) {
+                vertex.selectionWeight = weight;
+            }
+            for (const bool active : {true, false}) {
+                renderer.UpdateSelection(selectionVertices, active);
+                clear();
+                renderer.Draw(width, height);
+                const auto actual = pixel(width / 2, height / 2);
+                const glm::vec3 grayscale((elevation + 32767.0F) / 65534.0F);
+                const auto expected = active
+                    ? glm::mix(grayscale, expectedColor(elevation), weight)
+                    : expectedColor(elevation);
+                for (int channel = 0; channel < 3; ++channel) {
+                    check(std::abs(actual[channel] - expected[channel] * 255.0F) <= 2.0F,
+                          "Selection did not blend the two elevation palettes correctly.");
+                }
+            }
+        }
+    }
+
+    grid.SetSelectionWeights(std::vector<float>(selectionVertices.size(), 0.0F), true);
+    renderer.UploadGrid(*grid.GetSnapshot());
+    clear();
+    renderer.Draw(width, height);
+    const auto emptySelection = pixel(width / 2, height / 2);
+    for (const auto channel : emptySelection) {
+        check(std::abs(channel - 127.5F) <= 1.0F,
+              "Uploading an active all-zero selection did not use grayscale.");
+    }
+    renderer.UploadGrid(*snapshot);
+    clear();
+    renderer.Draw(width, height);
+    check(pixel(width / 2, height / 2) == center,
+          "Uploading an inactive selection did not restore the default palette.");
+
     // Constant-elevation meshes isolate the colour map from elevation interpolation.
     auto vertices = snapshot->GetVertices();
     auto elevationUpdate = vertices;

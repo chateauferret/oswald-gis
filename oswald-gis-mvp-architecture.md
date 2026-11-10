@@ -121,6 +121,7 @@ Vertices are linked into a convex spherical triangulation. The topology is store
 struct GridVertex {
     glm::vec3 position;  // Position vector on S^2 (|P| = 1.0)
     float elevation;     // Terrain elevation (-32767.0 to +32767.0)
+    float selectionWeight; // Per-vertex selection mask [0.0, 1.0]
 };
 
 struct HalfEdge {
@@ -140,6 +141,13 @@ with reciprocal twins and a three-edge `nextEdge` cycle. Triangle indices are
 stored in the same order for later GPU upload. A valid grid has $2N-4$ faces
 and $6N-12$ half-edges. Generation rejects an incomplete or open hull rather
 than publishing a partially valid model.
+
+Each vertex also stores a selection weight in [0, 1]. Snapshots track whether
+a selection is active separately from the weights: no active selection leaves
+brushes unrestricted, while an active all-zero mask prevents edits. Radius
+selection uses geodesic distance and a linearly feathered outer ring; polygon
+selection evaluates a spherical polygon against each vertex. Clear, invert,
+and selection strokes are undoable.
 
 ### 4.4 Metric Distance Scaling
 
@@ -285,6 +293,14 @@ The vertex shader applies `uModelViewProjection` and passes elevation to the
 fragment shader. Full ambient illumination preserves palette colours across
 the entire globe, independent of position and rotation.
 
+Selection weights are uploaded as a separate per-vertex attribute and passed
+to the fragment shader. With an active selection, the shader blends the
+elevation colours from [grayscale.map](./assets/colormaps/grayscale.map) at
+weight zero to [default.map](./assets/colormaps/default.map) at weight one.
+Each palette has its own stop list and is evaluated at the same elevation.
+Without an active selection, the default palette is used everywhere.
+Brush edits multiply their falloff by the active selection weight.
+
 Colour values and stop positions are external shader data, not GLSL constants.
 The fragment shader binary-searches a single elevation stop list in a
 read-only `std430` shader storage buffer and interpolates adjacent RGB values
@@ -371,6 +387,29 @@ Dear ImGui provides the main application interface overlay.
 +-------------------------------------------------------------------+
 ```
 
+The main menu also includes `Select -> Radius Selection`, `Polygon Selection`,
+`Clear Selection`, and `Invert Selection`. Radius selection has outer-radius
+and feather controls. Polygon selection accepts globe clicks and finishes on
+a double-click or Enter; Escape cancels it.
+With either Select tool active, clicking outside the globe (including outside
+the viewport or on UI areas outside the globe) clears the selection and any
+unfinished polygon. Clearing is undoable and keeps the Select tool active.
+Hold Shift when starting a radius stroke or placing the first polygon point
+to add to the existing selection instead of replacing it. Overlapping weights
+combine by taking their maximum, preserving feathering without accumulation.
+Shift-clicks outside the globe leave the selection unchanged.
+
+`Select -> By value...` replaces selection using the current elevation range.
+The dialog accepts bounds in [-32767, 32767], labelled "Between" and "and"
+to the left of the number boxes, and a feather
+percentage f in [0, 100]. Full selection extends from the midpoint (100-f)% toward
+each bound; the remaining intervals taper linearly to zero at the bounds.
+Values outside the range are unselected. At 0% the entire inclusive range has
+full weight with hard edges; at 100% selection tapers from full weight at the
+range midpoint to zero at both bounds. Equal bounds
+select exact matches only. OK swaps reversed bounds before applying one undoable selection change without
+changing elevations; Cancel or Escape dismisses the dialog without applying.
+
 #### Settings Dialog (`File -> Settings...`)
 * **Point Count ($N$)**: Int slider controlling target base vertex density ($1,000$ to $1,000,000$).
 * **Jitter Strength ($J$)**: Float slider ($0.00$ to $1.00$).
@@ -382,6 +421,9 @@ The navigation system provides interactive orthographic globe manipulation:
 
 * **Mouse Drag (Left Button)**: Rotates globe around X/Y axes. Pitch is clamped to $[-1.45, +1.45]$ radians ($\sim \pm 83^\circ$) to prevent polar inversion.
 * **Mouse Wheel**: Adjusts orthographic zoom scale factor smoothly.
+* **Middle-Button Drag**: Rotates the globe regardless of the selected tool,
+  respecting UI mouse capture. Middle and right clicks do not clear selection;
+  only a left click without Shift outside the globe clears it.
 * **Double Click (Left Button)**: Casts an orthographic ray from cursor screen space into 3D world space. If the ray intersects unit sphere $S^2$, the controller smoothly rotates the globe to center the clicked coordinate.
 
 ---

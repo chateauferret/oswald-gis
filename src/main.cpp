@@ -30,10 +30,19 @@ struct GlfwSession {
 
 CameraController* activeCamera = nullptr;
 UIManager* activeUiManager = nullptr;
+int navigationButton = -1;
 
 void mouseButton(GLFWwindow* window, int button, int action, int) {
-    if (button != GLFW_MOUSE_BUTTON_LEFT || activeCamera == nullptr ||
-        (activeUiManager != nullptr && activeUiManager->IsBrushActive())) {
+    if (activeCamera == nullptr ||
+        (button != GLFW_MOUSE_BUTTON_LEFT && button != GLFW_MOUSE_BUTTON_MIDDLE)) {
+        return;
+    }
+    if (action == GLFW_RELEASE && button != navigationButton) {
+        return;
+    }
+    if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT &&
+        (navigationButton == GLFW_MOUSE_BUTTON_MIDDLE ||
+         (activeUiManager != nullptr && activeUiManager->IsBrushActive()))) {
         return;
     }
     double x = 0.0;
@@ -43,15 +52,16 @@ void mouseButton(GLFWwindow* window, int button, int action, int) {
     int height = 0;
     glfwGetWindowSize(window, &width, &height);
     const bool captured = ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureMouse;
-    activeCamera->HandleMouseButton(action == GLFW_PRESS, x, y, glfwGetTime(), width, height, captured);
+    activeCamera->HandleMouseButton(action == GLFW_PRESS, x, y, glfwGetTime(), width, height,
+                                    captured, button == GLFW_MOUSE_BUTTON_LEFT);
+    navigationButton = action == GLFW_PRESS && !captured ? button : -1;
 }
 
 void cursorPosition(GLFWwindow* window, double x, double y) {
-    if (activeCamera == nullptr ||
-        (activeUiManager != nullptr && activeUiManager->IsBrushActive())) {
+    if (activeCamera == nullptr || navigationButton == -1) {
         return;
     }
-    const bool down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    const bool down = glfwGetMouseButton(window, navigationButton) == GLFW_PRESS;
     const bool captured = ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureMouse;
     activeCamera->HandleCursorPosition(x, y, down, captured);
 }
@@ -142,6 +152,7 @@ int runApplication() {
     GlobeRenderer renderer(resources / "shaders");
     renderer.UploadGrid(*snapshot);
     renderer.SetColorMap(ColorMap::Load(resources / "assets/colormaps/default.map"));
+    renderer.SetSelectionColorMap(ColorMap::Load(resources / "assets/colormaps/grayscale.map"));
     UIManager ui(snapshot->GetOptions());
     activeUiManager = &ui;
 

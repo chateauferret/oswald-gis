@@ -234,7 +234,7 @@ void testDialog() {
     auto selectMenuItem = [&](int menu, int row, const char* label) {
         auto* bar = ImGui::FindWindowByName("##MainMenuBar");
         check(bar != nullptr && bar->Active, "Main menu bar was not rendered.");
-        constexpr std::array names{"File", "Edit", "Tools"};
+        constexpr std::array names{"File", "Edit", "Select", "Tools"};
         float x = bar->DC.CursorStartPos.x + ImGui::GetStyle().ItemSpacing.x * 0.5F;
         for (int i = 0; i < menu; ++i) {
             x += ImGui::CalcTextSize(names[i]).x + ImGui::GetStyle().ItemSpacing.x * 2.0F;
@@ -270,12 +270,12 @@ void testDialog() {
               "Elevation brush still shows an intensity slider.");
     }
     selectBrushCombo("Distance unit", 1, 1, "Miles");
-    selectMenuItem(2, 1, "Raise/Lower Brush");
+    selectMenuItem(3, 1, "Raise/Lower Brush");
     checkBrushSlider("Intensity (%)", 4, true);
     check(!sliderGrabPosition(5).has_value(), "Raise/Lower brush still has a value slider.");
     selectBrushCombo("Operation", 0, 1, "Lower");
     checkBrushSlider("Intensity (%)", 4, true);
-    selectMenuItem(2, 0, "Elevation Brush");
+    selectMenuItem(3, 0, "Elevation Brush");
     checkBrushSlider("Elevation", 4, true);
     check(!sliderGrabPosition(5).has_value(),
           "Switching tools restored an intensity slider to the elevation brush.");
@@ -394,7 +394,7 @@ void testDialog() {
           "Holding the elevation brush still applied it more than once.");
     check(grid.GetSnapshot()->GetVertices()[target].elevation == 32767.0F,
           "Undo did not restore the elevation brush stroke.");
-    selectMenuItem(2, 1, "Raise/Lower Brush");
+    selectMenuItem(3, 1, "Raise/Lower Brush");
     selectBrushCombo("Operation", 0, 1, "Lower");
     checkBrushSlider("Intensity (%)", 4, true, 0.999F);
     ImGui::GetIO().AddMousePosEvent(targetScreen.x, targetScreen.y);
@@ -434,6 +434,182 @@ void testDialog() {
           "Escape did not cancel the dialog.");
     check(grid.GetSnapshot()->GetVertices()[0].elevation == 32767.0F,
           "Cancel changed the loaded raster.");
+
+    for (const int tool : {0, 1}) {
+        selectMenuItem(2, tool, tool == 0 ? "Radius Selection" : "Polygon Selection");
+        for (const auto position : {ImVec2(1270.0F, 790.0F), ImVec2(1200.0F, 8.0F),
+                                    ImVec2(-10.0F, 400.0F),
+                                    ImVec2(1290.0F, 400.0F)}) {
+            std::vector<float> weights(grid.GetSnapshot()->GetVertices().size(), 0.25F);
+            grid.SetSelectionWeights(weights);
+            renderer.UpdateSelection(grid.GetSnapshot()->GetVertices(), true);
+            for (const auto button : {ImGuiMouseButton_Middle, ImGuiMouseButton_Right}) {
+                ImGui::GetIO().AddMousePosEvent(position.x, position.y);
+                frame();
+                ImGui::GetIO().AddMouseButtonEvent(button, true);
+                frame();
+                ImGui::GetIO().AddMouseButtonEvent(button, false);
+                frame();
+                check(grid.GetSnapshot()->HasSelection() &&
+                      grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
+                      "Middle or right click outside the globe cleared selection.");
+            }
+            ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+            click(position.x, position.y);
+            check(grid.GetSnapshot()->HasSelection() &&
+                  grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
+                  "Shift-click outside the globe changed the existing selection.");
+            ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+            frame();
+            click(position.x, position.y);
+            check(!grid.GetSnapshot()->HasSelection(),
+                  "An off-globe click with a Select tool did not clear the selection.");
+            for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+                check(vertex.selectionWeight == 0.0F,
+                      "An off-globe click left nonzero selection weights.");
+            }
+            shortcut(ImGuiKey_Z);
+            check(grid.GetSnapshot()->HasSelection() &&
+                  grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
+                  "Undo did not restore the selection cleared by an off-globe click.");
+            shortcut(ImGuiKey_Y);
+            check(!grid.GetSnapshot()->HasSelection(),
+                  "Redo did not clear the selection again.");
+            check(ui.IsBrushActive(), "Clearing selection deactivated the Select tool.");
+        }
+    }
+
+    for (const int tool : {0, 1}) {
+        for (const bool additive : {false, true}) {
+            selectMenuItem(2, tool, tool == 0 ? "Radius Selection" : "Polygon Selection");
+            const std::vector<float> original(grid.GetSnapshot()->GetVertices().size(), 0.25F);
+            grid.SetSelectionWeights(original);
+            renderer.UpdateSelection(grid.GetSnapshot()->GetVertices(), true);
+            const auto globeClick = [&](float x, float y) {
+                for (int i = 0; i < 25; ++i) {
+                    frame();
+                }
+                click(x, y);
+            };
+            ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, additive);
+            globeClick(640.0F, 350.0F);
+            ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+            frame();
+            if (tool == 1) {
+                globeClick(700.0F, 450.0F);
+                globeClick(580.0F, 450.0F);
+                key(ImGuiKey_Enter);
+            }
+            const auto selected = grid.GetSnapshot();
+            bool added = false;
+            bool outside = false;
+            for (const auto& vertex : selected->GetVertices()) {
+                added |= vertex.selectionWeight > 0.25F;
+                outside |= vertex.selectionWeight == (additive ? 0.25F : 0.0F);
+                if (additive) {
+                    check(vertex.selectionWeight >= 0.25F,
+                          "Shift selection reduced an existing selection weight.");
+                }
+            }
+            check(added && outside, "Selection did not preserve the requested add/replace mode.");
+            shortcut(ImGuiKey_Z);
+            for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+                check(vertex.selectionWeight == 0.25F,
+                      "Undo did not restore the selection before add/replace.");
+            }
+            shortcut(ImGuiKey_Y);
+            const auto redone = grid.GetSnapshot();
+            for (std::size_t i = 0; i < original.size(); ++i) {
+                check(redone->GetVertices()[i].selectionWeight ==
+                          selected->GetVertices()[i].selectionWeight,
+                      "Redo did not restore the add/replace selection.");
+            }
+            if (tool == 0) {
+                selectMenuItem(2, 0, "Radius Selection");
+            }
+        }
+    }
+
+    std::vector<float> valueElevations(grid.GetSnapshot()->GetVertices().size(), 0.0F);
+    valueElevations[0] = -100.0F;
+    valueElevations[1] = -75.0F;
+    valueElevations[2] = 50.0F;
+    valueElevations[3] = 100.0F;
+    valueElevations[4] = 120.0F;
+    grid.SetElevations(valueElevations);
+    renderer.UpdateElevations(grid.GetSnapshot()->GetVertices());
+    const auto beforeValueSelection = grid.GetSnapshot();
+    const auto valueDialog = [&] {
+        auto* dialog = ImGui::FindWindowByName("Select By Value");
+        check(dialog != nullptr && dialog->Active, "By value dialog did not open.");
+        return dialog;
+    };
+    const auto editValueBound = [&](int row, const char* text) {
+        auto* dialog = valueDialog();
+        click(dialog->DC.CursorStartPos.x + ImGui::CalcTextSize("Between").x +
+                  ImGui::GetStyle().ItemSpacing.x + 30.0F,
+              dialog->DC.CursorStartPos.y + row * rowHeight +
+                  ImGui::GetFrameHeight() * 0.5F);
+        shortcut(ImGuiKey_A);
+        ImGui::GetIO().AddInputCharactersUTF8(text);
+        frame();
+        key(ImGuiKey_Enter);
+    };
+    const auto valueDialogButton = [&](bool ok) {
+        frame();
+        frame();
+        auto* dialog = valueDialog();
+        const float okWidth = ImGui::CalcTextSize("OK").x +
+                              ImGui::GetStyle().FramePadding.x * 2.0F;
+        const float x = ok ? okWidth * 0.5F :
+            okWidth + ImGui::GetStyle().ItemSpacing.x +
+                ImGui::CalcTextSize("Cancel").x * 0.5F + ImGui::GetStyle().FramePadding.x;
+        click(dialog->DC.CursorStartPos.x + x,
+              dialog->DC.CursorPosPrevLine.y + ImGui::GetFrameHeight() * 0.5F);
+    };
+    selectMenuItem(2, 2, "By value...");
+    editValueBound(0, "-100");
+    editValueBound(1, "100");
+    valueDialogButton(false);
+    check(!dialogOpen() && grid.GetSnapshot() == beforeValueSelection,
+          "Cancelling By value changed the model or left the dialog open.");
+    selectMenuItem(2, 2, "By value...");
+    editValueBound(0, "40000");
+    valueDialogButton(true);
+    check(dialogOpen() && grid.GetSnapshot() == beforeValueSelection,
+          "Invalid value bounds changed selection or closed the dialog.");
+    editValueBound(0, "100");
+    editValueBound(1, "-100");
+    valueDialogButton(true);
+    check(!dialogOpen(), "OK did not close the By value dialog.");
+    const auto byValue = grid.GetSnapshot();
+    check(byValue->HasSelection() &&
+          byValue->GetVertices()[0].selectionWeight == 0.0F &&
+          byValue->GetVertices()[1].selectionWeight == 0.5F &&
+          byValue->GetVertices()[2].selectionWeight == 1.0F &&
+          byValue->GetVertices()[3].selectionWeight == 0.0F &&
+          byValue->GetVertices()[4].selectionWeight == 0.0F,
+          "By value dialog did not swap reversed bounds and apply the requested range.");
+    shortcut(ImGuiKey_Z);
+    check(grid.GetSnapshot()->HasSelection() == beforeValueSelection->HasSelection(),
+          "Undo did not restore the previous selection active state.");
+    for (std::size_t i = 0; i < valueElevations.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].selectionWeight ==
+                  beforeValueSelection->GetVertices()[i].selectionWeight &&
+              grid.GetSnapshot()->GetVertices()[i].elevation == valueElevations[i],
+              "Undo By value did not restore selection or changed elevation.");
+    }
+    shortcut(ImGuiKey_Y);
+    for (std::size_t i = 0; i < valueElevations.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].selectionWeight ==
+                  byValue->GetVertices()[i].selectionWeight,
+              "Redo did not restore By value selection.");
+    }
+    selectMenuItem(2, 2, "By value...");
+    editValueBound(0, "-100");
+    auto* betweenInput = ImGui::GetInputTextState(valueDialog()->GetID("##LowerBound"));
+    check(betweenInput != nullptr, "Between label did not precede the lower-bound input.");
+    valueDialogButton(false);
 }
 
 } // namespace

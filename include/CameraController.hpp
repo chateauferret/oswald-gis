@@ -5,8 +5,9 @@
 class CameraController {
 public:
     void HandleMouseButton(bool pressed, double cursorX, double cursorY, double time,
-                           int viewportWidth, int viewportHeight, bool captureMouse);
-    void HandleCursorPosition(double cursorX, double cursorY, bool leftButtonDown,
+                           int viewportWidth, int viewportHeight, bool captureMouse,
+                           bool allowRecentering = true);
+    void HandleCursorPosition(double cursorX, double cursorY, bool buttonDown,
                               bool captureMouse);
     void HandleScroll(double yOffset, bool captureMouse);
 

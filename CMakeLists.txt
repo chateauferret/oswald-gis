@@ -100,7 +100,8 @@ FetchContent_MakeAvailable(stb)
 
 find_package(OpenGL REQUIRED)
 
-add_library(oswald_model STATIC src/SphericalGrid.cpp src/ElevationRaster.cpp src/BrushTool.cpp)
+add_library(oswald_model STATIC src/SphericalGrid.cpp src/ElevationRaster.cpp src/BrushTool.cpp
+    src/SelectionTool.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
 target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r)
@@ -114,7 +115,8 @@ target_include_directories(oswald_view PUBLIC include)
 target_link_libraries(oswald_view PUBLIC oswald_model glad_gl_core_45)
 
 set(OSWALD_RESOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/resources")
-foreach(resource shaders/globe.vert shaders/globe.frag assets/colormaps/default.map)
+foreach(resource shaders/globe.vert shaders/globe.frag assets/colormaps/default.map
+                 assets/colormaps/grayscale.map)
     configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
 endforeach()
 
@@ -155,6 +157,10 @@ if(BUILD_TESTING)
     add_executable(brush_tool_tests tests/BrushToolTests.cpp)
     target_link_libraries(brush_tool_tests PRIVATE oswald_model)
     add_test(NAME brush_tool COMMAND brush_tool_tests)
+
+    add_executable(selection_tool_tests tests/SelectionToolTests.cpp)
+    target_link_libraries(selection_tool_tests PRIVATE oswald_model)
+    add_test(NAME selection_tool COMMAND selection_tool_tests)
 
     add_executable(raster_file_browser_tests tests/RasterFileBrowserTests.cpp src/RasterFileBrowser.cpp)
     target_include_directories(raster_file_browser_tests PRIVATE include)

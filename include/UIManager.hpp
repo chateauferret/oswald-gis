@@ -30,6 +30,7 @@ private:
     struct Stroke {
         std::vector<float> original;
         std::vector<float> working;
+        std::vector<float> scratch;
         std::vector<GridVertex> renderVertices;
     };
 
@@ -43,6 +44,7 @@ private:
     BrushToolManager brushTools_;
     std::optional<Stroke> stroke_;
     bool settingsOpen_ = false;
+    double pendingRaiseLowerRate_ = BrushSettings{}.raiseLowerRate;
     bool rasterOpen_ = false;
     RasterFileBrowser rasterBrowser_;
     std::filesystem::path selectedRasterPath_;

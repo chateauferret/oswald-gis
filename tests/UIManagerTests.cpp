@@ -4,11 +4,16 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -146,7 +151,134 @@ void testDialog() {
         frame();
     };
 
+    auto selectBrushCombo = [&](const char* label, int row, int selectedItem,
+                                const char* expectedItem) {
+        auto* panel = ImGui::FindWindowByName("###BrushParameters");
+        check(panel != nullptr && panel->Active, "Brush panel is not visible.");
+        const float height = ImGui::GetFrameHeight();
+        const auto start = panel->DC.CursorStartPos;
+        const ImGuiID popupId = ImHashStr("##ComboPopup", 0, panel->GetID(label));
+        ImGui::GetIO().AddMousePosEvent(start.x + panel->ItemWidthDefault - height * 0.5F,
+            start.y + row * (height + ImGui::GetStyle().ItemSpacing.y) + height * 0.5F);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+        frame();
+        auto* popup = ImGui::FindWindowByName("##Combo_00");
+        check(panel->Active && popup != nullptr && popup->Active &&
+              !ImGui::GetCurrentContext()->OpenPopupStack.empty() &&
+              ImGui::GetCurrentContext()->OpenPopupStack.back().PopupId == popupId,
+              "Clicking a brush combo arrow did not keep its dropdown and panel visible.");
+
+        ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 10.0F,
+            popup->DC.CursorStartPos.y + selectedItem * ImGui::GetTextLineHeightWithSpacing() +
+            ImGui::GetTextLineHeight() * 0.5F);
+        frame();
+        check(ImGui::GetCurrentContext()->HoveredId ==
+                  ImHashStr(expectedItem, 0, popup->GetID(selectedItem)),
+              "Brush combo did not point to the expected option.");
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+        check(!dialogOpen() && panel->Active,
+              "Selecting a brush combo option did not close the dropdown.");
+    };
+    auto checkBrushSlider = [&](const char* label, int row, bool enabled, float relativeX = 0.25F) {
+        auto* panel = ImGui::FindWindowByName("###BrushParameters");
+        check(panel != nullptr && panel->Active, "Brush panel is not visible.");
+        const float height = ImGui::GetFrameHeight();
+        const auto start = panel->DC.CursorStartPos;
+        const ImGuiID sliderId = panel->GetID(label);
+        ImGui::GetIO().AddMousePosEvent(start.x + panel->ItemWidthDefault * relativeX,
+            start.y + row * (height + ImGui::GetStyle().ItemSpacing.y) + height * 0.5F);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        check((ImGui::GetCurrentContext()->ActiveId == sliderId) == enabled,
+              enabled ? "Brush slider should be enabled." : "Brush slider should be disabled.");
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+    };
+    auto sliderGrabPosition = [&](int row) -> std::optional<float> {
+        frame();
+        auto* panel = ImGui::FindWindowByName("###BrushParameters");
+        check(panel != nullptr && panel->Active, "Brush panel is not visible.");
+        const float height = ImGui::GetFrameHeight();
+        const float top = panel->DC.CursorStartPos.y +
+                          row * (height + ImGui::GetStyle().ItemSpacing.y);
+        const ImU32 color = ImGui::GetColorU32(ImGuiCol_SliderGrab);
+        float left = std::numeric_limits<float>::max();
+        float right = std::numeric_limits<float>::lowest();
+        for (const auto& vertex : panel->DrawList->VtxBuffer) {
+            if (vertex.col == color && vertex.pos.y >= top && vertex.pos.y <= top + height) {
+                left = std::min(left, vertex.pos.x);
+                right = std::max(right, vertex.pos.x);
+            }
+        }
+        if (left > right) {
+            return std::nullopt;
+        }
+        return (left + right) * 0.5F;
+    };
+    auto click = [&](float x, float y) {
+        ImGui::GetIO().AddMousePosEvent(x, y);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+    };
+    auto selectMenuItem = [&](int menu, int row, const char* label) {
+        auto* bar = ImGui::FindWindowByName("##MainMenuBar");
+        check(bar != nullptr && bar->Active, "Main menu bar was not rendered.");
+        constexpr std::array names{"File", "Edit", "Tools"};
+        float x = bar->DC.CursorStartPos.x + ImGui::GetStyle().ItemSpacing.x * 0.5F;
+        for (int i = 0; i < menu; ++i) {
+            x += ImGui::CalcTextSize(names[i]).x + ImGui::GetStyle().ItemSpacing.x * 2.0F;
+        }
+        click(x + ImGui::CalcTextSize(names[menu]).x * 0.5F,
+              bar->Pos.y + bar->Size.y * 0.5F);
+        frame();
+        auto& popups = ImGui::GetCurrentContext()->OpenPopupStack;
+        check(!popups.empty() && popups.back().Window != nullptr, "Menu did not open.");
+        auto* popup = popups.back().Window;
+        ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 20.0F,
+            popup->DC.CursorStartPos.y + row * ImGui::GetTextLineHeightWithSpacing() +
+            ImGui::GetTextLineHeight() * 0.5F);
+        frame();
+        check(ImGui::GetCurrentContext()->HoveredId == popup->GetID(label),
+              "Menu did not point to the expected item.");
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+        frame();
+    };
+
     frame();
+    frame();
+    frame();
+    checkBrushSlider("Falloff (%)", 3, true);
+    constexpr std::array operationNames{"Replace", "Minimum", "Maximum"};
+    for (int operation = 0; operation <= 2; ++operation) {
+        selectBrushCombo("Operation", 0, operation, operationNames[operation]);
+        checkBrushSlider("Elevation", 4, true);
+        check(!sliderGrabPosition(5).has_value(),
+              "Elevation brush still shows an intensity slider.");
+    }
+    selectBrushCombo("Distance unit", 1, 1, "Miles");
+    selectMenuItem(2, 1, "Raise/Lower Brush");
+    checkBrushSlider("Intensity (%)", 4, true);
+    check(!sliderGrabPosition(5).has_value(), "Raise/Lower brush still has a value slider.");
+    selectBrushCombo("Operation", 0, 1, "Lower");
+    checkBrushSlider("Intensity (%)", 4, true);
+    selectMenuItem(2, 0, "Elevation Brush");
+    checkBrushSlider("Elevation", 4, true);
+    check(!sliderGrabPosition(5).has_value(),
+          "Switching tools restored an intensity slider to the elevation brush.");
     openDialog();
     selectRow(0);
     key(ImGuiKey_Enter);
@@ -164,12 +296,130 @@ void testDialog() {
           "Selecting a compatible raster did not close the dialog.");
     check(grid.GetSnapshot()->GetVertices()[0].elevation == 32767.0F,
           "Selected raster did not update grid elevations.");
+    const auto paintedSnapshot = grid.GetSnapshot();
+    selectMenuItem(0, 1, "Settings...");
+    auto* settings = ImGui::FindWindowByName("Settings");
+    check(settings != nullptr && settings->Active, "Settings dialog did not open.");
+    const float rowHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y;
+    auto focusSpeed = [&] {
+        click(settings->DC.CursorStartPos.x + 30.0F,
+              settings->DC.CursorStartPos.y + 2.0F * rowHeight +
+              ImGui::GetFrameHeight() * 0.5F);
+    };
+    auto editSpeed = [&](const char* text) {
+        focusSpeed();
+        shortcut(ImGuiKey_A);
+        ImGui::GetIO().AddInputCharactersUTF8(text);
+        frame();
+        key(ImGuiKey_Enter);
+    };
+    auto settingsButton = [&](bool apply) {
+        frame();
+        frame();
+        const float applyWidth = ImGui::CalcTextSize("Apply").x +
+                                 ImGui::GetStyle().FramePadding.x * 2.0F;
+        const float x = apply ? applyWidth * 0.5F :
+            applyWidth + ImGui::GetStyle().ItemSpacing.x +
+            ImGui::CalcTextSize("Cancel").x * 0.5F + ImGui::GetStyle().FramePadding.x;
+        click(settings->DC.CursorStartPos.x + x,
+              settings->DC.CursorPosPrevLine.y + ImGui::GetFrameHeight() * 0.5F);
+    };
+    focusSpeed();
+    auto* speedInput = ImGui::GetInputTextState(settings->GetID("Raise/Lower speed (units/s)"));
+    check(speedInput != nullptr && std::string_view(speedInput->TextA.Data) == "8192",
+          "Settings did not expose the default Raise/Lower speed.");
+    editSpeed("4096");
+    settingsButton(true);
+    check(!dialogOpen(), "Valid Raise/Lower speed did not apply.");
+    check(grid.GetSnapshot() == paintedSnapshot, "Changing brush speed regenerated the terrain.");
+    selectMenuItem(0, 1, "Settings...");
+    focusSpeed();
+    speedInput = ImGui::GetInputTextState(settings->GetID("Raise/Lower speed (units/s)"));
+    check(speedInput != nullptr && std::string_view(speedInput->TextA.Data) == "4096",
+          "Settings did not retain the configured Raise/Lower speed.");
+    editSpeed("-1");
+    settingsButton(true);
+    check(dialogOpen() && grid.GetSnapshot() == paintedSnapshot,
+          "Invalid Raise/Lower speed applied or changed the terrain.");
+    settingsButton(false);
+    check(!dialogOpen(), "Cancel did not close the Settings dialog.");
+    selectMenuItem(0, 1, "Settings...");
+    focusSpeed();
+    speedInput = ImGui::GetInputTextState(settings->GetID("Raise/Lower speed (units/s)"));
+    check(speedInput != nullptr && std::string_view(speedInput->TextA.Data) == "4096",
+          "Invalid or cancelled speed edits changed the configured speed.");
+    settingsButton(false);
+    const auto target = grid.GetSnapshot()->FindNearest({0.0, -1.0, 0.0});
+    const auto point = grid.GetSnapshot()->GetVertices()[target].position;
+    const auto display = ImGui::GetIO().DisplaySize;
+    const float horizontal = 1.15F * display.x / display.y;
+    const ImVec2 targetScreen((point.x / horizontal + 1.0F) * display.x * 0.5F,
+                              (1.0F - point.z / 1.15F) * display.y * 0.5F);
+    selectBrushCombo("Operation", 0, 1, "Minimum");
+    {
+        auto* panel = ImGui::FindWindowByName("###BrushParameters");
+        const float height = ImGui::GetFrameHeight();
+        const auto start = panel->DC.CursorStartPos;
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        click(start.x + panel->ItemWidthDefault * 0.5F,
+              start.y + 2.0F * (height + ImGui::GetStyle().ItemSpacing.y) + height * 0.5F);
+        key(ImGuiKey_A);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        frame();
+        ImGui::GetIO().AddInputCharactersUTF8("1500");
+        frame();
+        key(ImGuiKey_Enter);
+    }
+    auto elevationStroke = [&](int heldFrames) {
+        ImGui::GetIO().AddMousePosEvent(targetScreen.x, targetScreen.y);
+        frame();
+        ImGui::GetIO().DeltaTime = 0.5F;
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        for (int held = 0; held < heldFrames; ++held) {
+            frame();
+        }
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+        ImGui::GetIO().DeltaTime = 1.0F / 60.0F;
+        std::vector<float> elevations;
+        for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+            elevations.push_back(vertex.elevation);
+        }
         shortcut(ImGuiKey_Z);
-        check(grid.GetSnapshot()->GetVertices()[0].elevation == 0.0F,
-            "Ctrl+Z did not undo the raster import.");
-        shortcut(ImGuiKey_Y);
-        check(grid.GetSnapshot()->GetVertices()[0].elevation == 32767.0F,
-            "Ctrl+Y did not redo the raster import.");
+        return elevations;
+    };
+    const auto clicked = elevationStroke(1);
+    check(clicked[target] < 32767.0F, "Elevation brush click did not change the terrain.");
+    check(elevationStroke(6) == clicked,
+          "Holding the elevation brush still applied it more than once.");
+    check(grid.GetSnapshot()->GetVertices()[target].elevation == 32767.0F,
+          "Undo did not restore the elevation brush stroke.");
+    selectMenuItem(2, 1, "Raise/Lower Brush");
+    selectBrushCombo("Operation", 0, 1, "Lower");
+    checkBrushSlider("Intensity (%)", 4, true, 0.999F);
+    ImGui::GetIO().AddMousePosEvent(targetScreen.x, targetScreen.y);
+    frame();
+    ImGui::GetIO().DeltaTime = 0.5F;
+    ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+    frame();
+    ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    frame();
+    ImGui::GetIO().DeltaTime = 1.0F / 60.0F;
+    check(std::abs(grid.GetSnapshot()->GetVertices()[target].elevation - 30719.0F) < 0.01F,
+          "Raise/Lower stroke did not use the speed configured in Settings.");
+    shortcut(ImGuiKey_Z);
+    check(grid.GetSnapshot()->GetVertices()[target].elevation == 32767.0F,
+          "Undo did not restore the Raise/Lower stroke.");
+    shortcut(ImGuiKey_Y);
+    check(std::abs(grid.GetSnapshot()->GetVertices()[target].elevation - 30719.0F) < 0.01F,
+          "Redo did not restore the Raise/Lower stroke.");
+    shortcut(ImGuiKey_Z);
+    shortcut(ImGuiKey_Z);
+    check(grid.GetSnapshot()->GetVertices()[0].elevation == 0.0F,
+          "Ctrl+Z did not undo the raster import.");
+    shortcut(ImGuiKey_Y);
+    check(grid.GetSnapshot()->GetVertices()[0].elevation == 32767.0F,
+          "Ctrl+Y did not redo the raster import.");
     openDialog();
     for (int i = 0; i < 30; ++i) {
         frame();

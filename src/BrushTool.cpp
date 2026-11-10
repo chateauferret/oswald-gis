@@ -13,31 +13,23 @@ constexpr float minimumElevation = -32767.0F;
 constexpr float maximumElevation = 32767.0F;
 
 void validate(const SphericalGridSnapshot& grid, const std::vector<float>& elevations,
-              const ElevationBrushSettings& settings) {
+              const BrushSettings& settings, double elapsedSeconds) {
     if (elevations.size() != grid.GetVertices().size()) {
         throw std::invalid_argument("Brush elevation count must match the grid vertex count.");
     }
     if (!std::isfinite(settings.radius) || settings.radius <= 0.0 ||
         !std::isfinite(settings.falloffPercent) || settings.falloffPercent < 0.0 ||
-        settings.falloffPercent > 100.0 || !std::isfinite(settings.intensityPercent) ||
-        settings.intensityPercent < 0.0 || settings.intensityPercent > 100.0 ||
-        !std::isfinite(settings.value) || settings.value < minimumElevation ||
-        settings.value > maximumElevation) {
-        throw std::invalid_argument("Brush radius, falloff, intensity, or value is invalid.");
+        settings.falloffPercent > 100.0 || !std::isfinite(elapsedSeconds) ||
+        elapsedSeconds < 0.0) {
+        throw std::invalid_argument("Brush radius, falloff, or elapsed time is invalid.");
     }
 }
 
-float applyOperation(BrushOperation operation, float current, float value, float weight) {
+float applyOperation(BrushOperation operation, float current, float value) {
     float destination = current;
     switch (operation) {
     case BrushOperation::Replace:
         destination = value;
-        break;
-    case BrushOperation::Raise:
-        destination = std::min(maximumElevation, current + std::abs(value));
-        break;
-    case BrushOperation::Lower:
-        destination = std::max(minimumElevation, current - std::abs(value));
         break;
     case BrushOperation::Minimum:
         destination = std::min(current, value);
@@ -46,20 +38,18 @@ float applyOperation(BrushOperation operation, float current, float value, float
         destination = std::max(current, value);
         break;
     }
-    const float blended = current + (destination - current) * weight;
-    return std::clamp(blended, minimumElevation, maximumElevation);
+    return std::clamp(destination, minimumElevation, maximumElevation);
 }
 
-} // namespace
-
-std::vector<std::size_t> ElevationBrushTool::Apply(
+template <typename Operation>
+std::vector<std::size_t> applyBrush(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
-    const ElevationBrushSettings& settings) const {
-    validate(grid, elevations, settings);
+    const BrushSettings& settings, double elapsedSeconds, Operation operation) {
+    validate(grid, elevations, settings, elapsedSeconds);
     const double planetRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
                                     ? earthRadiusKilometres : earthRadiusMiles;
-    const double innerRadius = settings.radius;
-    const double outerRadius = innerRadius * (1.0 + settings.falloffPercent / 100.0);
+    const double outerRadius = settings.radius;
+    const double innerRadius = outerRadius * (1.0 - settings.falloffPercent / 100.0);
     const auto candidates = grid.FindWithinRadius(center, outerRadius, planetRadius);
     std::vector<std::size_t> changed;
     changed.reserve(candidates.size());
@@ -70,19 +60,17 @@ std::vector<std::size_t> ElevationBrushTool::Apply(
     }
     center /= centerLength;
     const auto& vertices = grid.GetVertices();
-    const double intensity = settings.intensityPercent / 100.0;
     for (const auto index : candidates) {
         const glm::dvec3 point = glm::normalize(glm::dvec3(vertices[index].position));
         const double angle = std::atan2(glm::length(glm::cross(center, point)),
                                         glm::dot(center, point));
         const double distance = angle * planetRadius;
         double falloff = 1.0;
-        if (settings.falloffPercent > 0.0 && distance > innerRadius) {
+        if (innerRadius < outerRadius && distance > innerRadius) {
             falloff = std::clamp((outerRadius - distance) / (outerRadius - innerRadius), 0.0, 1.0);
         }
-        const float weight = static_cast<float>(intensity * falloff);
-        const float updated = applyOperation(settings.operation, elevations[index],
-                                             settings.value, weight);
+        const float current = elevations[index];
+        const float updated = operation(current, falloff);
         if (updated != elevations[index]) {
             elevations[index] = updated;
             changed.push_back(index);
@@ -91,8 +79,55 @@ std::vector<std::size_t> ElevationBrushTool::Apply(
     return changed;
 }
 
+} // namespace
+
+std::vector<std::size_t> ElevationBrushTool::Apply(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& settings, double elapsedSeconds) const {
+    if (!std::isfinite(settings.value) || settings.value < minimumElevation ||
+        settings.value > maximumElevation) {
+        throw std::invalid_argument("Brush elevation value is invalid.");
+    }
+    if (settings.operation != BrushOperation::Replace &&
+        settings.operation != BrushOperation::Minimum &&
+        settings.operation != BrushOperation::Maximum) {
+        throw std::invalid_argument("Elevation brush operation is invalid.");
+    }
+    return applyBrush(grid, center, elevations, settings, elapsedSeconds,
+                      [&](float current, double falloff) {
+        const float result = applyOperation(settings.operation, current, settings.value);
+        return current + (result - current) * static_cast<float>(falloff);
+    });
+}
+
+std::vector<std::size_t> RaiseLowerBrushTool::Apply(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& settings, double elapsedSeconds) const {
+    if (!std::isfinite(settings.raiseLowerRate) || settings.raiseLowerRate <= 0.0) {
+        throw std::invalid_argument("Raise/Lower brush speed must be finite and positive.");
+    }
+    if (settings.raiseLowerOperation != RaiseLowerOperation::Raise &&
+        settings.raiseLowerOperation != RaiseLowerOperation::Lower) {
+        throw std::invalid_argument("Raise/Lower brush operation is invalid.");
+    }
+    if (!std::isfinite(settings.intensityPercent) || settings.intensityPercent < 0.0 ||
+        settings.intensityPercent > 100.0) {
+        throw std::invalid_argument("Raise/Lower brush intensity is invalid.");
+    }
+    const double direction = settings.raiseLowerOperation == RaiseLowerOperation::Raise ? 1.0 : -1.0;
+    return applyBrush(grid, center, elevations, settings, elapsedSeconds,
+                      [&](float current, double falloff) {
+        const double amount = settings.raiseLowerRate *
+                              (settings.intensityPercent / 100.0 * falloff) * elapsedSeconds;
+        return static_cast<float>(std::clamp(current + direction * amount,
+                                            static_cast<double>(minimumElevation),
+                                            static_cast<double>(maximumElevation)));
+    });
+}
+
 BrushToolManager::BrushToolManager() {
     RegisterTool(std::make_unique<ElevationBrushTool>());
+    RegisterTool(std::make_unique<RaiseLowerBrushTool>());
 }
 
 void BrushToolManager::RegisterTool(std::unique_ptr<BrushTool> tool) {

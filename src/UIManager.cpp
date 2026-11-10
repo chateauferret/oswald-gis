@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <memory>
 #include <numbers>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -191,13 +192,25 @@ void UIManager::RenderBrushPanel() {
         return;
     }
     bool open = true;
-    if (ImGui::Begin("Elevation Brush", &open)) {
+    const auto& tool = brushTools_.GetSelectedTool();
+    const bool raiseLower = dynamic_cast<const RaiseLowerBrushTool*>(&tool) != nullptr;
+    const std::string title = std::string(tool.GetName()) + "###BrushParameters";
+    if (ImGui::Begin(title.c_str(), &open)) {
         auto& settings = brushTools_.GetSettings();
-        constexpr std::array operationNames{"Replace", "Raise", "Lower", "Minimum", "Maximum"};
-        int operation = static_cast<int>(settings.operation);
-        if (ImGui::Combo("Operation", &operation, operationNames.data(),
-                         static_cast<int>(operationNames.size()))) {
-            settings.operation = static_cast<BrushOperation>(operation);
+        if (raiseLower) {
+            constexpr std::array operationNames{"Raise", "Lower"};
+            int operation = static_cast<int>(settings.raiseLowerOperation);
+            if (ImGui::Combo("Operation", &operation, operationNames.data(),
+                             static_cast<int>(operationNames.size()))) {
+                settings.raiseLowerOperation = static_cast<RaiseLowerOperation>(operation);
+            }
+        } else {
+            constexpr std::array operationNames{"Replace", "Minimum", "Maximum"};
+            int operation = static_cast<int>(settings.operation);
+            if (ImGui::Combo("Operation", &operation, operationNames.data(),
+                             static_cast<int>(operationNames.size()))) {
+                settings.operation = static_cast<BrushOperation>(operation);
+            }
         }
 
         int unit = static_cast<int>(settings.distanceUnit);
@@ -213,7 +226,7 @@ void UIManager::RenderBrushPanel() {
         float radius = static_cast<float>(settings.radius);
         const float maximumRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
                                         ? 20020.0F : 12500.0F;
-        if (ImGui::DragFloat("Inner radius", &radius, 10.0F, 0.1F,
+        if (ImGui::DragFloat("Outer radius", &radius, 10.0F, 0.1F,
                              maximumRadius, "%.1f")) {
             settings.radius = std::clamp(static_cast<double>(radius), 0.1,
                                          static_cast<double>(maximumRadius));
@@ -222,13 +235,22 @@ void UIManager::RenderBrushPanel() {
         if (ImGui::SliderFloat("Falloff (%)", &falloff, 0.0F, 100.0F, "%.0f%%")) {
             settings.falloffPercent = falloff;
         }
-        float intensity = static_cast<float>(settings.intensityPercent);
-        if (ImGui::SliderFloat("Intensity (%)", &intensity, 0.0F, 100.0F, "%.0f%%")) {
-            settings.intensityPercent = intensity;
+        if (raiseLower) {
+            float intensity = static_cast<float>(settings.intensityPercent);
+            if (ImGui::SliderFloat("Intensity (%)", &intensity, 0.0F, 100.0F, "%.0f%%")) {
+                settings.intensityPercent = intensity;
+            }
+        } else {
+            ImGui::SliderFloat("Elevation", &settings.value, -32767.0F, 32767.0F,
+                               "%.0f");
         }
-        ImGui::SliderFloat("Elevation / amount", &settings.value, -32767.0F, 32767.0F,
-                           "%.0f");
-        ImGui::TextWrapped("Left-drag over the globe to paint. Falloff feathers outward from the inner radius.");
+        ImGui::TextWrapped("Left-drag over the globe to paint. Falloff sets the tapered portion of the outer radius: 0%% is a cylinder, 100%% is a cone.");
+        if (raiseLower) {
+            ImGui::TextWrapped("At 100%% intensity, raise/lower by %.0f units per second. Configure this speed in File > Settings.",
+                              settings.raiseLowerRate);
+        } else {
+            ImGui::TextWrapped("Each click or drag applies the operation once; holding the button or retracing the stroke does not build it up further.");
+        }
     }
     ImGui::End();
     if (!open) {
@@ -270,8 +292,27 @@ void UIManager::ProcessBrushInput(SphericalFibonacciGrid& grid, GlobeRenderer& r
     if (stroke_ && brushTools_.IsActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
         !captured && cursorCenter) {
         const auto snapshot = grid.GetSnapshot();
-        brushTools_.GetSelectedTool().Apply(*snapshot, *cursorCenter, stroke_->working,
-                                            brushTools_.GetSettings());
+        const auto& tool = brushTools_.GetSelectedTool();
+        if (tool.IsContinuous()) {
+            tool.Apply(*snapshot, *cursorCenter, stroke_->working, brushTools_.GetSettings(),
+                       io.DeltaTime);
+        } else {
+            // Evaluate each dab against the pre-stroke terrain and keep the strongest
+            // effect per vertex, so overlapping or stationary dabs never compound.
+            if (stroke_->scratch.empty()) {
+                stroke_->scratch = stroke_->original;
+            }
+            const auto changed = tool.Apply(*snapshot, *cursorCenter, stroke_->scratch,
+                                            brushTools_.GetSettings(), io.DeltaTime);
+            for (const auto index : changed) {
+                const float original = stroke_->original[index];
+                if (std::abs(stroke_->scratch[index] - original) >
+                    std::abs(stroke_->working[index] - original)) {
+                    stroke_->working[index] = stroke_->scratch[index];
+                }
+                stroke_->scratch[index] = original;
+            }
+        }
         for (std::size_t i = 0; i < stroke_->working.size(); ++i) {
             stroke_->renderVertices[i].elevation = stroke_->working[i];
         }
@@ -282,8 +323,8 @@ void UIManager::ProcessBrushInput(SphericalFibonacciGrid& grid, GlobeRenderer& r
         const auto& settings = brushTools_.GetSettings();
         const double planetRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
                                         ? earthRadiusKilometres : earthRadiusMiles;
-        const double innerRadius = settings.radius;
-        const double outerRadius = innerRadius * (1.0 + settings.falloffPercent / 100.0);
+        const double outerRadius = settings.radius;
+        const double innerRadius = outerRadius * (1.0 - settings.falloffPercent / 100.0);
         constexpr ImU32 white = IM_COL32(255, 255, 255, 230);
         drawBrushRing(*cursorCenter, outerRadius, planetRadius, modelMatrix, mvp,
                       io.DisplaySize, white);
@@ -337,9 +378,14 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Tools")) {
-            bool brushActive = brushTools_.IsActive();
-            if (ImGui::MenuItem("Elevation Brush", nullptr, &brushActive)) {
-                brushTools_.SetActive(brushActive);
+            for (const auto& tool : brushTools_.GetTools()) {
+                const std::string name(tool->GetName());
+                const bool selected = brushTools_.IsActive() &&
+                    brushTools_.GetSelectedTool().GetName() == name;
+                if (ImGui::MenuItem(name.c_str(), nullptr, selected)) {
+                    brushTools_.SelectTool(name);
+                    brushTools_.SetActive(!selected);
+                }
             }
             ImGui::EndMenu();
         }
@@ -463,6 +509,7 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
     }
 
     if (settingsOpen_) {
+        pendingRaiseLowerRate_ = brushTools_.GetSettings().raiseLowerRate;
         ImGui::OpenPopup("Settings");
         settingsOpen_ = false;
     }
@@ -475,6 +522,8 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         if (ImGui::SliderFloat("Jitter Strength (J)", &jitterStrength, 0.0F, 1.0F, "%.2f")) {
             options_.jitterStrength = jitterStrength;
         }
+        ImGui::InputDouble("Raise/Lower speed (units/s)", &pendingRaiseLowerRate_,
+                           1.0, 1024.0, "%.0f");
         if (!errorMessage_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
             ImGui::TextWrapped("%s", errorMessage_.c_str());
@@ -482,13 +531,22 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         }
         if (ImGui::Button("Apply")) {
             try {
-                grid.GenerateGrid(options_);
-                undoStack_.Clear();
-                if (raster_) {
-                    const auto elevations = raster_->SampleElevations(*grid.GetSnapshot());
-                    grid.SetElevations(elevations);
+                if (!std::isfinite(pendingRaiseLowerRate_) || pendingRaiseLowerRate_ <= 0.0) {
+                    throw std::invalid_argument("Raise/Lower speed must be finite and positive.");
                 }
-                renderer.UploadGrid(*grid.GetSnapshot());
+                const auto& currentOptions = grid.GetSnapshot()->GetOptions();
+                if (options_.pointCount != currentOptions.pointCount ||
+                    options_.jitterStrength != currentOptions.jitterStrength ||
+                    options_.seed != currentOptions.seed) {
+                    grid.GenerateGrid(options_);
+                    undoStack_.Clear();
+                    if (raster_) {
+                        const auto elevations = raster_->SampleElevations(*grid.GetSnapshot());
+                        grid.SetElevations(elevations);
+                    }
+                    renderer.UploadGrid(*grid.GetSnapshot());
+                }
+                brushTools_.GetSettings().raiseLowerRate = pendingRaiseLowerRate_;
                 errorMessage_.clear();
                 ImGui::CloseCurrentPopup();
             } catch (const std::exception& error) {
@@ -501,8 +559,7 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         }
         ImGui::EndPopup();
     }
-    if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
-                                      ImGuiPopupFlags_AnyPopupLevel)) {
+    if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings")) {
         RenderBrushPanel();
     }
     ProcessBrushInput(grid, renderer, modelMatrix, zoom);

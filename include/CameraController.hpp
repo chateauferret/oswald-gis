@@ -10,6 +10,12 @@ public:
     void HandleCursorPosition(double cursorX, double cursorY, bool buttonDown,
                               bool captureMouse);
     void HandleScroll(double yOffset, bool captureMouse);
+    void Update(float deltaSeconds);
+    void Reset();
+    void SetAutoSpin(bool enabled);
+    bool IsAutoSpinEnabled() const { return autoSpin_; }
+    void SetSpinRate(float degreesPerSecond);
+    float GetSpinRate() const { return spinRate_; }
 
     glm::mat4 GetModelMatrix() const;
     float GetZoom() const { return zoom_; }
@@ -22,6 +28,8 @@ private:
     float yaw_ = 0.0F;
     float pitch_ = 0.0F;
     float zoom_ = 1.0F;
+    float spinRate_ = 16.0F;
+    bool autoSpin_ = false;
     double lastCursorX_ = 0.0;
     double lastCursorY_ = 0.0;
     double lastClickX_ = 0.0;

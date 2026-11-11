@@ -8,9 +8,11 @@ uniform mat4 uModelViewProjection;
 
 out float vElevation;
 out float vSelectionWeight;
+out vec3 vObjectPosition;
 
 void main() {
     vElevation = aElevation;
     vSelectionWeight = aSelectionWeight;
+    vObjectPosition = aPos;
     gl_Position = uModelViewProjection * vec4(aPos, 1.0);
 }

@@ -2,9 +2,11 @@
 
 #include <imgui.h>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <filesystem>
@@ -30,10 +32,15 @@ glm::mat4 brushMvp(const ImVec2& displaySize, const glm::mat4& modelMatrix, floa
     return projection * view * modelMatrix;
 }
 
+bool isInsideViewport(const ImVec2& mouse, const ImVec2& displaySize) {
+    return displaySize.x > 0.0F && displaySize.y > 0.0F &&
+           mouse.x >= 0.0F && mouse.y >= 0.0F &&
+           mouse.x < displaySize.x && mouse.y < displaySize.y;
+}
+
 std::optional<glm::dvec3> pickSphere(const ImVec2& mouse, const ImVec2& displaySize,
                                     const glm::mat4& mvp) {
-    if (displaySize.x <= 0.0F || displaySize.y <= 0.0F ||
-        mouse.x < 0.0F || mouse.y < 0.0F || mouse.x >= displaySize.x || mouse.y >= displaySize.y) {
+    if (!isInsideViewport(mouse, displaySize)) {
         return std::nullopt;
     }
     const float ndcX = 2.0F * mouse.x / displaySize.x - 1.0F;
@@ -112,6 +119,14 @@ void drawBrushRing(glm::dvec3 center, double radius, double planetRadius,
     }
 }
 
+std::optional<glm::dvec3> inspectHoverPoint(const ImVec2& mouse,
+                                          const ImVec2& displaySize,
+                                          const glm::mat4& modelMatrix,
+                                          float zoom) {
+    const auto mvp = brushMvp(displaySize, modelMatrix, zoom);
+    return pickSphere(mouse, displaySize, mvp);
+}
+
 } // namespace
 
 class RasterImportCommand final : public UndoableCommand {
@@ -174,6 +189,28 @@ private:
     std::vector<float> after_;
 };
 
+class TerrainFilterCommand final : public UndoableCommand {
+public:
+    TerrainFilterCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+                         std::vector<float> before, std::vector<float> after)
+        : grid_(grid), renderer_(renderer), before_(std::move(before)),
+          after_(std::move(after)) {}
+
+    void redo() override { Apply(after_); }
+    void undo() override { Apply(before_); }
+
+private:
+    void Apply(const std::vector<float>& elevations) {
+        grid_.SetElevations(elevations);
+        renderer_.UpdateElevations(grid_.GetSnapshot()->GetVertices());
+    }
+
+    SphericalFibonacciGrid& grid_;
+    GlobeRenderer& renderer_;
+    std::vector<float> before_;
+    std::vector<float> after_;
+};
+
 class SelectionCommand final : public UndoableCommand {
 public:
     SelectionCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
@@ -209,7 +246,117 @@ std::vector<float> selectionWeightsOf(const SphericalGridSnapshot& snapshot) {
     return weights;
 }
 
-UIManager::UIManager(const GridOptions& options) : options_(options) {}
+UIManager::UIManager(const GridOptions& options, std::filesystem::path colorMapDirectory)
+    : options_(options), previousOptions_(options),
+      colorMapDirectory_(std::move(colorMapDirectory)) {}
+
+UIManager::~UIManager() {
+    if (gridControl_) {
+        gridControl_->Cancel();
+    }
+    if (gridFuture_.valid()) {
+        gridFuture_.wait();
+    }
+}
+
+namespace {
+
+std::shared_ptr<const SphericalGridSnapshot> buildGridSnapshot(
+    const GridOptions& options, const std::shared_ptr<const ElevationRaster>& raster,
+    GridGenerationControl* control) {
+    auto generated = std::make_shared<const SphericalGridSnapshot>(options, control);
+    if (!raster) {
+        return generated;
+    }
+    if (control != nullptr && control->IsCancelled()) {
+        throw GridGenerationCancelled();
+    }
+    const auto elevations = raster->SampleElevations(*generated);
+    return std::make_shared<const SphericalGridSnapshot>(*generated, elevations);
+}
+
+} // namespace
+
+void UIManager::InstallGeneratedGrid(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+                                     std::shared_ptr<const SphericalGridSnapshot> snapshot) {
+    grid.InstallSnapshot(std::move(snapshot));
+    undoStack_.Clear();
+    stroke_.reset();
+    selectionStroke_.reset();
+    polygonPoints_.clear();
+    renderer.UploadGrid(*grid.GetSnapshot());
+    previousOptions_ = options_;
+}
+
+void UIManager::StartGridGeneration(SphericalFibonacciGrid& grid, GlobeRenderer& renderer) {
+    const GridOptions requested = options_;
+    previousOptions_ = grid.GetSnapshot()->GetOptions();
+    if (requested.pointCount <= backgroundGenerationThreshold) {
+        try {
+            InstallGeneratedGrid(grid, renderer, buildGridSnapshot(requested, raster_, nullptr));
+        } catch (...) {
+            options_ = previousOptions_;
+            throw;
+        }
+        return;
+    }
+    gridControl_ = std::make_unique<GridGenerationControl>();
+    gridCancelRequested_ = false;
+    gridProgressOpen_ = true;
+    gridFuture_ = std::async(std::launch::async,
+                             [requested, raster = raster_, control = gridControl_.get()] {
+                                 return buildGridSnapshot(requested, raster, control);
+                             });
+}
+
+void UIManager::PollGridGeneration(SphericalFibonacciGrid& grid, GlobeRenderer& renderer) {
+    if (!gridFuture_.valid() ||
+        gridFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return;
+    }
+    try {
+        InstallGeneratedGrid(grid, renderer, gridFuture_.get());
+    } catch (const GridGenerationCancelled&) {
+        options_ = previousOptions_;
+    } catch (const std::exception& error) {
+        options_ = previousOptions_;
+        legendError_ = std::string("Grid generation failed: ") + error.what();
+        legendErrorOpen_ = true;
+    }
+    gridFuture_ = {};
+    gridControl_.reset();
+}
+
+void UIManager::RenderGridProgressDialog() {
+    if (gridProgressOpen_) {
+        ImGui::OpenPopup("Generating Grid");
+        gridProgressOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Generating Grid", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize |
+                                    ImGuiWindowFlags_NoMove)) {
+        return;
+    }
+    if (!gridFuture_.valid()) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    const float progress = gridControl_ ? gridControl_->GetProgress() : 0.0F;
+    ImGui::Text("Generating %zu points...", options_.pointCount);
+    ImGui::ProgressBar(progress, ImVec2(320.0F, 0.0F));
+    ImGui::BeginDisabled(gridCancelRequested_);
+    if (ImGui::Button("Cancel") && gridControl_) {
+        gridControl_->Cancel();
+        gridCancelRequested_ = true;
+    }
+    ImGui::EndDisabled();
+    if (gridCancelRequested_) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Cancelling after the current stage; the previous grid is kept.");
+    }
+    ImGui::EndPopup();
+}
 
 void UIManager::NavigateRasterDirectory(const std::filesystem::path& directory) {
     try {
@@ -395,6 +542,59 @@ void UIManager::RenderValueSelectionDialog(SphericalFibonacciGrid& grid,
     }
 }
 
+void UIManager::RenderFillFilterDialog(SphericalFibonacciGrid& grid,
+                                       GlobeRenderer& renderer) {
+    if (fillFilterOpen_) {
+        ImGui::OpenPopup("Fill Filter");
+        fillFilterOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Fill Filter", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    constexpr std::array operationNames{"Replace", "Raise", "Lower", "Minimum", "Maximum"};
+    int operation = static_cast<int>(pendingFillSettings_.operation);
+    if (ImGui::Combo("Operation", &operation, operationNames.data(),
+                     static_cast<int>(operationNames.size()))) {
+        pendingFillSettings_.operation = static_cast<FillOperation>(operation);
+    }
+    ImGui::SliderFloat("Fill value", &pendingFillSettings_.value,
+                       -32767.0F, 32767.0F, "%.0f");
+    ImGui::TextWrapped("Raise adds the fill value; Lower subtracts it. Selection weights blend each operation, and no active selection affects the entire terrain.");
+    if (!fillFilterError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", fillFilterError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<FillFilter&>(filters_.GetFilter("Fill"));
+            filter.SetSettings(pendingFillSettings_);
+            const auto snapshot = grid.GetSnapshot();
+            std::vector<float> before;
+            before.reserve(snapshot->GetVertices().size());
+            for (const auto& vertex : snapshot->GetVertices()) {
+                before.push_back(vertex.elevation);
+            }
+            auto after = filter.Apply(*snapshot, before);
+            if (before != after) {
+                undoStack_.Execute(std::make_unique<TerrainFilterCommand>(
+                    grid, renderer, std::move(before), std::move(after)));
+            }
+            fillFilterError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            fillFilterError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        fillFilterError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void UIManager::FinishPolygonSelection(SphericalFibonacciGrid& grid, GlobeRenderer& renderer) {
     if (polygonPoints_.size() >= 3) {
         const auto snapshot = grid.GetSnapshot();
@@ -508,7 +708,8 @@ void UIManager::ProcessSelectionInput(SphericalFibonacciGrid& grid, GlobeRendere
     std::optional<glm::dvec3> cursorCenter;
     if (radiusMode || polygonMode) {
         cursorCenter = pickSphere(io.MousePos, io.DisplaySize, mvp);
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !cursorCenter) {
+        if (!captured && isInsideViewport(io.MousePos, io.DisplaySize) &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !cursorCenter) {
             if (io.KeyShift) {
                 return;
             }
@@ -620,15 +821,20 @@ void UIManager::ProcessSelectionInput(SphericalFibonacciGrid& grid, GlobeRendere
 
 bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
                        const glm::mat4& modelMatrix, float zoom) {
+    renderer.SetWireframeEnabled(viewportWireframe_);
+    renderer.SetGraticuleEnabled(viewportGraticule_);
+
+    PollGridGeneration(grid, renderer);
+    const bool generating = gridFuture_.valid() || gridProgressOpen_;
     bool requestExit = false;
     const auto undo = [&] { undoStack_.Undo(); };
     const auto redo = [&] { undoStack_.Redo(); };
-    if (ImGui::IsKeyPressed(ImGuiKey_O) && ImGui::GetIO().KeyCtrl &&
+    if (!generating && ImGui::IsKeyPressed(ImGuiKey_O) && ImGui::GetIO().KeyCtrl &&
         !ImGui::GetIO().WantTextInput) {
         rasterOpen_ = true;
         errorMessage_.clear();
     }
-    if (!ImGui::IsPopupOpen("Select By Value") &&
+    if (!generating && !ImGui::IsPopupOpen("Select By Value") &&
         !ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
             undo();
@@ -636,6 +842,34 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
             redo();
         }
     }
+    if (camera_ != nullptr) {
+        const auto* drawList = ImGui::GetForegroundDrawList();
+        ImGui::SetNextWindowPos(ImVec2(14.0F, 28.0F), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.75F);
+        ImGui::Begin("Viewport Controls", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+        if (ImGui::Button("Reset")) {
+            camera_->Reset();
+        }
+        ImGui::SameLine();
+        bool spinEnabled = camera_->IsAutoSpinEnabled();
+        if (ImGui::Checkbox("Spin", &spinEnabled)) {
+            camera_->SetAutoSpin(spinEnabled);
+        }
+        ImGui::SameLine();
+        bool wireframe = viewportWireframe_;
+        if (ImGui::Checkbox("Wireframe", &wireframe)) {
+            viewportWireframe_ = wireframe;
+        }
+        ImGui::SameLine();
+        bool graticule = viewportGraticule_;
+        if (ImGui::Checkbox("Graticule", &graticule)) {
+            viewportGraticule_ = graticule;
+        }
+        ImGui::End();
+    }
+
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open Raster...", "Ctrl+O")) {
@@ -716,7 +950,117 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Filter")) {
+            if (ImGui::MenuItem("Fill...")) {
+                const auto& filter = dynamic_cast<const FillFilter&>(
+                    filters_.GetFilter("Fill"));
+                pendingFillSettings_ = filter.GetSettings();
+                fillFilterError_.clear();
+                fillFilterOpen_ = true;
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("View")) {
+            if (ImGui::BeginMenu("Legend")) {
+                const auto renderColorMapChoices = [&](const char* label, bool selected) {
+                    if (!ImGui::BeginMenu(label)) {
+                        return;
+                    }
+                    if (colorMapDirectory_.empty()) {
+                        ImGui::TextDisabled("No colour map directory configured");
+                    } else {
+                        try {
+                            std::vector<std::filesystem::path> maps;
+                            for (const auto& entry :
+                                 std::filesystem::directory_iterator(colorMapDirectory_)) {
+                                if (entry.is_regular_file() && entry.path().extension() == ".map") {
+                                    maps.push_back(entry.path());
+                                }
+                            }
+                            std::sort(maps.begin(), maps.end());
+                            if (maps.empty()) {
+                                ImGui::TextDisabled("No colour maps available");
+                            }
+                            for (const auto& path : maps) {
+                                const auto name = path.filename().string();
+                                const bool active = selected ? selectionColorMapName_ == name
+                                                             : colorMapName_ == name;
+                                if (!ImGui::MenuItem(name.c_str(), nullptr, active)) {
+                                    continue;
+                                }
+                                try {
+                                    auto map = ColorMap::Load(path);
+                                    if (selected) {
+                                        renderer.SetSelectionColorMap(map);
+                                        selectionColorMapName_ = name;
+                                    } else {
+                                        renderer.SetColorMap(map);
+                                        colorMapName_ = name;
+                                    }
+                                } catch (const std::exception& error) {
+                                    legendError_ = error.what();
+                                    legendErrorOpen_ = true;
+                                }
+                            }
+                        } catch (const std::exception& error) {
+                            legendError_ = error.what();
+                            legendErrorOpen_ = true;
+                        }
+                    }
+                    ImGui::EndMenu();
+                };
+                renderColorMapChoices("Unselected points", false);
+                renderColorMapChoices("Selected points", true);
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenu();
+        }
         ImGui::EndMainMenuBar();
+    }
+
+    const auto& io = ImGui::GetIO();
+    if (!io.WantCaptureMouse && isInsideViewport(io.MousePos, io.DisplaySize)) {
+        const auto point = inspectHoverPoint(io.MousePos, io.DisplaySize, modelMatrix, zoom);
+        if (point) {
+            const auto normalized = glm::normalize(*point);
+            const double latitude = glm::degrees(std::atan2(normalized.z,
+                std::sqrt(normalized.x * normalized.x + normalized.y * normalized.y)));
+            const double longitude = glm::degrees(std::atan2(normalized.y, normalized.x));
+            const auto snapshot = grid.GetSnapshot();
+            const auto nearestIndex = snapshot->FindNearest(normalized);
+            const auto& vertex = snapshot->GetVertices()[nearestIndex];
+            const double elevation = static_cast<double>(vertex.elevation);
+            const double feet = elevation * 3.28083989501312;
+            const std::string label = "Lat " + std::to_string(latitude) + "° / Lon " +
+                                     std::to_string(longitude) + "°\nElev " +
+                                     std::to_string(elevation) + " m / " +
+                                     std::to_string(feet) + " ft";
+            ImGui::SetNextWindowPos(ImVec2(std::min(io.MousePos.x + 18.0F, io.DisplaySize.x - 260.0F),
+                                           std::min(io.MousePos.y + 18.0F, io.DisplaySize.y - 80.0F)),
+                                    ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.7F);
+            if (ImGui::Begin("Hover Readout", nullptr,
+                             ImGuiWindowFlags_NoDecoration |
+                             ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoFocusOnAppearing)) {
+                ImGui::TextUnformatted(label.c_str());
+                ImGui::End();
+            }
+        }
+    }
+
+    if (legendErrorOpen_) {
+        ImGui::OpenPopup("Legend Error");
+        legendErrorOpen_ = false;
+    }
+    if (ImGui::BeginPopupModal("Legend Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", legendError_.c_str());
+        if (ImGui::Button("Close")) {
+            legendError_.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     if (rasterOpen_) {
@@ -837,6 +1181,10 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
 
     if (settingsOpen_) {
         pendingRaiseLowerRate_ = brushTools_.GetSettings().raiseLowerRate;
+        pendingGraticuleColor_ = graticuleColor_;
+        pendingHighlightedGraticuleColor_ = highlightedGraticuleColor_;
+        pendingWireframeColor_ = wireframeColor_;
+        pendingWireframeSelectedColor_ = wireframeSelectedColor_;
         ImGui::OpenPopup("Settings");
         settingsOpen_ = false;
     }
@@ -851,6 +1199,18 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         }
         ImGui::InputDouble("Raise/Lower speed (units/s)", &pendingRaiseLowerRate_,
                            1.0, 1024.0, "%.0f");
+        int relaxation = static_cast<int>(options_.relaxationIterations);
+        if (ImGui::SliderInt("Relaxation Passes (Lloyd)", &relaxation, 0, 20)) {
+            options_.relaxationIterations = static_cast<std::uint32_t>(relaxation);
+        }
+        ImGui::TextWrapped("Relaxation evens out the Voronoi cells towards regular hexagons; jitter is applied afterwards.");
+        ImGui::ColorEdit3("Graticule colour", glm::value_ptr(pendingGraticuleColor_));
+        ImGui::ColorEdit3("Highlighted graticule colour",
+                          glm::value_ptr(pendingHighlightedGraticuleColor_));
+        ImGui::ColorEdit3("Wireframe colour (unselected)",
+                          glm::value_ptr(pendingWireframeColor_));
+        ImGui::ColorEdit3("Wireframe colour (selected)",
+                          glm::value_ptr(pendingWireframeSelectedColor_));
         if (!errorMessage_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
             ImGui::TextWrapped("%s", errorMessage_.c_str());
@@ -861,20 +1221,23 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
                 if (!std::isfinite(pendingRaiseLowerRate_) || pendingRaiseLowerRate_ <= 0.0) {
                     throw std::invalid_argument("Raise/Lower speed must be finite and positive.");
                 }
+                brushTools_.GetSettings().raiseLowerRate = pendingRaiseLowerRate_;
+                renderer.SetGraticuleColors(pendingGraticuleColor_,
+                                            pendingHighlightedGraticuleColor_);
+                renderer.SetWireframeColors(pendingWireframeColor_,
+                                            pendingWireframeSelectedColor_);
+                wireframeColor_ = pendingWireframeColor_;
+                wireframeSelectedColor_ = pendingWireframeSelectedColor_;
+                graticuleColor_ = pendingGraticuleColor_;
+                highlightedGraticuleColor_ = pendingHighlightedGraticuleColor_;
+                errorMessage_.clear();
                 const auto& currentOptions = grid.GetSnapshot()->GetOptions();
                 if (options_.pointCount != currentOptions.pointCount ||
                     options_.jitterStrength != currentOptions.jitterStrength ||
-                    options_.seed != currentOptions.seed) {
-                    grid.GenerateGrid(options_);
-                    undoStack_.Clear();
-                    if (raster_) {
-                        const auto elevations = raster_->SampleElevations(*grid.GetSnapshot());
-                        grid.SetElevations(elevations);
-                    }
-                    renderer.UploadGrid(*grid.GetSnapshot());
+                    options_.seed != currentOptions.seed ||
+                    options_.relaxationIterations != currentOptions.relaxationIterations) {
+                    StartGridGeneration(grid, renderer);
                 }
-                brushTools_.GetSettings().raiseLowerRate = pendingRaiseLowerRate_;
-                errorMessage_.clear();
                 ImGui::CloseCurrentPopup();
             } catch (const std::exception& error) {
                 errorMessage_ = error.what();
@@ -888,12 +1251,18 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
     }
     const bool valueSelectionDialog = valueSelectionOpen_ || ImGui::IsPopupOpen("Select By Value");
     RenderValueSelectionDialog(grid, renderer);
+    const bool fillFilterDialog = fillFilterOpen_ || ImGui::IsPopupOpen("Fill Filter");
+    RenderFillFilterDialog(grid, renderer);
+    RenderGridProgressDialog();
+    if (generating) {
+        return requestExit;
+    }
     if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings") &&
-        !valueSelectionDialog) {
+        !valueSelectionDialog && !fillFilterDialog) {
         RenderBrushPanel();
         RenderSelectionPanel();
     }
-    if (!valueSelectionDialog) {
+    if (!valueSelectionDialog && !fillFilterDialog) {
         ProcessBrushInput(grid, renderer, modelMatrix, zoom);
         ProcessSelectionInput(grid, renderer, modelMatrix, zoom);
     }

@@ -130,6 +130,10 @@ std::array<unsigned char, 3> pixel(int x, int y) {
     return result;
 }
 
+std::array<unsigned char, 3> palettePixel(int width, int height) {
+    return pixel(width / 2 + 6, height / 2 + 6);
+}
+
 void clear() {
     glClearColor(0.06F, 0.08F, 0.12F, 1.0F);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -193,7 +197,7 @@ void testGpu() {
     renderer.UploadGrid(*snapshot);
     clear();
     renderer.Draw(width, height);
-    const auto center = pixel(width / 2, height / 2);
+    const auto center = palettePixel(width, height);
     check(center[1] > center[0] * 2 && center[1] > center[2] * 2,
           "Zero-elevation globe is not coastal green.");
         check(std::abs(static_cast<int>(center[1]) - .48F * 255.0F) <= 1,
@@ -204,24 +208,45 @@ void testGpu() {
           std::abs(static_cast<int>(corner[2]) - 31) <= 1,
           "Globe overwrote background outside its silhouette.");
 
-    // Every visible region must retain its map colour, including after rotation.
-    for (const float angle : {0.0F, 1.5F, 3.0F, 4.5F}) {
-        const auto rotation = glm::rotate(glm::mat4(1.0F), angle,
-                                          glm::normalize(glm::vec3(1.0F, 0.0F, 1.0F)));
-        clear();
-        renderer.Draw(width, height, rotation);
-        for (const float x : {-.65F, 0.0F, .65F}) {
-            for (const float y : {-.65F, 0.0F, .65F}) {
-                const auto actual = pixel(
-                    static_cast<int>((.5F + x / 2.3F) * width),
-                    static_cast<int>((.5F + y / 2.3F) * height));
-                const auto expected = expectedColor(0.0F);
-                for (int channel = 0; channel < 3; ++channel) {
-                    check(std::abs(actual[channel] - expected[channel] * 255.0F) <= 1.0F,
-                          "Ambient globe colour varies with surface position or rotation.");
-                }
+    clear();
+    renderer.Draw(width, height);
+    const auto graticuleCrossing = pixel(width / 2, height / 2);
+    check(graticuleCrossing[0] > center[0] + 50 &&
+          graticuleCrossing[1] > center[1] + 10,
+          "Equator and Prime Meridian are not highlighted over the base palette.");
+    renderer.SetGraticuleColors(glm::vec3(0.75F), glm::vec3(1.0F));
+    renderer.SetGraticuleColors(glm::vec3(0.25F, 0.5F, 0.75F),
+                                glm::vec3(0.8F, 0.6F, 0.4F));
+    expectFailure([&] {
+        renderer.SetGraticuleColors(glm::vec3(1.1F), glm::vec3(1.0F));
+    });
+    expectFailure([&] {
+        renderer.SetWireframeColors(glm::vec3(-0.1F), glm::vec3(0.5F));
+    });
+    const auto countWireframePixels = [&] {
+        int count = 0;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const auto p = pixel(x, y);
+                count += p[0] > 200 && p[1] > 200 && p[2] < 60 ? 1 : 0;
             }
         }
+        return count;
+    };
+    clear();
+    renderer.Draw(width, height);
+    const int withoutWireframe = countWireframePixels();
+    renderer.SetWireframeEnabled(true);
+    clear();
+    renderer.Draw(width, height);
+    check(countWireframePixels() > withoutWireframe + 50,
+          "Voronoi wireframe did not draw in the default yellow.");
+    check(pixel(width / 2, height / 2)[1] > 100,
+          "Wireframe replaced the elevation layer instead of overlaying it.");
+    renderer.SetWireframeEnabled(false);
+    for (const float zoom : {0.4F, 1.0F, 4.0F}) {
+        clear();
+        renderer.Draw(width, height, glm::mat4(1.0F), zoom);
     }
 
     auto selectionVertices = snapshot->GetVertices();
@@ -241,7 +266,7 @@ void testGpu() {
                 renderer.UpdateSelection(selectionVertices, active);
                 clear();
                 renderer.Draw(width, height);
-                const auto actual = pixel(width / 2, height / 2);
+                const auto actual = palettePixel(width, height);
                 const glm::vec3 grayscale((elevation + 32767.0F) / 65534.0F);
                 const auto expected = active
                     ? glm::mix(grayscale, expectedColor(elevation), weight)
@@ -258,7 +283,7 @@ void testGpu() {
     renderer.UploadGrid(*grid.GetSnapshot());
     clear();
     renderer.Draw(width, height);
-    const auto emptySelection = pixel(width / 2, height / 2);
+    const auto emptySelection = palettePixel(width, height);
     for (const auto channel : emptySelection) {
         check(std::abs(channel - 127.5F) <= 1.0F,
               "Uploading an active all-zero selection did not use grayscale.");
@@ -266,7 +291,7 @@ void testGpu() {
     renderer.UploadGrid(*snapshot);
     clear();
     renderer.Draw(width, height);
-    check(pixel(width / 2, height / 2) == center,
+    check(palettePixel(width, height) == center,
           "Uploading an inactive selection did not restore the default palette.");
 
     // Constant-elevation meshes isolate the colour map from elevation interpolation.
@@ -278,7 +303,7 @@ void testGpu() {
     renderer.UpdateElevations(elevationUpdate);
     clear();
     renderer.Draw(width, height);
-    const auto updatedPixel = pixel(width / 2, height / 2);
+    const auto updatedPixel = palettePixel(width, height);
     const auto updatedColor = expectedColor(32767.0F);
     for (int channel = 0; channel < 3; ++channel) {
         check(std::abs(updatedPixel[channel] - updatedColor[channel] * 255.0F) <= 1.0F,
@@ -300,7 +325,7 @@ void testGpu() {
         renderer.UploadMesh(vertices, snapshot->GetTriangleIndices());
         clear();
         renderer.Draw(width, height);
-        const auto actual = pixel(width / 2, height / 2);
+        const auto actual = palettePixel(width, height);
         const auto expected = expectedColor(elevation);
         for (int channel = 0; channel < 3; ++channel) {
             check(std::abs(actual[channel] - expected[channel] * 255.0F) <= 2.0F,
@@ -313,7 +338,7 @@ void testGpu() {
     renderer.SetColorMap(alternate);
     clear();
     renderer.Draw(width, height);
-    const auto red = pixel(width / 2, height / 2);
+    const auto red = palettePixel(width, height);
     check(red[0] > 100 && red[1] == 0 && red[2] == 0,
           "Replacing palette did not update the maximum-elevation colour.");
     for (const float elevation : {-100.0F, 0.0F, 100.0F, 1000.0F, 2000.0F, 3000.0F}) {
@@ -323,7 +348,7 @@ void testGpu() {
         renderer.UploadMesh(vertices, snapshot->GetTriangleIndices());
         clear();
         renderer.Draw(width, height);
-        const auto actual = pixel(width / 2, height / 2);
+        const auto actual = palettePixel(width, height);
         const float blend = glm::clamp((elevation - 1000.0F) / 2000.0F, 0.0F, 1.0F);
         check(std::abs(actual[0] - blend * 255.0F) <= 1.0F && actual[1] == 0 &&
               std::abs(actual[2] - (1.0F - blend) * 255.0F) <= 1.0F,
@@ -350,7 +375,7 @@ void testGpu() {
     renderer.UploadMesh(vertices, snapshot->GetTriangleIndices());
     clear();
     renderer.Draw(width, height);
-    const auto interpolated = pixel(width / 2, height / 2);
+    const auto interpolated = palettePixel(width, height);
     check(interpolated[0] > 50 && std::abs(static_cast<int>(interpolated[0]) -
           static_cast<int>(interpolated[1])) <= 1 && interpolated[2] == 0,
           "Shader ignored irregular stops or failed to interpolate across zero.");

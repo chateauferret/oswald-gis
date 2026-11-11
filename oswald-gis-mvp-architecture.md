@@ -289,24 +289,36 @@ glVertexArrayElementBuffer(vao, ebo);
 
 The maintained GLSL 450 core shader pair is
 [globe.vert](./shaders/globe.vert) and [globe.frag](./shaders/globe.frag).
-The vertex shader applies `uModelViewProjection` and passes elevation to the
-fragment shader. Full ambient illumination preserves palette colours across
-the entire globe, independent of position and rotation.
+The vertex shader applies `uModelViewProjection` and passes elevation,
+selection weight, and object-space position to the fragment shader.
 
 Selection weights are uploaded as a separate per-vertex attribute and passed
-to the fragment shader. With an active selection, the shader blends the
-elevation colours from [grayscale.map](./assets/colormaps/grayscale.map) at
-weight zero to [default.map](./assets/colormaps/default.map) at weight one.
-Each palette has its own stop list and is evaluated at the same elevation.
-Without an active selection, the default palette is used everywhere.
+to the fragment shader. With an active selection, the shader blends from the
+selected palette at weight zero to the unselected palette at weight one. The
+initial palettes are [grayscale.map](./assets/colormaps/grayscale.map) and
+[default.map](./assets/colormaps/default.map), respectively. Each palette has
+its own stop list and is evaluated at the same elevation.
+Without an active selection, the unselected palette is used everywhere.
 Brush edits multiply their falloff by the active selection weight.
 
+The vertex shader passes object-space position to the fragment shader. The
+fragment shader derives latitude and longitude there, then draws antialiased
+parallels and meridians, with brighter Equator and Prime Meridian lines.
+Angular spacing is inversely proportional to zoom, keeping the visible grid
+density approximately stable while zooming. A view-dependent blue rim tint
+adds atmospheric edge glow.
+Graticule lines are antialiased to approximately one pixel, light grey by
+default; the Equator and Prime Meridian are white by default. Both RGB colours
+are configurable in `File -> Settings`.
+
 Colour values and stop positions are external shader data, not GLSL constants.
-The fragment shader binary-searches a single elevation stop list in a
-read-only `std430` shader storage buffer and interpolates adjacent RGB values
-exactly, without a sampled lookup texture. Elevation is clamped to
-[-32767, +32767]. Zero is treated like any other elevation: there is no
-ocean/land split or implicit sea-level threshold.
+Each palette is uploaded as a dynamic RGBA32F 1D texture whose texels store
+ordered elevation/RGB stops. The fragment shader binary-searches the texture
+and interpolates adjacent colours exactly. `View -> Legend` lists `.map` files
+from the configured colour-map directory and changes the unselected and
+selected palettes independently without rebuilding the mesh or shader.
+Elevation is clamped to [-32767, +32767]. Zero is treated like any other
+elevation: there is no ocean/land split or implicit sea-level threshold.
 
 ### 7.3 External Colour-Map Format
 
@@ -341,17 +353,15 @@ and invalid numbers are explicit errors with the file path and line number.
 
 `ColorMap::Load(path)` parses and validates the file without an OpenGL context.
 `ColorMap::GetStops()` exposes the ordered elevation/RGB list.
-`GlobeRenderer::SetColorMap(map)` uploads the stops and updates a single count.
-A future menu can load a selected map and call this
-method without rebuilding the mesh or recompiling shaders. There is no fixed
-application stop-count cap; maps must fit the GPU storage-buffer and shader
-integer-indexing limits, which are checked explicitly. Failed file loading
-does not change the active renderer palette.
+`GlobeRenderer::SetColorMap(map)` replaces the unselected palette texture;
+`SetSelectionColorMap(map)` independently replaces the selected palette
+texture. Maps must fit the GPU's 1D texture-size limit, which is checked
+explicitly. Failed file loading does not change the active renderer palette.
 
 ### 7.4 Renderer Lifecycle and Viewport
 
 `GlobeRenderer` owns the shader program, VAO, vertex buffer, index buffer, and
-colour-map storage buffer through RAII. Construct, upload, draw, and destroy
+both colour-map textures through RAII. Construct, upload, draw, and destroy
 it on the thread with its OpenGL 4.5 context current. Destruction occurs before
 the GLFW window and context are destroyed, including startup failure paths.
 Shader compilation/linking errors include driver logs; OpenGL operation errors
@@ -426,6 +436,16 @@ The navigation system provides interactive orthographic globe manipulation:
   only a left click without Shift outside the globe clears it.
 * **Double Click (Left Button)**: Casts an orthographic ray from cursor screen space into 3D world space. If the ray intersects unit sphere $S^2$, the controller smoothly rotates the globe to center the clicked coordinate.
 
+### 8.3 Consistent UI Controls
+
+Use the same widget type and presentation wherever the same kind of value is
+entered, whether in a dialog or a parameters panel. In particular, elevation
+values in [-32767, +32767] use the elevation brush's float slider: the same
+range and whole-unit display format. Apply this control consistently to other
+elevation-value inputs, including the Fill filter dialog. Use the same
+consistency rule for other data types and ranges rather than introducing a
+different widget style for equivalent values.
+
 ---
 
 ## 9. Data Ingestion & Cartographic Raster Pipeline
@@ -490,9 +510,10 @@ as an OpenGL-independent C++20 library. The `oswald_gis` executable links the
 model and graphics dependencies. `spherical_grid_tests` links only the model
 and thread library; no display is needed to run the model tests.
 
-`oswald_view` builds the renderer and colour-map loader. Shaders and the default
-map are copied at configuration time into the build's `resources` directory.
-Editing a source shader/map triggers CMake regeneration on the next build.
+`oswald_view` builds the renderer and colour-map loader. Shaders and all `.map`
+files in `assets/colormaps` are copied at configuration time into the build's
+`resources` directory. Editing a source shader/map triggers CMake regeneration
+on the next build.
 The executable uses the configured absolute resource path, independent of the
 working directory. Relocatable installation/resource discovery is not yet
 implemented; moving the build requires reconfiguration.

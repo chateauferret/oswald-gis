@@ -33,6 +33,9 @@ void validateOptions(const GridOptions& options) {
     if (options.pointCount < 1000 || options.pointCount > 1'000'000) {
         throw std::invalid_argument("Point count must be between 1,000 and 1,000,000.");
     }
+    if (options.relaxationIterations > 100) {
+        throw std::invalid_argument("Relaxation iterations must be between 0 and 100.");
+    }
     if (!std::isfinite(options.jitterStrength) ||
         options.jitterStrength < 0.0 || options.jitterStrength > 1.0) {
         throw std::invalid_argument("Jitter strength must be finite and between 0 and 1.");
@@ -146,17 +149,75 @@ void triangulate(const std::vector<GridVertex>& vertices,
     }
 }
 
+// One Lloyd step: move every site to the centroid of its spherical Voronoi cell.
+void relaxOnce(std::vector<GridVertex>& vertices, const std::vector<std::uint32_t>& indices) {
+    std::vector<glm::dvec3> sums(vertices.size(), glm::dvec3(0.0));
+    for (std::size_t face = 0; face + 2 < indices.size(); face += 3) {
+        const std::array<std::uint32_t, 3> corner{indices[face], indices[face + 1], indices[face + 2]};
+        std::array<glm::dvec3, 3> p{};
+        for (std::size_t i = 0; i < 3; ++i) {
+            p[i] = glm::dvec3(vertices[corner[i]].position);
+        }
+        glm::dvec3 normal = glm::cross(p[1] - p[0], p[2] - p[0]);
+        if (glm::dot(normal, p[0] + p[1] + p[2]) < 0.0) {
+            normal = -normal;
+        }
+        const double length = glm::length(normal);
+        if (length == 0.0) {
+            continue;
+        }
+        const glm::dvec3 circumcenter = normal / length;
+        // The cell of each site inside this triangle is the quad (site, mid, circumcenter, mid).
+        for (std::size_t i = 0; i < 3; ++i) {
+            const glm::dvec3& a = p[i];
+            const glm::dvec3 m1 = 0.5 * (a + p[(i + 1) % 3]);
+            const glm::dvec3 m2 = 0.5 * (a + p[(i + 2) % 3]);
+            const auto accumulate = [&](const glm::dvec3& b, const glm::dvec3& c) {
+                // Signed area keeps obtuse triangles (circumcenter outside) correct.
+                const double area = 0.5 * glm::dot(glm::cross(b - a, c - a), a);
+                sums[corner[i]] += area * (a + b + c) / 3.0;
+            };
+            // Orient the fan consistently regardless of vertex winding.
+            const double sign = glm::dot(glm::cross(m1 - a, m2 - a), a) >= 0.0 ? 1.0 : -1.0;
+            if (sign > 0.0) {
+                accumulate(m1, circumcenter);
+                accumulate(circumcenter, m2);
+            } else {
+                accumulate(circumcenter, m1);
+                accumulate(m2, circumcenter);
+            }
+        }
+    }
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        if (glm::dot(sums[i], sums[i]) > 0.0) {
+            vertices[i].position = glm::vec3(unitDirection(sums[i]));
+        }
+    }
+}
+
 } // namespace
 
 float PointCloudAdaptor::kdtree_get_pt(std::size_t index, std::size_t dimension) const {
     return points[index].position[static_cast<glm::vec3::length_type>(dimension)];
 }
 
-SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options)
+SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
+                                             GridGenerationControl* control)
     : options_(options), adaptor_{vertices_},
       tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
           10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
     validateOptions(options);
+    const float stageCount = static_cast<float>(options.relaxationIterations) + 1.0F;
+    const auto checkpoint = [&](float completedStages) {
+        if (control == nullptr) {
+            return;
+        }
+        if (control->IsCancelled()) {
+            throw GridGenerationCancelled();
+        }
+        control->SetProgress(std::min(completedStages / stageCount, 1.0F));
+    };
+    checkpoint(0.0F);
     vertices_.reserve(options.pointCount);
     std::mt19937 random(options.seed);
     // Explicit conversion avoids implementation-specific uniform_real_distribution mappings.
@@ -170,20 +231,30 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options)
         const double z = 1.0 - (2.0 * i + 1.0) / options.pointCount;
         const double radius = std::sqrt(std::max(0.0, 1.0 - z * z));
         const double theta = 2.0 * std::numbers::pi * i / goldenRatio;
-        glm::dvec3 position(radius * std::cos(theta), radius * std::sin(theta), z);
-        if (options.jitterStrength > 0.0) {
+        vertices_.push_back({glm::vec3(radius * std::cos(theta), radius * std::sin(theta), z), 0.0F});
+    }
+    for (std::uint32_t pass = 0; pass < options.relaxationIterations; ++pass) {
+        triangulate(vertices_, halfEdges_, triangleIndices_);
+        relaxOnce(vertices_, triangleIndices_);
+        halfEdges_.clear();
+        triangleIndices_.clear();
+        checkpoint(static_cast<float>(pass) + 1.0F);
+    }
+    if (options.jitterStrength > 0.0) {
+        for (auto& vertex : vertices_) {
             glm::dvec3 displacement;
             do {
                 displacement.x = sample();
                 displacement.y = sample();
                 displacement.z = sample();
             } while (glm::dot(displacement, displacement) > 1.0);
-            position = unitDirection(position + jitterScale * displacement);
+            vertex.position = glm::vec3(unitDirection(glm::dvec3(vertex.position) +
+                                                      jitterScale * displacement));
         }
-        vertices_.push_back({glm::vec3(position), 0.0F});
     }
     triangulate(vertices_, halfEdges_, triangleIndices_);
     tree_.buildIndex();
+    checkpoint(stageCount);
 }
 
 SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source,
@@ -279,6 +350,13 @@ SphericalFibonacciGrid::SphericalFibonacciGrid(const GridOptions& options) {
 
 void SphericalFibonacciGrid::GenerateGrid(const GridOptions& options) {
     snapshot_.store(std::make_shared<const SphericalGridSnapshot>(options));
+}
+
+void SphericalFibonacciGrid::InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot) {
+    if (!snapshot) {
+        throw std::invalid_argument("Cannot install a null grid snapshot.");
+    }
+    snapshot_.store(std::move(snapshot));
 }
 
 void SphericalFibonacciGrid::SetElevations(std::span<const float> elevations) {

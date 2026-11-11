@@ -99,9 +99,10 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(stb)
 
 find_package(OpenGL REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(oswald_model STATIC src/SphericalGrid.cpp src/ElevationRaster.cpp src/BrushTool.cpp
-    src/SelectionTool.cpp)
+    src/SelectionTool.cpp src/Filter.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
 target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r)
@@ -115,9 +116,15 @@ target_include_directories(oswald_view PUBLIC include)
 target_link_libraries(oswald_view PUBLIC oswald_model glad_gl_core_45)
 
 set(OSWALD_RESOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/resources")
-foreach(resource shaders/globe.vert shaders/globe.frag assets/colormaps/default.map
-                 assets/colormaps/grayscale.map)
+foreach(resource shaders/globe.vert shaders/globe.frag shaders/wire.vert shaders/wire.frag)
     configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
+endforeach()
+file(GLOB OSWALD_COLORMAP_FILES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/assets/colormaps/*.map")
+foreach(colormap IN LISTS OSWALD_COLORMAP_FILES)
+    get_filename_component(colormap_name "${colormap}" NAME)
+    configure_file("${colormap}" "${OSWALD_RESOURCE_DIR}/assets/colormaps/${colormap_name}"
+                   COPYONLY)
 endforeach()
 
 add_executable(oswald_gis src/main.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
@@ -135,6 +142,7 @@ target_link_libraries(oswald_gis PRIVATE
     imgui_lib
     nanoflann::nanoflann
     OpenGL::GL
+    Threads::Threads
 )
 
 include(CTest)
@@ -162,6 +170,10 @@ if(BUILD_TESTING)
     target_link_libraries(selection_tool_tests PRIVATE oswald_model)
     add_test(NAME selection_tool COMMAND selection_tool_tests)
 
+    add_executable(filter_tests tests/FilterTests.cpp)
+    target_link_libraries(filter_tests PRIVATE oswald_model)
+    add_test(NAME filter COMMAND filter_tests)
+
     add_executable(raster_file_browser_tests tests/RasterFileBrowserTests.cpp src/RasterFileBrowser.cpp)
     target_include_directories(raster_file_browser_tests PRIVATE include)
     add_test(NAME raster_file_browser COMMAND raster_file_browser_tests)
@@ -171,7 +183,7 @@ if(BUILD_TESTING)
     add_test(NAME undo_stack COMMAND undo_stack_tests)
 
     add_executable(ui_manager_tests tests/UIManagerTests.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
-    target_link_libraries(ui_manager_tests PRIVATE oswald_view imgui_lib glfw)
+    target_link_libraries(ui_manager_tests PRIVATE oswald_view oswald_controller imgui_lib glfw Threads::Threads)
     target_compile_definitions(ui_manager_tests PRIVATE
         GLFW_INCLUDE_NONE
         OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"

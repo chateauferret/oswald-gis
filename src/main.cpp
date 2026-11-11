@@ -10,6 +10,7 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
+#include <algorithm>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -99,7 +100,9 @@ struct ImGuiSession {
 } // namespace
 
 int runApplication() {
-    SphericalFibonacciGrid grid;
+    GridOptions gridOptions;
+    gridOptions.relaxationIterations = 5;
+    SphericalFibonacciGrid grid(gridOptions);
     const auto snapshot = grid.GetSnapshot();
     std::cout << "Generated " << snapshot->GetVertices().size() << " vertices and "
               << snapshot->GetTriangleIndices().size() / 3 << " spherical faces.\n"
@@ -153,10 +156,16 @@ int runApplication() {
     renderer.UploadGrid(*snapshot);
     renderer.SetColorMap(ColorMap::Load(resources / "assets/colormaps/default.map"));
     renderer.SetSelectionColorMap(ColorMap::Load(resources / "assets/colormaps/grayscale.map"));
-    UIManager ui(snapshot->GetOptions());
+    UIManager ui(snapshot->GetOptions(), resources / "assets/colormaps");
     activeUiManager = &ui;
+    ui.SetCameraController(&camera);
+    double previousTime = glfwGetTime();
 
     while (glfwWindowShouldClose(window.get()) == GLFW_FALSE) {
+        const double currentTime = glfwGetTime();
+        const float deltaSeconds = static_cast<float>(std::max(0.0, currentTime - previousTime));
+        previousTime = currentTime;
+        camera.Update(deltaSeconds);
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();

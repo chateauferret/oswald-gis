@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace {
 
@@ -85,6 +86,34 @@ void CameraController::HandleScroll(double yOffset, bool captureMouse) {
         return;
     }
     zoom_ = std::clamp(zoom_ * std::exp(static_cast<float>(yOffset) * 0.12F), 0.4F, 4.0F);
+}
+
+void CameraController::Update(float deltaSeconds) {
+    if (!std::isfinite(deltaSeconds) || deltaSeconds < 0.0F) {
+        return;
+    }
+    if (autoSpin_) {
+        yaw_ += glm::radians(spinRate_ * deltaSeconds);
+    }
+}
+
+void CameraController::Reset() {
+    yaw_ = 0.0F;
+    pitch_ = 0.0F;
+    zoom_ = 1.0F;
+    dragging_ = false;
+    lastClickTime_ = -1.0;
+}
+
+void CameraController::SetAutoSpin(bool enabled) {
+    autoSpin_ = enabled;
+}
+
+void CameraController::SetSpinRate(float degreesPerSecond) {
+    if (!std::isfinite(degreesPerSecond) || degreesPerSecond < 0.0F) {
+        throw std::invalid_argument("Camera spin rate must be finite and nonnegative.");
+    }
+    spinRate_ = degreesPerSecond;
 }
 
 glm::mat4 CameraController::GetModelMatrix() const {

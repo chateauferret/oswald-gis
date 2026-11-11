@@ -234,7 +234,7 @@ void testDialog() {
     auto selectMenuItem = [&](int menu, int row, const char* label) {
         auto* bar = ImGui::FindWindowByName("##MainMenuBar");
         check(bar != nullptr && bar->Active, "Main menu bar was not rendered.");
-        constexpr std::array names{"File", "Edit", "Select", "Tools"};
+        constexpr std::array names{"File", "Edit", "Select", "Tools", "Filter"};
         float x = bar->DC.CursorStartPos.x + ImGui::GetStyle().ItemSpacing.x * 0.5F;
         for (int i = 0; i < menu; ++i) {
             x += ImGui::CalcTextSize(names[i]).x + ImGui::GetStyle().ItemSpacing.x * 2.0F;
@@ -437,46 +437,92 @@ void testDialog() {
 
     for (const int tool : {0, 1}) {
         selectMenuItem(2, tool, tool == 0 ? "Radius Selection" : "Polygon Selection");
-        for (const auto position : {ImVec2(1270.0F, 790.0F), ImVec2(1200.0F, 8.0F),
-                                    ImVec2(-10.0F, 400.0F),
-                                    ImVec2(1290.0F, 400.0F)}) {
-            std::vector<float> weights(grid.GetSnapshot()->GetVertices().size(), 0.25F);
+        const auto restoreSelection = [&] {
+            const std::vector<float> weights(grid.GetSnapshot()->GetVertices().size(), 0.25F);
             grid.SetSelectionWeights(weights);
             renderer.UpdateSelection(grid.GetSnapshot()->GetVertices(), true);
-            for (const auto button : {ImGuiMouseButton_Middle, ImGuiMouseButton_Right}) {
-                ImGui::GetIO().AddMousePosEvent(position.x, position.y);
-                frame();
-                ImGui::GetIO().AddMouseButtonEvent(button, true);
-                frame();
-                ImGui::GetIO().AddMouseButtonEvent(button, false);
-                frame();
-                check(grid.GetSnapshot()->HasSelection() &&
-                      grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
-                      "Middle or right click outside the globe cleared selection.");
-            }
-            ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
-            click(position.x, position.y);
-            check(grid.GetSnapshot()->HasSelection() &&
-                  grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
-                  "Shift-click outside the globe changed the existing selection.");
-            ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+        };
+        restoreSelection();
+        const ImVec2 viewportBackground(1270.0F, 790.0F);
+        for (const auto button : {ImGuiMouseButton_Middle, ImGuiMouseButton_Right}) {
+            ImGui::GetIO().AddMousePosEvent(viewportBackground.x, viewportBackground.y);
             frame();
-            click(position.x, position.y);
-            check(!grid.GetSnapshot()->HasSelection(),
-                  "An off-globe click with a Select tool did not clear the selection.");
-            for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
-                check(vertex.selectionWeight == 0.0F,
-                      "An off-globe click left nonzero selection weights.");
-            }
-            shortcut(ImGuiKey_Z);
+            ImGui::GetIO().AddMouseButtonEvent(button, true);
+            frame();
+            ImGui::GetIO().AddMouseButtonEvent(button, false);
+            frame();
             check(grid.GetSnapshot()->HasSelection() &&
                   grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
-                  "Undo did not restore the selection cleared by an off-globe click.");
-            shortcut(ImGuiKey_Y);
-            check(!grid.GetSnapshot()->HasSelection(),
-                  "Redo did not clear the selection again.");
-            check(ui.IsBrushActive(), "Clearing selection deactivated the Select tool.");
+                  "Middle or right click on the viewport background cleared selection.");
         }
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+        click(viewportBackground.x, viewportBackground.y);
+        check(grid.GetSnapshot()->HasSelection() &&
+              grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
+              "Shift-click on the viewport background changed selection.");
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+        frame();
+        click(viewportBackground.x, viewportBackground.y);
+        check(!grid.GetSnapshot()->HasSelection(),
+              "A viewport-background click did not clear the selection.");
+        for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+            check(vertex.selectionWeight == 0.0F,
+                  "A viewport-background click left nonzero selection weights.");
+        }
+        shortcut(ImGuiKey_Z);
+        check(grid.GetSnapshot()->HasSelection() &&
+              grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
+              "Undo did not restore the selection cleared from the viewport.");
+        shortcut(ImGuiKey_Y);
+        check(!grid.GetSnapshot()->HasSelection(),
+              "Redo did not clear the selection again.");
+        check(ui.IsBrushActive(), "Clearing selection deactivated the Select tool.");
+
+        for (const auto position : {ImVec2(1200.0F, 8.0F), ImVec2(-10.0F, 400.0F),
+                                    ImVec2(1290.0F, 400.0F)}) {
+            restoreSelection();
+            const auto beforeClick = grid.GetSnapshot();
+            click(position.x, position.y);
+            check(grid.GetSnapshot() == beforeClick,
+                  "A click on the menu bar or outside the viewport changed selection.");
+        }
+
+        restoreSelection();
+        const auto beforeMenu = grid.GetSnapshot();
+        selectMenuItem(2, 2, "By value...");
+        check(dialogOpen() && grid.GetSnapshot() == beforeMenu,
+              "Opening a menu item changed the selection.");
+        key(ImGuiKey_Escape);
+        check(!dialogOpen() && grid.GetSnapshot() == beforeMenu,
+              "Cancelling a menu dialog changed the selection.");
+
+        auto* panel = ImGui::FindWindowByName("###SelectionOptions");
+        check(panel != nullptr && panel->Active, "Selection options panel is not visible.");
+        const float height = ImGui::GetFrameHeight();
+        const ImVec2 widgetPosition(
+            panel->DC.CursorStartPos.x + panel->ItemWidthDefault * 0.25F,
+            panel->DC.CursorStartPos.y +
+                (tool == 0 ? 2.0F * (height + ImGui::GetStyle().ItemSpacing.y) : 0.0F) +
+                height * 0.5F);
+        ImGui::GetIO().AddMousePosEvent(widgetPosition.x, widgetPosition.y);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        if (tool == 0) {
+            check(ImGui::GetCurrentContext()->ActiveId == panel->GetID("Falloff (%)"),
+                  "Selection falloff slider was not activated.");
+        }
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+        check(grid.GetSnapshot() == beforeMenu,
+              "Clicking the selection options panel changed the selection.");
+        selectMenuItem(2, 3, "Clear Selection");
+        check(!grid.GetSnapshot()->HasSelection(),
+              "The Clear Selection menu command did not clear the selection.");
+        shortcut(ImGuiKey_Z);
+        check(grid.GetSnapshot()->HasSelection() &&
+              grid.GetSnapshot()->GetVertices()[0].selectionWeight == 0.25F,
+              "Undo did not restore the selection cleared by the menu command.");
     }
 
     for (const int tool : {0, 1}) {
@@ -497,6 +543,8 @@ void testDialog() {
             frame();
             if (tool == 1) {
                 globeClick(700.0F, 450.0F);
+                selectMenuItem(2, 2, "By value...");
+                key(ImGuiKey_Escape);
                 globeClick(580.0F, 450.0F);
                 key(ImGuiKey_Enter);
             }
@@ -610,6 +658,52 @@ void testDialog() {
     auto* betweenInput = ImGui::GetInputTextState(valueDialog()->GetID("##LowerBound"));
     check(betweenInput != nullptr, "Between label did not precede the lower-bound input.");
     valueDialogButton(false);
+
+    const auto fillDialog = [&] {
+        auto* dialog = ImGui::FindWindowByName("Fill Filter");
+        check(dialog != nullptr && dialog->Active, "Fill filter dialog did not open.");
+        return dialog;
+    };
+    const auto setFillValueToMaximum = [&] {
+        auto* dialog = fillDialog();
+        ImGui::GetIO().AddMousePosEvent(
+            dialog->DC.CursorStartPos.x + dialog->ItemWidthDefault - 1.0F,
+            dialog->DC.CursorStartPos.y + rowHeight + ImGui::GetFrameHeight() * 0.5F);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        check(ImGui::GetCurrentContext()->ActiveId == dialog->GetID("Fill value"),
+              "Fill value is not controlled by an interactive slider.");
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+    };
+    const auto fillDialogApply = [&] {
+        frame();
+        frame();
+        auto* dialog = fillDialog();
+        const float buttonWidth = ImGui::CalcTextSize("Apply").x +
+                                  ImGui::GetStyle().FramePadding.x * 2.0F;
+        click(dialog->DC.CursorStartPos.x + buttonWidth * 0.5F,
+              dialog->DC.CursorPosPrevLine.y + ImGui::GetFrameHeight() * 0.5F);
+    };
+    selectMenuItem(4, 0, "Fill...");
+    setFillValueToMaximum();
+    fillDialogApply();
+    check(!dialogOpen(), "Valid Fill filter did not close its dialog.");
+    const auto afterFill = grid.GetSnapshot();
+    check(afterFill->GetVertices()[0].elevation == valueElevations[0] &&
+          afterFill->GetVertices()[1].elevation == 16346.0F &&
+          afterFill->GetVertices()[2].elevation == 32767.0F &&
+          afterFill->GetVertices()[4].elevation == valueElevations[4],
+          "Fill filter dialog did not blend using selection weights.");
+    shortcut(ImGuiKey_Z);
+    check(grid.GetSnapshot()->GetVertices()[1].elevation == valueElevations[1] &&
+          grid.GetSnapshot()->GetVertices()[2].elevation == valueElevations[2],
+          "Undo did not restore terrain after Fill filter.");
+    shortcut(ImGuiKey_Y);
+    check(grid.GetSnapshot()->GetVertices()[1].elevation == 16346.0F &&
+          grid.GetSnapshot()->GetVertices()[2].elevation == 32767.0F,
+          "Redo did not reapply the Fill filter.");
 }
 
 } // namespace

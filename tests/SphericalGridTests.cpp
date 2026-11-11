@@ -251,6 +251,83 @@ void verifyValidationAndRegeneration() {
     }
 }
 
+// Coefficient of variation of all edge lengths; lower means more uniform cells.
+double edgeLengthSpread(const SphericalGridSnapshot& snapshot) {
+    const auto& vertices = snapshot.GetVertices();
+    const auto& edges = snapshot.GetHalfEdges();
+    std::vector<double> lengths;
+    lengths.reserve(edges.size());
+    for (const auto& edge : edges) {
+        const auto& from = vertices[static_cast<std::size_t>(edge.originVertex)];
+        const auto& to = vertices[static_cast<std::size_t>(edges[edge.nextEdge].originVertex)];
+        lengths.push_back(glm::length(glm::dvec3(from.position) - glm::dvec3(to.position)));
+    }
+    double mean = 0.0;
+    for (const auto value : lengths) {
+        mean += value;
+    }
+    mean /= lengths.size();
+    double variance = 0.0;
+    for (const auto value : lengths) {
+        variance += (value - mean) * (value - mean);
+    }
+    return std::sqrt(variance / lengths.size()) / mean;
+}
+
+void verifyRelaxation() {
+    GridOptions plain{2000, 0.0, 7};
+    GridOptions relaxed = plain;
+    relaxed.relaxationIterations = 5;
+    SphericalFibonacciGrid first(plain);
+    SphericalFibonacciGrid second(relaxed);
+    SphericalFibonacciGrid repeat(relaxed);
+    verifyTopology(*second.GetSnapshot());
+    for (const auto& vertex : second.GetSnapshot()->GetVertices()) {
+        check(std::abs(glm::length(glm::dvec3(vertex.position)) - 1.0) < 1e-6,
+              "Relaxed vertex is not on the unit sphere.");
+    }
+    check(edgeLengthSpread(*second.GetSnapshot()) < edgeLengthSpread(*first.GetSnapshot()),
+          "Lloyd relaxation did not make the point spacing more uniform.");
+    for (std::size_t i = 0; i < 2000; ++i) {
+        check(second.GetSnapshot()->GetVertices()[i].position ==
+                  repeat.GetSnapshot()->GetVertices()[i].position,
+              "Relaxed generation is not reproducible.");
+    }
+    relaxed.relaxationIterations = 101;
+    expectInvalid([&] { SphericalFibonacciGrid invalid(relaxed); });
+    relaxed.relaxationIterations = 3;
+    relaxed.jitterStrength = 0.5;
+    SphericalFibonacciGrid jittered(relaxed);
+    verifyTopology(*jittered.GetSnapshot());
+}
+
+void verifyCancellation() {
+    GridGenerationControl progress;
+    GridOptions options{2000, 0.1, 3};
+    options.relaxationIterations = 2;
+    const SphericalGridSnapshot completed(options, &progress);
+    check(progress.GetProgress() == 1.0F, "Completed generation did not report full progress.");
+    check(completed.GetVertices().size() == 2000, "Generation with a control produced a wrong grid.");
+
+    GridGenerationControl cancelled;
+    cancelled.Cancel();
+    bool threw = false;
+    try {
+        const SphericalGridSnapshot snapshot(options, &cancelled);
+    } catch (const GridGenerationCancelled&) {
+        threw = true;
+    }
+    check(threw, "Cancelled generation did not throw.");
+
+    SphericalFibonacciGrid grid({1000, 0.0, 1});
+    const auto before = grid.GetSnapshot();
+    check(grid.GetSnapshot() == before, "Snapshot changed unexpectedly.");
+    auto replacement = std::make_shared<const SphericalGridSnapshot>(options);
+    grid.InstallSnapshot(replacement);
+    check(grid.GetSnapshot() == replacement, "Installed snapshot was not published.");
+    expectInvalid([&] { grid.InstallSnapshot(nullptr); });
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -275,6 +352,8 @@ int main(int argc, char** argv) {
                 verifyQueries(*snapshot);
             }
             verifyValidationAndRegeneration();
+            verifyRelaxation();
+            verifyCancellation();
         }
         std::cout << "Spherical grid tests passed.\n";
         return 0;

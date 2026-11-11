@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 struct GridVertex {
@@ -27,6 +28,26 @@ struct GridOptions {
     std::size_t pointCount = 10'000;
     double jitterStrength = 0.15;
     std::uint32_t seed = 42;
+    // Lloyd relaxation passes applied before jitter; they make the Voronoi cells more regular.
+    std::uint32_t relaxationIterations = 0;
+};
+
+// Thread-safe progress and cancellation channel for long grid generations.
+class GridGenerationControl {
+public:
+    void Cancel() { cancelled_.store(true); }
+    bool IsCancelled() const { return cancelled_.load(); }
+    float GetProgress() const { return progress_.load(); }
+    void SetProgress(float progress) { progress_.store(progress); }
+
+private:
+    std::atomic<bool> cancelled_{false};
+    std::atomic<float> progress_{0.0F};
+};
+
+class GridGenerationCancelled : public std::runtime_error {
+public:
+    GridGenerationCancelled() : std::runtime_error("Grid generation was cancelled.") {}
 };
 
 struct PointCloudAdaptor {
@@ -45,7 +66,10 @@ using KDTree3D = nanoflann::KDTreeSingleIndexAdaptor<
 
 class SphericalGridSnapshot {
 public:
-    explicit SphericalGridSnapshot(const GridOptions& options);
+    // Throws GridGenerationCancelled if the control is cancelled; cancellation is checked
+    // between stages, so a Qhull triangulation already in progress runs to completion.
+    explicit SphericalGridSnapshot(const GridOptions& options,
+                                   GridGenerationControl* control = nullptr);
     SphericalGridSnapshot(const SphericalGridSnapshot& source,
                           std::span<const float> elevations);
     SphericalGridSnapshot(const SphericalGridSnapshot& source,
@@ -81,6 +105,7 @@ class SphericalFibonacciGrid {
 public:
     explicit SphericalFibonacciGrid(const GridOptions& options = {});
     void GenerateGrid(const GridOptions& options);
+    void InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot);
     void SetElevations(std::span<const float> elevations);
     void SetSelectionWeights(std::span<const float> selectionWeights, bool active = true);
     std::shared_ptr<const SphericalGridSnapshot> GetSnapshot() const;

@@ -234,7 +234,7 @@ void testDialog() {
     auto selectMenuItem = [&](int menu, int row, const char* label) {
         auto* bar = ImGui::FindWindowByName("##MainMenuBar");
         check(bar != nullptr && bar->Active, "Main menu bar was not rendered.");
-        constexpr std::array names{"File", "Edit", "Select", "Tools", "Filter"};
+        constexpr std::array names{"File", "Edit", "Select", "Tools", "Filter", "Mesh"};
         float x = bar->DC.CursorStartPos.x + ImGui::GetStyle().ItemSpacing.x * 0.5F;
         for (int i = 0; i < menu; ++i) {
             x += ImGui::CalcTextSize(names[i]).x + ImGui::GetStyle().ItemSpacing.x * 2.0F;
@@ -704,6 +704,29 @@ void testDialog() {
     check(grid.GetSnapshot()->GetVertices()[1].elevation == 16346.0F &&
           grid.GetSnapshot()->GetVertices()[2].elevation == 32767.0F,
           "Redo did not reapply the Fill filter.");
+
+        std::vector<float> meshSelection(grid.GetSnapshot()->GetVertices().size(), 1.0F);
+        std::vector<float> uniformTerrain(meshSelection.size(), 250.0F);
+        grid.SetSelectionWeights(meshSelection, true);
+        grid.SetElevations(uniformTerrain);
+        renderer.UploadGrid(*grid.GetSnapshot());
+        const auto beforeRefinement = grid.GetSnapshot()->GetVertices().size();
+        const auto selectedFaceCount = beforeRefinement * 2 - 4;
+        selectMenuItem(5, 0, "Refine Selection");
+        check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement + selectedFaceCount,
+            "Mesh menu did not refine the selected region.");
+        shortcut(ImGuiKey_Z);
+        check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement,
+            "Undo did not restore the mesh before refinement.");
+        shortcut(ImGuiKey_Y);
+            check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement + selectedFaceCount,
+            "Redo did not restore the refined mesh.");
+        selectMenuItem(5, 1, "Coarsen Flat Selection");
+                check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement,
+                    "Coarsening after refinement did not restore the prior sampling density.");
+        shortcut(ImGuiKey_Z);
+            check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement + selectedFaceCount,
+            "Undo did not restore the mesh before coarsening.");
 }
 
 } // namespace

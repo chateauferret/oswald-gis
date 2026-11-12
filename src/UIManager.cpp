@@ -237,6 +237,28 @@ private:
     bool afterActive_;
 };
 
+class AdaptiveMeshCommand final : public UndoableCommand {
+public:
+    AdaptiveMeshCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+                        std::shared_ptr<const SphericalGridSnapshot> before,
+                        std::shared_ptr<const SphericalGridSnapshot> after)
+        : grid_(grid), renderer_(renderer), before_(std::move(before)), after_(std::move(after)) {}
+
+    void redo() override { Apply(after_); }
+    void undo() override { Apply(before_); }
+
+private:
+    void Apply(const std::shared_ptr<const SphericalGridSnapshot>& snapshot) {
+        grid_.InstallSnapshot(snapshot);
+        renderer_.UploadGrid(*snapshot);
+    }
+
+    SphericalFibonacciGrid& grid_;
+    GlobeRenderer& renderer_;
+    std::shared_ptr<const SphericalGridSnapshot> before_;
+    std::shared_ptr<const SphericalGridSnapshot> after_;
+};
+
 std::vector<float> selectionWeightsOf(const SphericalGridSnapshot& snapshot) {
     std::vector<float> weights;
     weights.reserve(snapshot.GetVertices().size());
@@ -960,6 +982,44 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Mesh")) {
+            const auto snapshot = grid.GetSnapshot();
+            ImGui::BeginDisabled(!snapshot->HasSelection());
+            if (ImGui::MenuItem("Refine Selection")) {
+                try {
+                    auto refined = snapshot->RefineSelectedRegion();
+                    if (refined) {
+                        undoStack_.Execute(std::make_unique<AdaptiveMeshCommand>(
+                            grid, renderer, snapshot, std::move(refined)));
+                        meshError_.clear();
+                    } else {
+                        meshError_ = "No selected faces are available for refinement.";
+                        meshErrorOpen_ = true;
+                    }
+                } catch (const std::exception& error) {
+                    meshError_ = error.what();
+                    meshErrorOpen_ = true;
+                }
+            }
+            if (ImGui::MenuItem("Coarsen Flat Selection")) {
+                try {
+                    auto coarsened = snapshot->CoarsenSelectedRegion(1.0F);
+                    if (coarsened) {
+                        undoStack_.Execute(std::make_unique<AdaptiveMeshCommand>(
+                            grid, renderer, snapshot, std::move(coarsened)));
+                        meshError_.clear();
+                    } else {
+                        meshError_ = "No selected, locally uniform vertices are available for coarsening.";
+                        meshErrorOpen_ = true;
+                    }
+                } catch (const std::exception& error) {
+                    meshError_ = error.what();
+                    meshErrorOpen_ = true;
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("View")) {
             if (ImGui::BeginMenu("Legend")) {
                 const auto renderColorMapChoices = [&](const char* label, bool selected) {
@@ -1058,6 +1118,19 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         ImGui::TextWrapped("%s", legendError_.c_str());
         if (ImGui::Button("Close")) {
             legendError_.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (meshErrorOpen_) {
+        ImGui::OpenPopup("Mesh Operation");
+        meshErrorOpen_ = false;
+    }
+    if (ImGui::BeginPopupModal("Mesh Operation", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", meshError_.c_str());
+        if (ImGui::Button("Close")) {
+            meshError_.clear();
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();

@@ -66,6 +66,157 @@ std::uint64_t edgeKey(std::int32_t origin, std::int32_t destination) {
            static_cast<std::uint32_t>(destination);
 }
 
+void buildHalfEdges(const std::vector<GridVertex>& vertices,
+                    const std::vector<std::uint32_t>& indices,
+                    std::vector<HalfEdge>& edges) {
+    if (vertices.size() < 4 || vertices.size() > std::numeric_limits<std::uint32_t>::max() ||
+        indices.size() != (vertices.size() * 2 - 4) * 3) {
+        throw std::runtime_error("Spherical mesh has an invalid vertex or face count.");
+    }
+    edges.clear();
+    edges.reserve(indices.size());
+    std::unordered_map<std::uint64_t, std::int32_t> unmatched;
+    unmatched.reserve(indices.size() / 2);
+    std::vector<bool> used(vertices.size(), false);
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        const auto origin = indices[i];
+        const auto destination = indices[(i / 3) * 3 + (i + 1) % 3];
+        if (origin >= vertices.size() || destination >= vertices.size() || origin == destination) {
+            throw std::runtime_error("Spherical mesh contains an invalid edge endpoint.");
+        }
+        used[origin] = true;
+        edges.push_back({static_cast<std::int32_t>(origin), -1,
+                         static_cast<std::int32_t>((i / 3) * 3 + (i + 1) % 3),
+                         static_cast<std::int32_t>(i / 3)});
+    }
+    if (std::find(used.begin(), used.end(), false) != used.end()) {
+        throw std::runtime_error("Spherical mesh contains an isolated vertex.");
+    }
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+        auto& edge = edges[i];
+        const auto destination = edges[edge.nextEdge].originVertex;
+        const auto reverse = unmatched.find(edgeKey(destination, edge.originVertex));
+        if (reverse != unmatched.end()) {
+            edge.twinEdge = reverse->second;
+            edges[static_cast<std::size_t>(reverse->second)].twinEdge =
+                static_cast<std::int32_t>(i);
+            unmatched.erase(reverse);
+        } else if (!unmatched.emplace(edgeKey(edge.originVertex, destination),
+                                      static_cast<std::int32_t>(i)).second) {
+            throw std::runtime_error("Spherical mesh contains duplicate directed edges.");
+        }
+    }
+    if (!unmatched.empty()) {
+        throw std::runtime_error("Spherical mesh has an open boundary.");
+    }
+}
+
+struct RefinedPoint {
+    glm::dvec3 position;
+    float elevation;
+    float selectionWeight;
+};
+
+RefinedPoint interpolateFacePoint(const std::vector<GridVertex>& vertices,
+                                  const std::uint32_t* face) {
+    const glm::dvec3 a = unitDirection(glm::dvec3(vertices[face[0]].position));
+    const glm::dvec3 b = unitDirection(glm::dvec3(vertices[face[1]].position));
+    const glm::dvec3 c = unitDirection(glm::dvec3(vertices[face[2]].position));
+    const glm::dvec3 direction = unitDirection(a + b + c);
+    const glm::dvec3 normal = glm::cross(b - a, c - a);
+    const double denominator = glm::dot(normal, direction);
+    if (std::abs(denominator) < 1e-14) {
+        throw std::runtime_error("Cannot interpolate attributes across a degenerate spherical face.");
+    }
+    const glm::dvec3 point = direction * (glm::dot(normal, a) / denominator);
+    const glm::dvec3 v0 = b - a;
+    const glm::dvec3 v1 = c - a;
+    const glm::dvec3 v2 = point - a;
+    const double d00 = glm::dot(v0, v0);
+    const double d01 = glm::dot(v0, v1);
+    const double d11 = glm::dot(v1, v1);
+    const double d20 = glm::dot(v2, v0);
+    const double d21 = glm::dot(v2, v1);
+    const double barycentricDenominator = d00 * d11 - d01 * d01;
+    if (std::abs(barycentricDenominator) < 1e-20) {
+        throw std::runtime_error("Cannot interpolate attributes across a degenerate spherical face.");
+    }
+    const double weightB = (d11 * d20 - d01 * d21) / barycentricDenominator;
+    const double weightC = (d00 * d21 - d01 * d20) / barycentricDenominator;
+    const double weightA = 1.0 - weightB - weightC;
+    const auto value = [&](auto member) {
+        return static_cast<float>(weightA * (vertices[face[0]].*member) +
+                                  weightB * (vertices[face[1]].*member) +
+                                  weightC * (vertices[face[2]].*member));
+    };
+    return {direction, value(&GridVertex::elevation),
+            std::clamp(value(&GridVertex::selectionWeight), 0.0F, 1.0F)};
+}
+
+void insertHullPoint(std::vector<GridVertex>& vertices,
+                     std::vector<std::uint32_t>& indices,
+                     std::vector<HalfEdge>& edges,
+                     std::vector<std::uint8_t>& refinementVertices,
+                     const RefinedPoint& point) {
+    const auto newIndex = static_cast<std::uint32_t>(vertices.size());
+    const glm::vec3 storedPosition(point.position);
+    vertices.push_back({storedPosition, point.elevation, point.selectionWeight});
+    refinementVertices.push_back(1);
+    const glm::dvec3 p = unitDirection(glm::dvec3(storedPosition));
+    const std::size_t faceCount = indices.size() / 3;
+    std::vector<bool> visible(faceCount, false);
+    std::size_t visibleCount = 0;
+    for (std::size_t face = 0; face < faceCount; ++face) {
+        const glm::dvec3 a = unitDirection(glm::dvec3(vertices[indices[3 * face]].position));
+        const glm::dvec3 b = unitDirection(glm::dvec3(vertices[indices[3 * face + 1]].position));
+        const glm::dvec3 c = unitDirection(glm::dvec3(vertices[indices[3 * face + 2]].position));
+        const glm::dvec3 normal = glm::cross(b - a, c - a);
+        visible[face] = glm::dot(normal, p - a) > 1e-12 * glm::length(normal);
+        visibleCount += visible[face] ? 1U : 0U;
+    }
+    if (visibleCount == 0 || visibleCount == faceCount) {
+        vertices.pop_back();
+        refinementVertices.pop_back();
+        throw std::runtime_error("Incremental spherical insertion found no valid hull cavity.");
+    }
+
+    std::vector<std::uint32_t> nextIndices;
+    nextIndices.reserve((vertices.size() * 2 - 4) * 3);
+    for (std::size_t face = 0; face < faceCount; ++face) {
+        if (!visible[face]) {
+            nextIndices.insert(nextIndices.end(), indices.begin() + static_cast<std::ptrdiff_t>(3 * face),
+                               indices.begin() + static_cast<std::ptrdiff_t>(3 * face + 3));
+        }
+    }
+    std::size_t horizonCount = 0;
+    for (std::size_t edgeIndex = 0; edgeIndex < edges.size(); ++edgeIndex) {
+        const auto& edge = edges[edgeIndex];
+        if (!visible[static_cast<std::size_t>(edge.faceIndex)] ||
+            visible[static_cast<std::size_t>(edges[static_cast<std::size_t>(edge.twinEdge)].faceIndex)]) {
+            continue;
+        }
+        const auto destination = edges[static_cast<std::size_t>(edge.nextEdge)].originVertex;
+        const auto origin = edge.originVertex;
+        const glm::dvec3 a = unitDirection(glm::dvec3(vertices[static_cast<std::size_t>(origin)].position));
+        const glm::dvec3 b = unitDirection(glm::dvec3(vertices[static_cast<std::size_t>(destination)].position));
+        if (glm::dot(glm::cross(b - a, p - a), a) <= 0.0) {
+            vertices.pop_back();
+            refinementVertices.pop_back();
+            throw std::runtime_error("Incremental insertion produced an inward-facing cavity face.");
+        }
+        nextIndices.insert(nextIndices.end(), {static_cast<std::uint32_t>(origin),
+                               static_cast<std::uint32_t>(destination), newIndex});
+        ++horizonCount;
+    }
+    if (horizonCount < 3) {
+        vertices.pop_back();
+        refinementVertices.pop_back();
+        throw std::runtime_error("Incremental spherical insertion produced an invalid horizon.");
+    }
+    indices = std::move(nextIndices);
+    buildHalfEdges(vertices, indices, edges);
+}
+
 void triangulate(const std::vector<GridVertex>& vertices,
                  std::vector<HalfEdge>& edges,
                  std::vector<std::uint32_t>& indices) {
@@ -122,35 +273,12 @@ void triangulate(const std::vector<GridVertex>& vertices,
         throw std::runtime_error("Spherical hull does not include every generated vertex.");
     }
 
-    edges.reserve(indices.size());
-    std::unordered_map<std::uint64_t, std::int32_t> unmatched;
-    unmatched.reserve(indices.size() / 2);
-    for (std::size_t i = 0; i < indices.size(); ++i) {
-        const auto faceStart = static_cast<std::int32_t>((i / 3) * 3);
-        edges.push_back({static_cast<std::int32_t>(indices[i]), -1,
-                         faceStart + static_cast<std::int32_t>((i + 1) % 3),
-                         static_cast<std::int32_t>(i / 3)});
-    }
-    for (std::size_t i = 0; i < edges.size(); ++i) {
-        auto& edge = edges[i];
-        const auto destination = edges[edge.nextEdge].originVertex;
-        const auto reverse = unmatched.find(edgeKey(destination, edge.originVertex));
-        if (reverse != unmatched.end()) {
-            edge.twinEdge = reverse->second;
-            edges[reverse->second].twinEdge = static_cast<std::int32_t>(i);
-            unmatched.erase(reverse);
-        } else if (!unmatched.emplace(edgeKey(edge.originVertex, destination),
-                                      static_cast<std::int32_t>(i)).second) {
-            throw std::runtime_error("Spherical hull contains duplicate directed edges.");
-        }
-    }
-    if (!unmatched.empty()) {
-        throw std::runtime_error("Spherical hull has an open boundary.");
-    }
+    buildHalfEdges(vertices, indices, edges);
 }
 
 // One Lloyd step: move every site to the centroid of its spherical Voronoi cell.
-void relaxOnce(std::vector<GridVertex>& vertices, const std::vector<std::uint32_t>& indices) {
+void relaxOnce(std::vector<GridVertex>& vertices, const std::vector<std::uint32_t>& indices,
+               const std::vector<bool>* movable = nullptr, double damping = 1.0) {
     std::vector<glm::dvec3> sums(vertices.size(), glm::dvec3(0.0));
     for (std::size_t face = 0; face + 2 < indices.size(); face += 3) {
         const std::array<std::uint32_t, 3> corner{indices[face], indices[face + 1], indices[face + 2]};
@@ -189,8 +317,11 @@ void relaxOnce(std::vector<GridVertex>& vertices, const std::vector<std::uint32_
         }
     }
     for (std::size_t i = 0; i < vertices.size(); ++i) {
-        if (glm::dot(sums[i], sums[i]) > 0.0) {
-            vertices[i].position = glm::vec3(unitDirection(sums[i]));
+        if ((movable == nullptr || (*movable)[i]) && glm::dot(sums[i], sums[i]) > 0.0) {
+            const auto target = unitDirection(sums[i]);
+            const auto current = unitDirection(glm::dvec3(vertices[i].position));
+            vertices[i].position = glm::vec3(unitDirection((1.0 - damping) * current +
+                                                           damping * target));
         }
     }
 }
@@ -253,6 +384,7 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
         }
     }
     triangulate(vertices_, halfEdges_, triangleIndices_);
+    refinementVertices_.assign(vertices_.size(), 0);
     tree_.buildIndex();
     checkpoint(stageCount);
 }
@@ -260,7 +392,8 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
 SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source,
                                              std::span<const float> elevations)
     : options_(source.options_), vertices_(source.vertices_), halfEdges_(source.halfEdges_),
-      triangleIndices_(source.triangleIndices_), selectionActive_(source.selectionActive_),
+    triangleIndices_(source.triangleIndices_),
+    refinementVertices_(source.refinementVertices_), selectionActive_(source.selectionActive_),
       adaptor_{vertices_},
       tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
           10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
@@ -282,7 +415,8 @@ SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source
                                              std::vector<float> selectionWeights,
                                              bool selectionActive)
     : options_(source.options_), vertices_(source.vertices_), halfEdges_(source.halfEdges_),
-      triangleIndices_(source.triangleIndices_), selectionActive_(selectionActive),
+    triangleIndices_(source.triangleIndices_),
+    refinementVertices_(source.refinementVertices_), selectionActive_(selectionActive),
       adaptor_{vertices_},
       tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
           10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
@@ -304,6 +438,399 @@ SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source
         vertices_[i].selectionWeight = selectionActive ? selectionWeights[i] : 0.0F;
     }
     tree_.buildIndex();
+}
+
+SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
+                                             std::vector<GridVertex> vertices,
+                                             std::vector<std::uint32_t> triangleIndices,
+                                                                                         std::vector<std::uint8_t> refinementVertices,
+                                             bool selectionActive)
+    : options_(options), vertices_(std::move(vertices)),
+            triangleIndices_(std::move(triangleIndices)),
+            refinementVertices_(std::move(refinementVertices)), selectionActive_(selectionActive),
+      adaptor_{vertices_},
+      tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
+          10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+    buildHalfEdges(vertices_, triangleIndices_, halfEdges_);
+    if (refinementVertices_.size() != vertices_.size()) {
+        throw std::invalid_argument("Refinement provenance count must match the mesh vertex count.");
+    }
+    for (const auto& vertex : vertices_) {
+        if (!std::isfinite(vertex.position.x) || !std::isfinite(vertex.position.y) ||
+            !std::isfinite(vertex.position.z) || glm::dot(vertex.position, vertex.position) == 0.0F ||
+            !std::isfinite(vertex.elevation) || vertex.elevation < -32767.0F ||
+            vertex.elevation > 32767.0F || !std::isfinite(vertex.selectionWeight) ||
+            vertex.selectionWeight < 0.0F || vertex.selectionWeight > 1.0F) {
+            throw std::invalid_argument("Adaptive mesh attributes are outside their supported ranges.");
+        }
+    }
+    tree_.buildIndex();
+}
+
+std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::RefineSelectedRegion(
+    std::size_t maxNewPoints) const {
+    if (maxNewPoints > 1'000'000) {
+        throw std::invalid_argument("Refinement point limit cannot exceed 1,000,000.");
+    }
+    if (!selectionActive_) {
+        return nullptr;
+    }
+    if (vertices_.size() >= 1'000'000) {
+        throw std::runtime_error("The spherical mesh has reached its 1,000,000-vertex limit.");
+    }
+    std::vector<std::size_t> selectedFaces;
+    selectedFaces.reserve(std::min(triangleIndices_.size() / 3,
+                                   (maxNewPoints == 0 ? 4096 : maxNewPoints) * 8));
+    for (std::size_t face = 0; face < triangleIndices_.size() / 3; ++face) {
+        const auto a = triangleIndices_[3 * face];
+        const auto b = triangleIndices_[3 * face + 1];
+        const auto c = triangleIndices_[3 * face + 2];
+        const float strongestWeight = std::max({vertices_[a].selectionWeight,
+                            vertices_[b].selectionWeight,
+                            vertices_[c].selectionWeight});
+        if (strongestWeight >= 0.5F) {
+            selectedFaces.push_back(face);
+        }
+    }
+    if (selectedFaces.empty()) {
+        return nullptr;
+    }
+
+    const std::size_t insertCount = maxNewPoints == 0
+                                        ? selectedFaces.size()
+                                        : std::min(maxNewPoints, selectedFaces.size());
+    if (insertCount > 1'000'000 - vertices_.size()) {
+        throw std::runtime_error("Refinement would exceed the 1,000,000-vertex mesh limit. "
+                                 "Select a smaller region or use a point limit.");
+    }
+    std::vector<RefinedPoint> points;
+    points.reserve(insertCount);
+    for (std::size_t i = 0; i < insertCount; ++i) {
+        const std::size_t selectedIndex = ((2 * i + 1) * selectedFaces.size()) /
+                                          (2 * insertCount);
+        const auto faceOffset = 3 * selectedFaces[selectedIndex];
+        points.push_back(interpolateFacePoint(vertices_, triangleIndices_.data() + faceOffset));
+    }
+
+    auto vertices = vertices_;
+    auto indices = triangleIndices_;
+    auto edges = halfEdges_;
+    auto refinementVertices = refinementVertices_;
+    if (points.size() <= 32) {
+        for (const auto& point : points) {
+            insertHullPoint(vertices, indices, edges, refinementVertices, point);
+        }
+    } else {
+        vertices.reserve(vertices.size() + points.size());
+        refinementVertices.reserve(refinementVertices.size() + points.size());
+        for (const auto& point : points) {
+            vertices.push_back({glm::vec3(point.position), point.elevation,
+                                point.selectionWeight});
+            refinementVertices.push_back(1);
+        }
+        indices.clear();
+        edges.clear();
+        triangulate(vertices, edges, indices);
+    }
+    return std::shared_ptr<const SphericalGridSnapshot>(new SphericalGridSnapshot(
+        options_, std::move(vertices), std::move(indices),
+        std::move(refinementVertices), selectionActive_));
+}
+
+std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::CoarsenSelectedRegion(
+    float maximumElevationDifference, std::size_t maxRemovedVertices) const {
+    if (!std::isfinite(maximumElevationDifference) || maximumElevationDifference < 0.0F ||
+        maximumElevationDifference > 65534.0F) {
+        throw std::invalid_argument("Coarsening elevation tolerance must be finite and in [0, 65534].");
+    }
+    if (maxRemovedVertices > 1'000'000) {
+        throw std::invalid_argument("Coarsening vertex limit cannot exceed 1,000,000.");
+    }
+    if (!selectionActive_ || vertices_.size() <= 4) {
+        return nullptr;
+    }
+    const std::size_t removalLimit = maxRemovedVertices == 0
+                                         ? vertices_.size() - 4
+                                         : std::min(maxRemovedVertices, vertices_.size() - 4);
+    std::vector<std::int32_t> firstEdges(vertices_.size(), -1);
+    for (std::size_t edge = 0; edge < halfEdges_.size(); ++edge) {
+        const auto origin = static_cast<std::size_t>(halfEdges_[edge].originVertex);
+        if (firstEdges[origin] < 0) {
+            firstEdges[origin] = static_cast<std::int32_t>(edge);
+        }
+    }
+    std::vector<std::size_t> refinementCandidates;
+    std::vector<std::size_t> generalCandidates;
+    std::vector<bool> relaxable(vertices_.size(), false);
+    for (std::size_t vertexIndex = 0; vertexIndex < vertices_.size(); ++vertexIndex) {
+        float minimum = vertices_[vertexIndex].elevation;
+        float maximum = minimum;
+        if (firstEdges[vertexIndex] < 0) {
+            continue;
+        }
+        auto edgeIndex = firstEdges[vertexIndex];
+        const auto firstIndex = edgeIndex;
+        bool neighborSelected = false;
+        bool neighborUnselected = false;
+        do {
+            const auto neighbor = static_cast<std::size_t>(
+                halfEdges_[static_cast<std::size_t>(halfEdges_[static_cast<std::size_t>(edgeIndex)].nextEdge)]
+                    .originVertex);
+            minimum = std::min(minimum, vertices_[neighbor].elevation);
+            maximum = std::max(maximum, vertices_[neighbor].elevation);
+            neighborSelected |= vertices_[neighbor].selectionWeight >= 0.5F;
+            neighborUnselected |= vertices_[neighbor].selectionWeight < 0.5F;
+            edgeIndex = halfEdges_[static_cast<std::size_t>(
+                halfEdges_[static_cast<std::size_t>(edgeIndex)].twinEdge)].nextEdge;
+        } while (edgeIndex != firstIndex);
+        if (maximum - minimum > maximumElevationDifference) {
+            continue;
+        }
+        const bool selected = vertices_[vertexIndex].selectionWeight >= 0.5F;
+        relaxable[vertexIndex] = selected && !neighborUnselected;
+        if (refinementVertices_[vertexIndex] != 0 && (selected || neighborSelected)) {
+            refinementCandidates.push_back(vertexIndex);
+        } else if (selected && !neighborUnselected) {
+            generalCandidates.push_back(vertexIndex);
+        }
+    }
+
+    std::vector<std::size_t> removable;
+    bool regenerateSelectedRegion = false;
+    std::size_t regeneratedPointCount = 0;
+    if (!refinementCandidates.empty()) {
+        const auto count = std::min(refinementCandidates.size(), removalLimit);
+        removable.insert(removable.end(), refinementCandidates.begin(),
+                         refinementCandidates.begin() + static_cast<std::ptrdiff_t>(count));
+    } else if (!generalCandidates.empty()) {
+        if (maxRemovedVertices == 0) {
+            // Replace the selected interior instead of retaining a biased subset of its
+            // original Fibonacci sites. New samples are area-distributed and Poisson-spaced.
+            removable = generalCandidates;
+            regeneratedPointCount = std::max<std::size_t>(4, generalCandidates.size() / 2);
+            regenerateSelectedRegion = true;
+        } else {
+            const std::size_t target = std::min(removalLimit, maxRemovedVertices);
+            const auto priority = [](std::size_t index) {
+                std::uint64_t value = static_cast<std::uint64_t>(index) + 0x9e3779b97f4a7c15ULL;
+                value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+                value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+                return value ^ (value >> 31);
+            };
+            std::sort(generalCandidates.begin(), generalCandidates.end(), [&](std::size_t a,
+                                                                              std::size_t b) {
+                const auto priorityA = priority(a);
+                const auto priorityB = priority(b);
+                return priorityA == priorityB ? a < b : priorityA < priorityB;
+            });
+            std::vector<bool> removed(vertices_.size(), false);
+            for (const auto vertexIndex : generalCandidates) {
+                if (removable.size() >= target) {
+                    break;
+                }
+                auto edgeIndex = firstEdges[vertexIndex];
+                const auto firstIndex = edgeIndex;
+                std::size_t removedNeighbors = 0;
+                std::size_t degree = 0;
+                do {
+                    const auto neighbor = static_cast<std::size_t>(
+                        halfEdges_[static_cast<std::size_t>(
+                            halfEdges_[static_cast<std::size_t>(edgeIndex)].nextEdge)].originVertex);
+                    removedNeighbors += removed[neighbor] ? 1U : 0U;
+                    ++degree;
+                    edgeIndex = halfEdges_[static_cast<std::size_t>(
+                        halfEdges_[static_cast<std::size_t>(edgeIndex)].twinEdge)].nextEdge;
+                } while (edgeIndex != firstIndex);
+                const std::size_t localRemovalLimit = std::max<std::size_t>(1, (degree + 2) / 3);
+                if (removedNeighbors < localRemovalLimit) {
+                    removed[vertexIndex] = true;
+                    removable.push_back(vertexIndex);
+                }
+            }
+        }
+    }
+    if (removable.empty()) {
+        return nullptr;
+    }
+
+    std::vector<bool> removed(vertices_.size(), false);
+    for (const auto index : removable) {
+        removed[index] = true;
+    }
+    std::vector<GridVertex> vertices;
+    std::vector<std::uint8_t> refinementVertices;
+    std::vector<bool> retainedRelaxable;
+    vertices.reserve(vertices_.size() - removable.size());
+    refinementVertices.reserve(vertices_.size() - removable.size());
+    retainedRelaxable.reserve(vertices_.size() - removable.size());
+    for (std::size_t i = 0; i < vertices_.size(); ++i) {
+        if (!removed[i]) {
+            vertices.push_back(vertices_[i]);
+            refinementVertices.push_back(refinementVertices_[i]);
+            retainedRelaxable.push_back(relaxable[i]);
+        }
+    }
+
+    if (regenerateSelectedRegion) {
+        struct SelectedFace {
+            std::array<std::uint32_t, 3> indices;
+            double cumulativeArea;
+            bool interior;
+        };
+        std::vector<SelectedFace> selectedFaces;
+        double selectedArea = 0.0;
+        for (std::size_t face = 0; face < triangleIndices_.size() / 3; ++face) {
+            const std::array<std::uint32_t, 3> corners{
+                triangleIndices_[3 * face], triangleIndices_[3 * face + 1],
+                triangleIndices_[3 * face + 2]};
+            // Sample only faces wholly inside the selected region. Sampling the
+            // partially selected boundary faces biases replacements toward the seam.
+            const bool interior = vertices_[corners[0]].selectionWeight >= 0.5F &&
+                                  vertices_[corners[1]].selectionWeight >= 0.5F &&
+                                  vertices_[corners[2]].selectionWeight >= 0.5F;
+            if (!interior) {
+                continue;
+            }
+            const glm::dvec3 a = unitDirection(glm::dvec3(vertices_[corners[0]].position));
+            const glm::dvec3 b = unitDirection(glm::dvec3(vertices_[corners[1]].position));
+            const glm::dvec3 c = unitDirection(glm::dvec3(vertices_[corners[2]].position));
+            const double area = 2.0 * std::atan2(
+                std::abs(glm::dot(a, glm::cross(b, c))),
+                1.0 + glm::dot(a, b) + glm::dot(b, c) + glm::dot(c, a));
+            if (area > 0.0 && std::isfinite(area)) {
+                selectedArea += area;
+                selectedFaces.push_back({corners, selectedArea, interior});
+            }
+        }
+        regeneratedPointCount = std::min(regeneratedPointCount,
+            1'000'000 - vertices.size());
+        if (selectedFaces.empty() || regeneratedPointCount == 0) {
+            return nullptr;
+        }
+
+        const double spacing = 0.7 * std::sqrt(selectedArea /
+                                                static_cast<double>(regeneratedPointCount));
+        const double cellWidth = spacing;
+        struct SpatialEntry {
+            glm::dvec3 position;
+            bool fixed;
+        };
+        const auto cellCoordinate = [cellWidth](double value) {
+            return static_cast<std::int64_t>(std::floor((value + 1.0) / cellWidth));
+        };
+        const auto cellKey = [&](const glm::dvec3& point) {
+            const auto x = static_cast<std::uint64_t>(cellCoordinate(point.x));
+            const auto y = static_cast<std::uint64_t>(cellCoordinate(point.y));
+            const auto z = static_cast<std::uint64_t>(cellCoordinate(point.z));
+            return (x << 42) | (y << 21) | z;
+        };
+        std::unordered_map<std::uint64_t, std::vector<SpatialEntry>> buckets;
+        buckets.reserve(vertices.size() + regeneratedPointCount);
+        const auto addSpatialPoint = [&](const glm::dvec3& point, bool fixed) {
+            buckets[cellKey(point)].push_back({point, fixed});
+        };
+        for (const auto& vertex : vertices) {
+            addSpatialPoint(unitDirection(glm::dvec3(vertex.position)), true);
+        }
+
+        std::mt19937 random(options_.seed ^ static_cast<std::uint32_t>(vertices_.size()) ^
+                            0xa511e9b3U);
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+        std::vector<GridVertex> generated;
+        generated.reserve(regeneratedPointCount);
+        std::vector<bool> generatedRelaxable;
+        generatedRelaxable.reserve(regeneratedPointCount);
+        const std::size_t attemptLimit = regeneratedPointCount * 80;
+        for (std::size_t attempt = 0; attempt < attemptLimit &&
+                                       generated.size() < regeneratedPointCount; ++attempt) {
+            const double areaSample = unit(random) * selectedArea;
+            const auto faceIt = std::lower_bound(selectedFaces.begin(), selectedFaces.end(), areaSample,
+                [](const SelectedFace& face, double value) { return face.cumulativeArea < value; });
+            const auto& face = (faceIt == selectedFaces.end() ? selectedFaces.back() : *faceIt);
+            const double root = std::sqrt(unit(random));
+            const double second = unit(random);
+            const double weightA = 1.0 - root;
+            const double weightB = root * (1.0 - second);
+            const double weightC = root * second;
+            const auto& a = vertices_[face.indices[0]];
+            const auto& b = vertices_[face.indices[1]];
+            const auto& c = vertices_[face.indices[2]];
+            const glm::dvec3 direction = unitDirection(
+                weightA * glm::dvec3(a.position) + weightB * glm::dvec3(b.position) +
+                weightC * glm::dvec3(c.position));
+            const float selectionWeight = static_cast<float>(
+                weightA * a.selectionWeight + weightB * b.selectionWeight +
+                weightC * c.selectionWeight);
+            if (selectionWeight < 0.5F) {
+                continue;
+            }
+
+            const auto x = cellCoordinate(direction.x);
+            const auto y = cellCoordinate(direction.y);
+            const auto z = cellCoordinate(direction.z);
+            bool tooClose = false;
+            for (std::int64_t dx = -1; dx <= 1 && !tooClose; ++dx) {
+                for (std::int64_t dy = -1; dy <= 1 && !tooClose; ++dy) {
+                    for (std::int64_t dz = -1; dz <= 1 && !tooClose; ++dz) {
+                        const auto key = (static_cast<std::uint64_t>(x + dx) << 42) |
+                                         (static_cast<std::uint64_t>(y + dy) << 21) |
+                                         static_cast<std::uint64_t>(z + dz);
+                        const auto bucket = buckets.find(key);
+                        if (bucket == buckets.end()) {
+                            continue;
+                        }
+                        for (const auto& entry : bucket->second) {
+                            // Keep a wider buffer around the preserved seam than the
+                            // interior Poisson spacing; otherwise replacements pack against
+                            // the fixed ring and create a visible density ridge.
+                            const double minimumDistance = entry.fixed ? spacing * 1.35 : spacing;
+                            const auto delta = direction - entry.position;
+                            if (glm::dot(delta, delta) < minimumDistance * minimumDistance) {
+                                tooClose = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (tooClose) {
+                continue;
+            }
+            const float elevation = static_cast<float>(weightA * a.elevation +
+                                                        weightB * b.elevation +
+                                                        weightC * c.elevation);
+            generated.push_back({glm::vec3(direction), elevation, selectionWeight});
+            generatedRelaxable.push_back(face.interior);
+            addSpatialPoint(direction, false);
+        }
+        if (generated.size() < regeneratedPointCount / 2) {
+            throw std::runtime_error("Could not place enough evenly spaced points in the selected region. "
+                                     "Expand the selection or use a coarser target density.");
+        }
+        for (std::size_t i = 0; i < generated.size(); ++i) {
+            const auto& vertex = generated[i];
+            vertices.push_back(vertex);
+            refinementVertices.push_back(0);
+            retainedRelaxable.push_back(generatedRelaxable[i]);
+        }
+    }
+
+    std::vector<HalfEdge> edges;
+    std::vector<std::uint32_t> indices;
+    triangulate(vertices, edges, indices);
+    if (regenerateSelectedRegion || refinementCandidates.empty()) {
+        // A couple of damped Lloyd steps even out the coarsened interior while
+        // leaving its selection boundary and all outside vertices anchored.
+        for (int pass = 0; pass < 2; ++pass) {
+            relaxOnce(vertices, indices, &retainedRelaxable, 0.5);
+            edges.clear();
+            indices.clear();
+            triangulate(vertices, edges, indices);
+        }
+    }
+    return std::shared_ptr<const SphericalGridSnapshot>(new SphericalGridSnapshot(
+        options_, std::move(vertices), std::move(indices),
+        std::move(refinementVertices), selectionActive_));
 }
 
 std::size_t SphericalGridSnapshot::FindNearest(glm::dvec3 direction) const {

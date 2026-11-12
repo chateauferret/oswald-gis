@@ -165,18 +165,23 @@ To support high-detail local mapping in regions of interest while maintaining a 
 
 ### 5.1 Dynamic Refinement Protocol (Subdivision)
 
-1. **Region Selection**: The user defines a spatial selection domain on the globe using a 3D raycast brush or bounding spherical polygon.
-2. **Local Point Insertion**: Additional vertices are generated within the selected domain using localized Poisson-disk sampling or high-density jittered Fibonacci points.
-3. **Cavity Re-triangulation**: An incremental Bowyer-Watson spherical Delaunay algorithm updates the local triangulation cavity without rebuilding the global mesh.
-4. **Data Transfer**: New vertices inherit elevation values from their enclosing parent triangle via barycentric interpolation:
+1. **Region Selection**: The user defines a spatial selection domain on the globe using the radius or polygon selection tools.
+2. **Local Point Insertion**: `Mesh -> Refine Selection` considers faces incident to a vertex with selection weight at least 0.5 and inserts one spherical face-centroid site into every eligible face.
+3. **Cavity Re-triangulation**: Small batches insert each site incrementally into the spherical convex hull, removing visible facets and connecting their horizon to the new site. Larger batches are triangulated together with Qhull. Both paths produce a closed, outward-facing mesh.
+4. **Data Transfer**: Elevation and selection weight are interpolated from the parent face using planar barycentric coordinates at the ray/triangle intersection:
 
 $$\text{Elevation}(\mathbf{P}_{\text{new}}) = w_A \cdot \text{Elev}(A) + w_B \cdot \text{Elev}(B) + w_C \cdot \text{Elev}(C)$$
 
+$$\text{SelectionWeight}(\mathbf{P}_{\text{new}}) = w_A \cdot s_A + w_B \cdot s_B + w_C \cdot s_C$$
+
 ### 5.2 Dynamic Coarsening Protocol (Simplification)
 
-1. **Decimation Selection**: When coarsening a region, low-importance or flat vertices within the selection domain are flagged for removal.
-2. **Vertex Removal & Hole Triangulation**: Flagged points are deleted from the vertex buffer, and the surrounding cavity on $S^2$ is re-triangulated. 
-3. **Seamless Manifold Maintenance**: Because the surface remains a continuous 2D Delaunay manifold, vertex removal introduces no T-junction cracks, edge skirts, or visual rendering gaps.
+1. **Decimation Selection**: `Mesh -> Coarsen Flat Selection` first removes eligible vertices created by refinement in the selected region, restoring the prior site density. Otherwise, it preserves the selected-region seam and replaces flat selected interior sites with approximately half as many area-weighted Poisson-spaced spherical samples. New samples use wholly selected faces and maintain a 1.35-spacing buffer from fixed sites to avoid an edge-density spike.
+2. **Attribute Transfer & Hole Triangulation**: New sites inherit elevation and selection weight from their source face; Qhull rebuilds the spherical Delaunay hull with the original exterior and seam vertices fixed.
+3. **Constrained Relaxation**: Two damped spherical Lloyd steps move only selected interior vertices. Unselected vertices and the selection boundary remain fixed; the hull is rebuilt after each step.
+4. **Seamless Manifold Maintenance**: The rebuilt mesh is checked for a closed half-edge topology and a convex outward hull, avoiding T-junction cracks or visual gaps.
+
+Both operations publish new immutable snapshots and are undoable/redoable. The refinement API can optionally cap inserted points, while the default UI action processes every eligible face. Coarsening can also be explicitly limited; the default preferentially reverses refinement and otherwise regenerates the selected interior at lower density.
 
 ---
 
@@ -251,8 +256,8 @@ Snapshot queries are safe concurrently:
 
 Invalid parameters throw `std::invalid_argument`; geometry/index failures
 throw `std::runtime_error` with Qhull diagnostics on stderr. The application
-reports startup exceptions and exits unsuccessfully. Elevation editing,
-local refinement, and coarsening remain future work.
+reports startup exceptions and exits unsuccessfully. Selection-driven local
+refinement and flat-region coarsening are implemented as described above.
 
 ---
 

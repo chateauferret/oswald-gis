@@ -115,6 +115,8 @@ private:
     std::string selectionColorMapName_ = "grayscale.map";
     std::string legendError_;
     bool legendErrorOpen_ = false;
+    std::string meshError_;
+    bool meshErrorOpen_ = false;
     glm::vec3 graticuleColor_{0.75F};
     glm::vec3 highlightedGraticuleColor_{1.0F};
     glm::vec3 wireframeColor_{1.0F, 1.0F, 0.0F};

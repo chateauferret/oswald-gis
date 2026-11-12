@@ -91,11 +91,27 @@ public:
     std::vector<std::size_t> FindWithinRadius(
         glm::dvec3 direction, double arcRadius, double planetRadius = 6371.0) const;
 
+    // Returns a new immutable snapshot, or nullptr if the selection contains no eligible faces.
+    // A zero limit inserts one site into every eligible face; otherwise the insertion count is capped.
+    std::shared_ptr<const SphericalGridSnapshot> RefineSelectedRegion(
+        std::size_t maxNewPoints = 0) const;
+    // A zero limit removes eligible refinement-created sites; otherwise it removes a sparse
+    // non-adjacent subset of flat selected sites. A nonzero limit caps either behavior.
+    std::shared_ptr<const SphericalGridSnapshot> CoarsenSelectedRegion(
+        float maximumElevationDifference = 0.0F,
+        std::size_t maxRemovedVertices = 0) const;
+
 private:
+    SphericalGridSnapshot(const GridOptions& options, std::vector<GridVertex> vertices,
+                          std::vector<std::uint32_t> triangleIndices,
+                          std::vector<std::uint8_t> refinementVertices,
+                          bool selectionActive);
+
     GridOptions options_;
     std::vector<GridVertex> vertices_;
     std::vector<HalfEdge> halfEdges_;
     std::vector<std::uint32_t> triangleIndices_;
+    std::vector<std::uint8_t> refinementVertices_;
     bool selectionActive_ = false;
     PointCloudAdaptor adaptor_;
     KDTree3D tree_;

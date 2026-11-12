@@ -251,6 +251,174 @@ void verifyValidationAndRegeneration() {
     }
 }
 
+void verifyAdaptiveRefinementAndCoarsening() {
+    SphericalFibonacciGrid grid({1000, 0.0, 314});
+    const auto original = grid.GetSnapshot();
+    std::vector<float> elevations(original->GetVertices().size(), 1234.0F);
+    grid.SetElevations(elevations);
+    std::vector<float> selection(original->GetVertices().size(), 1.0F);
+    grid.SetSelectionWeights(selection, true);
+    const auto selected = grid.GetSnapshot();
+
+    const auto refined = selected->RefineSelectedRegion(12);
+    check(refined != nullptr && refined->GetVertices().size() == selected->GetVertices().size() + 12,
+        "Selected-region refinement did not insert the requested bounded point count.");
+    verifyTopology(*refined);
+    const auto verifyHull = [](const SphericalGridSnapshot& snapshot) {
+        const auto& meshVertices = snapshot.GetVertices();
+        const auto& meshIndices = snapshot.GetTriangleIndices();
+        for (std::size_t face = 0; face < meshIndices.size(); face += 3) {
+            const auto a = glm::normalize(glm::dvec3(meshVertices[meshIndices[face]].position));
+            const auto b = glm::normalize(glm::dvec3(meshVertices[meshIndices[face + 1]].position));
+            const auto c = glm::normalize(glm::dvec3(meshVertices[meshIndices[face + 2]].position));
+            const auto normal = glm::normalize(glm::cross(b - a, c - a));
+            for (const auto& vertex : meshVertices) {
+                check(glm::dot(normal, glm::normalize(glm::dvec3(vertex.position)) - a) <= 1e-9,
+                      "Adaptive mesh contains a face that is not on its convex spherical hull.");
+            }
+        }
+    };
+    verifyHull(*refined);
+    const auto fullyRefined = selected->RefineSelectedRegion();
+    const auto expectedInsertions = selected->GetTriangleIndices().size() / 3;
+    check(fullyRefined != nullptr &&
+          fullyRefined->GetVertices().size() == selected->GetVertices().size() + expectedInsertions,
+          "Default refinement did not insert one point into every eligible selected face.");
+    verifyTopology(*fullyRefined);
+    verifyHull(*fullyRefined);
+    const auto conservativeCoarsening = selected->CoarsenSelectedRegion();
+    check(conservativeCoarsening != nullptr &&
+          conservativeCoarsening->GetVertices().size() >= 450 &&
+          conservativeCoarsening->GetVertices().size() <= 550,
+          "Coarsening an unrefined uniform grid did not regenerate at approximately half density.");
+    verifyTopology(*conservativeCoarsening);
+    verifyHull(*conservativeCoarsening);
+    std::array<std::size_t, 8> pointsPerLatitudeBand{};
+    for (const auto& vertex : conservativeCoarsening->GetVertices()) {
+        const auto band = std::min<std::size_t>(7, static_cast<std::size_t>(
+            (1.0 - (static_cast<double>(vertex.position.z) + 1.0) * 0.5) * 8.0));
+        ++pointsPerLatitudeBand[band];
+    }
+    check(std::all_of(pointsPerLatitudeBand.begin(), pointsPerLatitudeBand.end(),
+                      [](std::size_t count) { return count > 20; }),
+          "Regenerated coarsening left whole latitude bands undersampled.");
+
+        std::vector<float> regionalSelection(selected->GetVertices().size(), 0.0F);
+        std::vector<float> taggedElevations(selected->GetVertices().size());
+        const auto& originalVertices = selected->GetVertices();
+        for (std::size_t i = 0; i < originalVertices.size(); ++i) {
+            regionalSelection[i] = originalVertices[i].position.z > 0.55F ? 1.0F : 0.0F;
+            taggedElevations[i] = static_cast<float>(i) / 10000.0F;
+        }
+        grid.SetElevations(taggedElevations);
+        grid.SetSelectionWeights(regionalSelection, true);
+        const auto regionalBefore = grid.GetSnapshot();
+        const auto regionalAfter = regionalBefore->CoarsenSelectedRegion(1.0F);
+        check(regionalAfter != nullptr, "Regional coarsening did not change a selected flat region.");
+        verifyTopology(*regionalAfter);
+        bool generatedSelectedPoints = false;
+        std::vector<glm::dvec3> fixedBoundary;
+        for (std::size_t i = 0; i < regionalBefore->GetVertices().size(); ++i) {
+            const auto& vertex = regionalBefore->GetVertices()[i];
+            bool boundary = false;
+            for (const auto& edge : regionalBefore->GetHalfEdges()) {
+                if (edge.originVertex != static_cast<std::int32_t>(i)) {
+                    continue;
+                }
+                const auto neighbor = static_cast<std::size_t>(
+                    regionalBefore->GetHalfEdges()[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+                boundary |= regionalBefore->GetVertices()[neighbor].selectionWeight < 0.5F;
+            }
+            if (vertex.selectionWeight < 0.5F || boundary) {
+                fixedBoundary.emplace_back(glm::normalize(glm::dvec3(vertex.position)));
+            }
+        }
+        for (const auto& afterVertex : regionalAfter->GetVertices()) {
+            const auto original = std::find_if(regionalBefore->GetVertices().begin(),
+                                               regionalBefore->GetVertices().end(),
+                [&](const GridVertex& vertex) { return vertex.position == afterVertex.position; });
+            if (original == regionalBefore->GetVertices().end()) {
+                check(afterVertex.selectionWeight == 1.0F,
+                      "Regeneration inserted a point on or outside the selected-region seam.");
+                const auto point = glm::normalize(glm::dvec3(afterVertex.position));
+                for (const auto& fixed : fixedBoundary) {
+                    const double distance = std::atan2(glm::length(glm::cross(point, fixed)),
+                                                      glm::dot(point, fixed));
+                    check(distance > 0.04,
+                          "Regenerated point is packed too tightly against the fixed selection boundary.");
+                }
+                generatedSelectedPoints = true;
+            }
+        }
+        for (std::size_t i = 0; i < regionalBefore->GetVertices().size(); ++i) {
+            bool boundary = false;
+            for (const auto& edge : regionalBefore->GetHalfEdges()) {
+                if (edge.originVertex != static_cast<std::int32_t>(i)) {
+                    continue;
+                }
+                const auto neighbor = static_cast<std::size_t>(
+                    regionalBefore->GetHalfEdges()[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+                boundary |= regionalBefore->GetVertices()[neighbor].selectionWeight < 0.5F;
+            }
+            if (regionalBefore->GetVertices()[i].selectionWeight < 0.5F || boundary) {
+                check(std::any_of(regionalAfter->GetVertices().begin(), regionalAfter->GetVertices().end(),
+                    [&](const GridVertex& vertex) { return vertex.position == regionalBefore->GetVertices()[i].position; }),
+                    "Selected-region regeneration moved or removed its fixed exterior/boundary ring.");
+            }
+        }
+        check(generatedSelectedPoints, "Selected-region coarsening did not generate replacement samples.");
+    check(refined->HasSelection(), "Refinement discarded the active selection state.");
+    for (std::size_t i = 0; i < selected->GetVertices().size(); ++i) {
+      check(refined->GetVertices()[i].position == selected->GetVertices()[i].position &&
+          refined->GetVertices()[i].elevation == 1234.0F &&
+          refined->GetVertices()[i].selectionWeight == 1.0F,
+          "Refinement changed an existing vertex or its attributes.");
+    }
+    for (std::size_t i = selected->GetVertices().size(); i < refined->GetVertices().size(); ++i) {
+      check(std::abs(glm::length(glm::dvec3(refined->GetVertices()[i].position)) - 1.0) < 1e-7 &&
+          refined->GetVertices()[i].elevation == 1234.0F &&
+          refined->GetVertices()[i].selectionWeight == 1.0F,
+          "Newly refined vertices were not projected or attribute-interpolated correctly.");
+    }
+    check(selected->GetVertices().size() == 1000,
+        "Refinement mutated the original immutable snapshot.");
+
+        const auto limitedCoarsening = refined->CoarsenSelectedRegion(0.0F, 8);
+        check(limitedCoarsening != nullptr &&
+            limitedCoarsening->GetVertices().size() == refined->GetVertices().size() - 8,
+            "Uniform selected-region coarsening did not honor its explicit removal limit.");
+        verifyTopology(*limitedCoarsening);
+        const auto coarsened = refined->CoarsenSelectedRegion();
+        check(coarsened != nullptr && coarsened->GetVertices().size() == selected->GetVertices().size(),
+            "Coarsening did not remove refinement-created vertices and restore the prior grid density.");
+    verifyTopology(*coarsened);
+    verifyHull(*coarsened);
+    check(coarsened->HasSelection(), "Coarsening discarded the active selection state.");
+        for (std::size_t i = 0; i < coarsened->GetVertices().size(); ++i) {
+          check(coarsened->GetVertices()[i].position == selected->GetVertices()[i].position &&
+              coarsened->GetVertices()[i].elevation == selected->GetVertices()[i].elevation &&
+              coarsened->GetVertices()[i].selectionWeight == selected->GetVertices()[i].selectionWeight,
+              "Refine-then-coarsen did not preserve the original sites and attributes.");
+    }
+    check(refined->GetVertices().size() == 1012,
+        "Coarsening mutated the prior immutable snapshot.");
+
+    std::vector<float> noSelection(selected->GetVertices().size(), 0.0F);
+    grid.SetSelectionWeights(noSelection, false);
+    const auto unselected = grid.GetSnapshot();
+    check(!unselected->RefineSelectedRegion() && !unselected->CoarsenSelectedRegion(),
+        "Adaptive mesh edits ran without an active selection.");
+        std::vector<float> sparseSelection(unselected->GetVertices().size(), 0.0F);
+        sparseSelection[0] = 1.0F;
+        grid.SetSelectionWeights(sparseSelection, true);
+        const auto sparseRefinement = grid.GetSnapshot()->RefineSelectedRegion(1);
+        check(sparseRefinement != nullptr &&
+                    sparseRefinement->GetVertices().size() == unselected->GetVertices().size() + 1,
+                    "A localized single-vertex selection did not seed regional refinement.");
+    expectInvalid([&] { selected->RefineSelectedRegion(1'000'001); });
+    expectInvalid([&] { selected->CoarsenSelectedRegion(-1.0F); });
+}
+
 // Coefficient of variation of all edge lengths; lower means more uniform cells.
 double edgeLengthSpread(const SphericalGridSnapshot& snapshot) {
     const auto& vertices = snapshot.GetVertices();
@@ -352,6 +520,7 @@ int main(int argc, char** argv) {
                 verifyQueries(*snapshot);
             }
             verifyValidationAndRegeneration();
+            verifyAdaptiveRefinementAndCoarsening();
             verifyRelaxation();
             verifyCancellation();
         }

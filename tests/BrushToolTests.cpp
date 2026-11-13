@@ -28,7 +28,7 @@ std::vector<float> elevationsOf(const SphericalGridSnapshot& grid) {
 }
 
 void testOperationsAndClamping() {
-    SphericalFibonacciGrid model({1000, 0.0, 17});
+    SphericalGrid model({1000, 0.0, 17});
     const auto& grid = *model.GetSnapshot();
     ElevationBrushTool brush;
     auto values = elevationsOf(grid);
@@ -53,7 +53,7 @@ void testOperationsAndClamping() {
 }
 
 void testIntensityAndGeodesicFalloff() {
-    SphericalFibonacciGrid model({1000, 0.0, 19});
+    SphericalGrid model({1000, 0.0, 19});
     const auto& grid = *model.GetSnapshot();
     const auto& vertices = grid.GetVertices();
     const glm::dvec3 center(vertices[0].position);
@@ -91,7 +91,7 @@ void testIntensityAndGeodesicFalloff() {
 }
 
 void testRaiseLowerBrush() {
-    SphericalFibonacciGrid model({1000, 0.0, 20});
+    SphericalGrid model({1000, 0.0, 20});
     const auto& grid = *model.GetSnapshot();
     const auto center = glm::normalize(glm::dvec3(grid.GetVertices()[0].position));
     const auto neighbor = glm::normalize(glm::dvec3(grid.GetVertices()[1].position));
@@ -147,7 +147,7 @@ void testRaiseLowerBrush() {
 }
 
 void testOuterRadiusProfiles() {
-    SphericalFibonacciGrid model({1000, 0.0, 21});
+    SphericalGrid model({1000, 0.0, 21});
     const auto& grid = *model.GetSnapshot();
     const auto& vertices = grid.GetVertices();
     const glm::dvec3 center = glm::normalize(glm::dvec3(vertices[0].position));
@@ -199,7 +199,7 @@ void testOuterRadiusProfiles() {
 }
 
 void testValidation() {
-    SphericalFibonacciGrid model({1000, 0.0, 23});
+    SphericalGrid model({1000, 0.0, 23});
     const auto& grid = *model.GetSnapshot();
     ElevationBrushTool brush;
     auto values = elevationsOf(grid);

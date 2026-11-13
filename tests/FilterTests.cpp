@@ -25,7 +25,7 @@ void expectInvalid(auto&& operation, const char* message) {
 }
 
 void testFillOperationsAndSelectionWeights() {
-    SphericalFibonacciGrid model({1000, 0.0, 91});
+    SphericalGrid model({1000, 0.0, 91});
     const auto size = model.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(size, 10.0F);
     model.SetElevations(elevations);
@@ -65,7 +65,7 @@ void testFillOperationsAndSelectionWeights() {
 }
 
 void testGlobalApplicationAndClamping() {
-    SphericalFibonacciGrid model({1000, 0.0, 92});
+    SphericalGrid model({1000, 0.0, 92});
     const auto size = model.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(size, 10.0F);
     model.SetElevations(elevations);
@@ -87,7 +87,7 @@ void testGlobalApplicationAndClamping() {
 }
 
 void testValidationAndPluginRegistration() {
-    SphericalFibonacciGrid model({1000, 0.0, 93});
+    SphericalGrid model({1000, 0.0, 93});
     const auto snapshot = model.GetSnapshot();
     std::vector<float> elevations(snapshot->GetVertices().size(), 0.0F);
     FillFilter filter;

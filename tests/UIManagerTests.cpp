@@ -97,7 +97,7 @@ void testDialog() {
     check(gladLoadGL(glfwGetProcAddress) != 0 && GLAD_GL_VERSION_4_5,
           "UI test requires OpenGL 4.5.");
     GlobeRenderer renderer(std::filesystem::path(OSWALD_RESOURCE_DIR) / "shaders");
-    SphericalFibonacciGrid grid({1000, 0.0, 42});
+    SphericalGrid grid({1000, 0.0, 42});
     renderer.UploadGrid(*grid.GetSnapshot());
     UIManager ui(grid.GetSnapshot()->GetOptions());
     const ImGuiSession imgui;
@@ -711,21 +711,21 @@ void testDialog() {
         grid.SetElevations(uniformTerrain);
         renderer.UploadGrid(*grid.GetSnapshot());
         const auto beforeRefinement = grid.GetSnapshot()->GetVertices().size();
-        const auto selectedFaceCount = beforeRefinement * 2 - 4;
         selectMenuItem(5, 0, "Refine Selection");
-        check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement + selectedFaceCount,
+        const auto afterRefinement = grid.GetSnapshot()->GetVertices().size();
+        check(afterRefinement > beforeRefinement * 2,
             "Mesh menu did not refine the selected region.");
         shortcut(ImGuiKey_Z);
         check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement,
             "Undo did not restore the mesh before refinement.");
         shortcut(ImGuiKey_Y);
-            check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement + selectedFaceCount,
+            check(grid.GetSnapshot()->GetVertices().size() == afterRefinement,
             "Redo did not restore the refined mesh.");
         selectMenuItem(5, 1, "Coarsen Flat Selection");
                 check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement,
                     "Coarsening after refinement did not restore the prior sampling density.");
         shortcut(ImGuiKey_Z);
-            check(grid.GetSnapshot()->GetVertices().size() == beforeRefinement + selectedFaceCount,
+            check(grid.GetSnapshot()->GetVertices().size() == afterRefinement,
             "Undo did not restore the mesh before coarsening.");
 }
 

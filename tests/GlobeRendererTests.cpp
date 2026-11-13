@@ -191,7 +191,7 @@ void testGpu() {
     expectFailure([&] { renderer.Draw(width, height); });
     expectFailure([&] { renderer.Draw(-1, height); });
     renderer.Draw(0, 0);
-    SphericalFibonacciGrid grid({1000, 0.0, 42});
+    SphericalGrid grid({1000, 0.0, 42});
     const auto snapshot = grid.GetSnapshot();
     renderer.SetColorMap(ColorMap::Load(resources / "assets/colormaps/default.map"));
     renderer.UploadGrid(*snapshot);

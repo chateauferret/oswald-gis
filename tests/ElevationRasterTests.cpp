@@ -89,7 +89,7 @@ void testLoadingAndSampling() {
 void testGridPopulationAndSnapshotLifetime() {
     TemporaryDirectory temporary;
     const auto raster = ElevationRaster::Load(temporary.writePpm());
-    SphericalFibonacciGrid grid({1000, 0.0, 42});
+    SphericalGrid grid({1000, 0.0, 42});
     const auto original = grid.GetSnapshot();
     const auto values = raster.SampleElevations(*original);
     check(values.size() == original->GetVertices().size(),

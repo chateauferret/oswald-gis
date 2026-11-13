@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-class SphericalFibonacciGrid;
+class SphericalGrid;
 class RasterImportCommand;
 
 class UIManager {
@@ -30,7 +30,7 @@ public:
     // Grids with more points than this are generated on a worker thread with a progress dialog.
     static constexpr std::size_t backgroundGenerationThreshold = 25'000;
 
-    bool Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    bool Render(SphericalGrid& grid, GlobeRenderer& renderer,
                 const glm::mat4& modelMatrix = glm::mat4(1.0F), float zoom = 1.0F);
     bool IsBrushActive() const { return brushTools_.IsActive() || selectionMode_ != SelectionMode::None; }
     void SetCameraController(CameraController* camera) { camera_ = camera; }
@@ -58,22 +58,22 @@ private:
 
     using GridFuture = std::future<std::shared_ptr<const SphericalGridSnapshot>>;
 
-    void StartGridGeneration(SphericalFibonacciGrid& grid, GlobeRenderer& renderer);
-    void PollGridGeneration(SphericalFibonacciGrid& grid, GlobeRenderer& renderer);
-    void InstallGeneratedGrid(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    void StartGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer);
+    void PollGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer);
+    void InstallGeneratedGrid(SphericalGrid& grid, GlobeRenderer& renderer,
                               std::shared_ptr<const SphericalGridSnapshot> snapshot);
     void RenderGridProgressDialog();
     void NavigateRasterDirectory(const std::filesystem::path& directory);
     void RenderBrushPanel();
     void RenderSelectionPanel();
-    void RenderValueSelectionDialog(SphericalFibonacciGrid& grid, GlobeRenderer& renderer);
-    void RenderFillFilterDialog(SphericalFibonacciGrid& grid, GlobeRenderer& renderer);
-    void ProcessBrushInput(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    void RenderValueSelectionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderFillFilterDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
                            const glm::mat4& modelMatrix, float zoom);
-    void ProcessSelectionInput(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    void ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& renderer,
                                const glm::mat4& modelMatrix, float zoom);
     void SetSelectionMode(SelectionMode mode);
-    void FinishPolygonSelection(SphericalFibonacciGrid& grid, GlobeRenderer& renderer);
+    void FinishPolygonSelection(SphericalGrid& grid, GlobeRenderer& renderer);
 
     GridOptions options_;
     GridOptions previousOptions_;

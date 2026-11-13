@@ -6,7 +6,7 @@
    Configure CMake with FetchContent for GLFW, GLAD (OpenGL 4.5 Core), GLM, Dear ImGui, and nanoflann. Verify window creation and basic rendering loop.
 
 2. **Phase 2: Model Implementation**  
-   Implement `SphericalFibonacciGrid` point distribution math, spatial jittering, and half-edge graph structures. Integrate the nanoflann 3D k-d tree adaptor.
+   Implement seeded area-uniform Poisson-disk sampling on $S^2$, spherical Delaunay triangulation, and half-edge graph structures. Integrate the nanoflann 3D k-d tree adaptor.
 
 3. **Phase 3: Render Viewport & Shaders**  
    Set up OpenGL DSA buffer lifecycle (`glCreateBuffers`, `glNamedBufferData`), compile the GLSL hypsometric elevation shader pair, and establish orthographic camera projection.
@@ -36,7 +36,7 @@
    Add floating on-screen viewport action buttons (camera reset, auto-spin toggle, wireframe toggle, graticule toggle). Implement real-time cursor hover inspection displaying unprojected geographic coordinates ($\text{Lat}^\circ, \text{Lon}^\circ$) and interpolated elevation in physical units ($m$/$ft$) via `nanoflann` k-d tree lookups.
 
 12. **Phase 12: Adaptive Regional Detail & Mesh Refinement**  
-   Implemented undoable `Mesh -> Refine Selection` and `Mesh -> Coarsen Flat Selection` actions. Refinement inserts a spherical face-centroid point into every face incident to the selected region, using incremental hull-cavity insertion for small batches and a single Delaunay rebuild for larger batches; elevation and selection weight are interpolated barycentrically. Coarsening first removes eligible refinement-created sites to reverse local refinement; otherwise it preserves the selected-region seam, replaces flat interior sites with approximately half as many area-weighted Poisson-spaced spherical samples from fully selected faces, interpolates attributes, and applies two constrained spherical Lloyd-relaxation passes. A 1.35-spacing boundary buffer avoids excess density near the seam. Both operations preserve closed manifold topology and immutable snapshots.
+   Implemented undoable `Mesh -> Refine Selection` and `Mesh -> Coarsen Flat Selection` actions. Refinement inserts spherical face-centroid points in selected faces, skipping faces less than half the selected area's area-weighted median face size so an already-dense seam is not over-refined. Tiny selections can seed incident faces. It uses incremental hull-cavity insertion for small batches and a single Delaunay rebuild for larger batches; elevation and selection weight are interpolated barycentrically. Coarsening first removes eligible refinement-created sites to reverse local refinement; otherwise it preserves the selected-region seam, replaces flat interior sites with approximately half as many area-weighted Poisson-spaced spherical samples from fully selected faces, interpolates attributes, and applies two constrained spherical Lloyd-relaxation passes. A 1.35-spacing boundary buffer avoids excess density near the seam. Both operations preserve closed manifold topology and immutable snapshots.
 
 13. **Phase 13: Data layer architecture**
    Create an abstract "Layer" class for data layers and have the Elevation layer inherit from this. Give each layer a name, a description, a type (list to be defined later), a blend mode, a colourmap, and a datatype. For now, all layers will be raster data mapped to the spherical grid, but in a later phase we can add vector layers. The selection channel is not a layer but is separate and selections apply to all raster layers.

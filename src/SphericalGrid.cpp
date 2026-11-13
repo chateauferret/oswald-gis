@@ -36,9 +36,9 @@ void validateOptions(const GridOptions& options) {
     if (options.relaxationIterations > 100) {
         throw std::invalid_argument("Relaxation iterations must be between 0 and 100.");
     }
-    if (!std::isfinite(options.jitterStrength) ||
-        options.jitterStrength < 0.0 || options.jitterStrength > 1.0) {
-        throw std::invalid_argument("Jitter strength must be finite and between 0 and 1.");
+    if (!std::isfinite(options.poissonVariability) ||
+        options.poissonVariability < 0.0 || options.poissonVariability > 1.0) {
+        throw std::invalid_argument("Poisson variability must be finite and between 0 and 1.");
     }
 }
 
@@ -349,39 +349,95 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
         control->SetProgress(std::min(completedStages / stageCount, 1.0F));
     };
     checkpoint(0.0F);
-    vertices_.reserve(options.pointCount);
     std::mt19937 random(options.seed);
-    // Explicit conversion avoids implementation-specific uniform_real_distribution mappings.
-    const auto sample = [&random]() {
-        return 2.0 * (static_cast<double>(random()) / 4294967296.0) - 1.0;
+    // Explicit mapping avoids implementation-specific uniform distribution behavior.
+    const auto unit = [&random]() {
+        return static_cast<double>(random()) / 4294967296.0;
     };
-    const double goldenRatio = (1.0 + std::sqrt(5.0)) / 2.0;
-    const double jitterScale = options.jitterStrength *
-                              std::sqrt(std::numbers::pi / options.pointCount);
-    for (std::size_t i = 0; i < options.pointCount; ++i) {
-        const double z = 1.0 - (2.0 * i + 1.0) / options.pointCount;
-        const double radius = std::sqrt(std::max(0.0, 1.0 - z * z));
-        const double theta = 2.0 * std::numbers::pi * i / goldenRatio;
-        vertices_.push_back({glm::vec3(radius * std::cos(theta), radius * std::sin(theta), z), 0.0F});
+    vertices_.reserve(options.pointCount);
+    const double spacing = (0.78 - 0.16 * options.poissonVariability) *
+                           std::sqrt(4.0 * std::numbers::pi / options.pointCount);
+    const auto cellCoordinate = [spacing](double value) {
+        return static_cast<std::int64_t>(std::floor((value + 1.0) / spacing));
+    };
+    const auto cellKey = [&](const glm::dvec3& point) {
+        const auto x = static_cast<std::uint64_t>(cellCoordinate(point.x));
+        const auto y = static_cast<std::uint64_t>(cellCoordinate(point.y));
+        const auto z = static_cast<std::uint64_t>(cellCoordinate(point.z));
+        return (x << 42) | (y << 21) | z;
+    };
+    const std::size_t noPoint = std::numeric_limits<std::size_t>::max();
+    std::unordered_map<std::uint64_t, std::size_t> buckets;
+    buckets.reserve(options.pointCount);
+    std::vector<std::size_t> nextInCell;
+    nextInCell.reserve(options.pointCount);
+    const std::size_t maxAttempts = options.pointCount * 80;
+    std::size_t attempts = 0;
+    while (vertices_.size() < options.pointCount && attempts < maxAttempts) {
+        if (control != nullptr && (attempts & 4095U) == 0U) {
+            if (control->IsCancelled()) {
+                throw GridGenerationCancelled();
+            }
+            control->SetProgress(static_cast<float>(vertices_.size()) /
+                                 static_cast<float>(options.pointCount) / stageCount);
+        }
+        ++attempts;
+        const double z = 2.0 * unit() - 1.0;
+        const double theta = 2.0 * std::numbers::pi * unit();
+        const double radial = std::sqrt(std::max(0.0, 1.0 - z * z));
+        const glm::dvec3 candidate(radial * std::cos(theta), radial * std::sin(theta), z);
+        const auto x = cellCoordinate(candidate.x);
+        const auto y = cellCoordinate(candidate.y);
+        const auto zCell = cellCoordinate(candidate.z);
+        bool tooClose = false;
+        for (std::int64_t dx = -1; dx <= 1 && !tooClose; ++dx) {
+            for (std::int64_t dy = -1; dy <= 1 && !tooClose; ++dy) {
+                for (std::int64_t dz = -1; dz <= 1 && !tooClose; ++dz) {
+                    const auto key = (static_cast<std::uint64_t>(x + dx) << 42) |
+                                     (static_cast<std::uint64_t>(y + dy) << 21) |
+                                     static_cast<std::uint64_t>(zCell + dz);
+                    const auto bucket = buckets.find(key);
+                    if (bucket == buckets.end()) {
+                        continue;
+                    }
+                    for (auto index = bucket->second; index != noPoint;
+                         index = nextInCell[index]) {
+                        const glm::dvec3 existing(vertices_[index].position);
+                        const auto delta = candidate - existing;
+                        if (glm::dot(delta, delta) < spacing * spacing) {
+                            tooClose = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (tooClose) {
+            continue;
+        }
+        const auto index = vertices_.size();
+        vertices_.push_back({glm::vec3(candidate), 0.0F});
+        const auto key = cellKey(candidate);
+        const auto bucket = buckets.find(key);
+        nextInCell.push_back(bucket == buckets.end() ? noPoint : bucket->second);
+        if (bucket == buckets.end()) {
+            buckets.emplace(key, index);
+        } else {
+            bucket->second = index;
+        }
     }
+    if (vertices_.size() != options.pointCount) {
+        throw std::runtime_error("Poisson sampling could place only " +
+            std::to_string(vertices_.size()) + " of " + std::to_string(options.pointCount) +
+            " requested points. Increase Poisson variability or lower the point count.");
+    }
+    checkpoint(1.0F);
     for (std::uint32_t pass = 0; pass < options.relaxationIterations; ++pass) {
         triangulate(vertices_, halfEdges_, triangleIndices_);
         relaxOnce(vertices_, triangleIndices_);
         halfEdges_.clear();
         triangleIndices_.clear();
-        checkpoint(static_cast<float>(pass) + 1.0F);
-    }
-    if (options.jitterStrength > 0.0) {
-        for (auto& vertex : vertices_) {
-            glm::dvec3 displacement;
-            do {
-                displacement.x = sample();
-                displacement.y = sample();
-                displacement.z = sample();
-            } while (glm::dot(displacement, displacement) > 1.0);
-            vertex.position = glm::vec3(unitDirection(glm::dvec3(vertex.position) +
-                                                      jitterScale * displacement));
-        }
+        checkpoint(static_cast<float>(pass) + 2.0F);
     }
     triangulate(vertices_, halfEdges_, triangleIndices_);
     refinementVertices_.assign(vertices_.size(), 0);
@@ -478,7 +534,12 @@ std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::RefineSelect
     if (vertices_.size() >= 1'000'000) {
         throw std::runtime_error("The spherical mesh has reached its 1,000,000-vertex limit.");
     }
-    std::vector<std::size_t> selectedFaces;
+    struct CandidateFace {
+        double area;
+        RefinedPoint point;
+    };
+    std::vector<CandidateFace> selectedFaces;
+    std::vector<CandidateFace> incidentFaces;
     selectedFaces.reserve(std::min(triangleIndices_.size() / 3,
                                    (maxNewPoints == 0 ? 4096 : maxNewPoints) * 8));
     for (std::size_t face = 0; face < triangleIndices_.size() / 3; ++face) {
@@ -488,13 +549,54 @@ std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::RefineSelect
         const float strongestWeight = std::max({vertices_[a].selectionWeight,
                             vertices_[b].selectionWeight,
                             vertices_[c].selectionWeight});
-        if (strongestWeight >= 0.5F) {
-            selectedFaces.push_back(face);
+        if (strongestWeight < 0.5F) {
+            continue;
         }
+        const auto point = interpolateFacePoint(vertices_, triangleIndices_.data() + 3 * face);
+        const auto pa = unitDirection(glm::dvec3(vertices_[a].position));
+        const auto pb = unitDirection(glm::dvec3(vertices_[b].position));
+        const auto pc = unitDirection(glm::dvec3(vertices_[c].position));
+        const double area = 2.0 * std::atan2(std::abs(glm::dot(pa, glm::cross(pb, pc))),
+            1.0 + glm::dot(pa, pb) + glm::dot(pb, pc) + glm::dot(pc, pa));
+        CandidateFace candidate{area, point};
+        if (point.selectionWeight >= 0.5F) {
+            selectedFaces.push_back(candidate);
+        } else {
+            incidentFaces.push_back(candidate);
+        }
+    }
+    // A one-vertex selection has no face center above the threshold, but must
+    // still be usable as a seed for refinement.
+    if (selectedFaces.empty()) {
+        selectedFaces = std::move(incidentFaces);
     }
     if (selectedFaces.empty()) {
         return nullptr;
     }
+
+    // Weight by area rather than face count: a dense seam contains many small
+    // triangles but represents little of the selected surface. Refining those
+    // along with the coarser interior would amplify the seam into a dense ring.
+    std::vector<double> areas;
+    areas.reserve(selectedFaces.size());
+    double totalArea = 0.0;
+    for (const auto& face : selectedFaces) {
+        areas.push_back(face.area);
+        totalArea += face.area;
+    }
+    std::sort(areas.begin(), areas.end());
+    double cumulativeArea = 0.0;
+    double medianArea = areas.back();
+    for (const double area : areas) {
+        cumulativeArea += area;
+        if (cumulativeArea >= totalArea * 0.5) {
+            medianArea = area;
+            break;
+        }
+    }
+    std::erase_if(selectedFaces, [medianArea](const CandidateFace& face) {
+        return face.area < medianArea * 0.5;
+    });
 
     const std::size_t insertCount = maxNewPoints == 0
                                         ? selectedFaces.size()
@@ -508,8 +610,7 @@ std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::RefineSelect
     for (std::size_t i = 0; i < insertCount; ++i) {
         const std::size_t selectedIndex = ((2 * i + 1) * selectedFaces.size()) /
                                           (2 * insertCount);
-        const auto faceOffset = 3 * selectedFaces[selectedIndex];
-        points.push_back(interpolateFacePoint(vertices_, triangleIndices_.data() + faceOffset));
+        points.push_back(selectedFaces[selectedIndex].point);
     }
 
     auto vertices = vertices_;
@@ -605,7 +706,7 @@ std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::CoarsenSelec
     } else if (!generalCandidates.empty()) {
         if (maxRemovedVertices == 0) {
             // Replace the selected interior instead of retaining a biased subset of its
-            // original Fibonacci sites. New samples are area-distributed and Poisson-spaced.
+            // original sites. New samples are area-distributed and Poisson-spaced.
             removable = generalCandidates;
             regeneratedPointCount = std::max<std::size_t>(4, generalCandidates.size() / 2);
             regenerateSelectedRegion = true;
@@ -871,27 +972,27 @@ std::vector<std::size_t> SphericalGridSnapshot::FindWithinRadius(
     return result;
 }
 
-SphericalFibonacciGrid::SphericalFibonacciGrid(const GridOptions& options) {
+SphericalGrid::SphericalGrid(const GridOptions& options) {
     GenerateGrid(options);
 }
 
-void SphericalFibonacciGrid::GenerateGrid(const GridOptions& options) {
+void SphericalGrid::GenerateGrid(const GridOptions& options) {
     snapshot_.store(std::make_shared<const SphericalGridSnapshot>(options));
 }
 
-void SphericalFibonacciGrid::InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot) {
+void SphericalGrid::InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot) {
     if (!snapshot) {
         throw std::invalid_argument("Cannot install a null grid snapshot.");
     }
     snapshot_.store(std::move(snapshot));
 }
 
-void SphericalFibonacciGrid::SetElevations(std::span<const float> elevations) {
+void SphericalGrid::SetElevations(std::span<const float> elevations) {
     const auto current = GetSnapshot();
     snapshot_.store(std::make_shared<const SphericalGridSnapshot>(*current, elevations));
 }
 
-void SphericalFibonacciGrid::SetSelectionWeights(std::span<const float> selectionWeights,
+void SphericalGrid::SetSelectionWeights(std::span<const float> selectionWeights,
                                                  bool active) {
     const auto current = GetSnapshot();
     std::vector<float> elevations;
@@ -904,6 +1005,6 @@ void SphericalFibonacciGrid::SetSelectionWeights(std::span<const float> selectio
         active));
 }
 
-std::shared_ptr<const SphericalGridSnapshot> SphericalFibonacciGrid::GetSnapshot() const {
+std::shared_ptr<const SphericalGridSnapshot> SphericalGrid::GetSnapshot() const {
     return snapshot_.load();
 }

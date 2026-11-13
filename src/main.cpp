@@ -102,7 +102,7 @@ struct ImGuiSession {
 int runApplication() {
     GridOptions gridOptions;
     gridOptions.relaxationIterations = 5;
-    SphericalFibonacciGrid grid(gridOptions);
+    SphericalGrid grid(gridOptions);
     const auto snapshot = grid.GetSnapshot();
     std::cout << "Generated " << snapshot->GetVertices().size() << " vertices and "
               << snapshot->GetTriangleIndices().size() / 3 << " spherical faces.\n"

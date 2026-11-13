@@ -26,7 +26,7 @@ void expectInvalid(auto&& operation) {
 }
 
 void testRadiusSelectionAndWeights() {
-    SphericalFibonacciGrid model({1000, 0.0, 81});
+    SphericalGrid model({1000, 0.0, 81});
     const auto snapshot = model.GetSnapshot();
     const auto& vertices = snapshot->GetVertices();
     const glm::dvec3 center(vertices[0].position);
@@ -57,7 +57,7 @@ void testRadiusSelectionAndWeights() {
 }
 
 void testSphericalPolygonSelection() {
-    SphericalFibonacciGrid model({1000, 0.0, 82});
+    SphericalGrid model({1000, 0.0, 82});
     const auto snapshot = model.GetSnapshot();
     std::vector<glm::dvec3> cap;
     constexpr double colatitude = 0.65;
@@ -70,8 +70,10 @@ void testSphericalPolygonSelection() {
     const auto weights = SelectSphericalPolygon(*snapshot, cap);
     check(weights.size() == snapshot->GetVertices().size(),
           "Polygon selection returned an incorrect weight count.");
-    check(weights.front() == 1.0F, "Polygon around the north pole missed the north pole.");
-    check(weights.back() == 0.0F, "Polygon around the north pole selected the south pole.");
+        check(weights[snapshot->FindNearest({0, 0, 1})] == 1.0F,
+            "Polygon around the north pole missed the nearest north-pole site.");
+        check(weights[snapshot->FindNearest({0, 0, -1})] == 0.0F,
+            "Polygon around the north pole selected the nearest south-pole site.");
     check(std::count(weights.begin(), weights.end(), 1.0F) > 0 &&
           std::count(weights.begin(), weights.end(), 0.0F) > 0,
           "Polygon selection did not divide the sphere.");
@@ -86,7 +88,7 @@ void testSphericalPolygonSelection() {
 }
 
 void testGridChannelAndBrushMasking() {
-    SphericalFibonacciGrid model({1000, 0.0, 83});
+    SphericalGrid model({1000, 0.0, 83});
     auto snapshot = model.GetSnapshot();
     std::vector<float> weights(snapshot->GetVertices().size(), 0.0F);
     weights[0] = 0.5F;
@@ -119,7 +121,7 @@ void testGridChannelAndBrushMasking() {
 }
 
 void testValueSelection() {
-    SphericalFibonacciGrid model({1000, 0.0, 84});
+    SphericalGrid model({1000, 0.0, 84});
     std::vector<float> elevations(model.GetSnapshot()->GetVertices().size(), 0.0F);
     const std::vector<float> samples{-120, -100, -90, -80, -60, -40, -20, 0,
                                      20, 40, 60, 80, 90, 100, 120};

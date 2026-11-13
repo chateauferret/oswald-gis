@@ -131,7 +131,7 @@ std::optional<glm::dvec3> inspectHoverPoint(const ImVec2& mouse,
 
 class RasterImportCommand final : public UndoableCommand {
 public:
-    RasterImportCommand(UIManager& ui, SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    RasterImportCommand(UIManager& ui, SphericalGrid& grid, GlobeRenderer& renderer,
                         std::vector<float> previousElevations,
                         std::vector<float> importedElevations,
                         std::shared_ptr<const ElevationRaster> previousRaster,
@@ -158,7 +158,7 @@ private:
     }
 
     UIManager& ui_;
-    SphericalFibonacciGrid& grid_;
+    SphericalGrid& grid_;
     GlobeRenderer& renderer_;
     std::vector<float> previousElevations_;
     std::vector<float> importedElevations_;
@@ -170,7 +170,7 @@ private:
 
 class BrushStrokeCommand final : public UndoableCommand {
 public:
-    BrushStrokeCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    BrushStrokeCommand(SphericalGrid& grid, GlobeRenderer& renderer,
                        std::vector<float> before, std::vector<float> after)
         : grid_(grid), renderer_(renderer), before_(std::move(before)), after_(std::move(after)) {}
 
@@ -183,7 +183,7 @@ private:
         renderer_.UpdateElevations(grid_.GetSnapshot()->GetVertices());
     }
 
-    SphericalFibonacciGrid& grid_;
+    SphericalGrid& grid_;
     GlobeRenderer& renderer_;
     std::vector<float> before_;
     std::vector<float> after_;
@@ -191,7 +191,7 @@ private:
 
 class TerrainFilterCommand final : public UndoableCommand {
 public:
-    TerrainFilterCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    TerrainFilterCommand(SphericalGrid& grid, GlobeRenderer& renderer,
                          std::vector<float> before, std::vector<float> after)
         : grid_(grid), renderer_(renderer), before_(std::move(before)),
           after_(std::move(after)) {}
@@ -205,7 +205,7 @@ private:
         renderer_.UpdateElevations(grid_.GetSnapshot()->GetVertices());
     }
 
-    SphericalFibonacciGrid& grid_;
+    SphericalGrid& grid_;
     GlobeRenderer& renderer_;
     std::vector<float> before_;
     std::vector<float> after_;
@@ -213,7 +213,7 @@ private:
 
 class SelectionCommand final : public UndoableCommand {
 public:
-    SelectionCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    SelectionCommand(SphericalGrid& grid, GlobeRenderer& renderer,
                      std::vector<float> before, bool beforeActive,
                      std::vector<float> after, bool afterActive)
         : grid_(grid), renderer_(renderer), before_(std::move(before)),
@@ -229,7 +229,7 @@ private:
         renderer_.UpdateSelection(grid_.GetSnapshot()->GetVertices(), active);
     }
 
-    SphericalFibonacciGrid& grid_;
+    SphericalGrid& grid_;
     GlobeRenderer& renderer_;
     std::vector<float> before_;
     bool beforeActive_;
@@ -239,7 +239,7 @@ private:
 
 class AdaptiveMeshCommand final : public UndoableCommand {
 public:
-    AdaptiveMeshCommand(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+    AdaptiveMeshCommand(SphericalGrid& grid, GlobeRenderer& renderer,
                         std::shared_ptr<const SphericalGridSnapshot> before,
                         std::shared_ptr<const SphericalGridSnapshot> after)
         : grid_(grid), renderer_(renderer), before_(std::move(before)), after_(std::move(after)) {}
@@ -253,7 +253,7 @@ private:
         renderer_.UploadGrid(*snapshot);
     }
 
-    SphericalFibonacciGrid& grid_;
+    SphericalGrid& grid_;
     GlobeRenderer& renderer_;
     std::shared_ptr<const SphericalGridSnapshot> before_;
     std::shared_ptr<const SphericalGridSnapshot> after_;
@@ -299,7 +299,7 @@ std::shared_ptr<const SphericalGridSnapshot> buildGridSnapshot(
 
 } // namespace
 
-void UIManager::InstallGeneratedGrid(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+void UIManager::InstallGeneratedGrid(SphericalGrid& grid, GlobeRenderer& renderer,
                                      std::shared_ptr<const SphericalGridSnapshot> snapshot) {
     grid.InstallSnapshot(std::move(snapshot));
     undoStack_.Clear();
@@ -310,7 +310,7 @@ void UIManager::InstallGeneratedGrid(SphericalFibonacciGrid& grid, GlobeRenderer
     previousOptions_ = options_;
 }
 
-void UIManager::StartGridGeneration(SphericalFibonacciGrid& grid, GlobeRenderer& renderer) {
+void UIManager::StartGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer) {
     const GridOptions requested = options_;
     previousOptions_ = grid.GetSnapshot()->GetOptions();
     if (requested.pointCount <= backgroundGenerationThreshold) {
@@ -331,7 +331,7 @@ void UIManager::StartGridGeneration(SphericalFibonacciGrid& grid, GlobeRenderer&
                              });
 }
 
-void UIManager::PollGridGeneration(SphericalFibonacciGrid& grid, GlobeRenderer& renderer) {
+void UIManager::PollGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (!gridFuture_.valid() ||
         gridFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
         return;
@@ -514,7 +514,7 @@ void UIManager::SetSelectionMode(SelectionMode mode) {
     polygonAdditive_ = false;
 }
 
-void UIManager::RenderValueSelectionDialog(SphericalFibonacciGrid& grid,
+void UIManager::RenderValueSelectionDialog(SphericalGrid& grid,
                                            GlobeRenderer& renderer) {
     if (valueSelectionOpen_) {
         valueSelectionError_.clear();
@@ -564,7 +564,7 @@ void UIManager::RenderValueSelectionDialog(SphericalFibonacciGrid& grid,
     }
 }
 
-void UIManager::RenderFillFilterDialog(SphericalFibonacciGrid& grid,
+void UIManager::RenderFillFilterDialog(SphericalGrid& grid,
                                        GlobeRenderer& renderer) {
     if (fillFilterOpen_) {
         ImGui::OpenPopup("Fill Filter");
@@ -617,7 +617,7 @@ void UIManager::RenderFillFilterDialog(SphericalFibonacciGrid& grid,
     ImGui::EndPopup();
 }
 
-void UIManager::FinishPolygonSelection(SphericalFibonacciGrid& grid, GlobeRenderer& renderer) {
+void UIManager::FinishPolygonSelection(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (polygonPoints_.size() >= 3) {
         const auto snapshot = grid.GetSnapshot();
         auto after = SelectSphericalPolygon(*snapshot, polygonPoints_);
@@ -633,7 +633,7 @@ void UIManager::FinishPolygonSelection(SphericalFibonacciGrid& grid, GlobeRender
     SetSelectionMode(SelectionMode::None);
 }
 
-void UIManager::ProcessBrushInput(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
                                   const glm::mat4& modelMatrix, float zoom) {
     auto& io = ImGui::GetIO();
     const auto mvp = brushMvp(io.DisplaySize, modelMatrix, zoom);
@@ -708,7 +708,7 @@ void UIManager::ProcessBrushInput(SphericalFibonacciGrid& grid, GlobeRenderer& r
     }
 }
 
-void UIManager::ProcessSelectionInput(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& renderer,
                                       const glm::mat4& modelMatrix, float zoom) {
     auto& io = ImGui::GetIO();
     const auto mvp = brushMvp(io.DisplaySize, modelMatrix, zoom);
@@ -841,7 +841,7 @@ void UIManager::ProcessSelectionInput(SphericalFibonacciGrid& grid, GlobeRendere
     }
 }
 
-bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
+bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                        const glm::mat4& modelMatrix, float zoom) {
     renderer.SetWireframeEnabled(viewportWireframe_);
     renderer.SetGraticuleEnabled(viewportGraticule_);
@@ -1263,12 +1263,13 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
     }
     if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         int pointCount = static_cast<int>(options_.pointCount);
-        float jitterStrength = static_cast<float>(options_.jitterStrength);
+        float poissonVariability = static_cast<float>(options_.poissonVariability);
         if (ImGui::SliderInt("Point Count (N)", &pointCount, 1'000, 1'000'000)) {
             options_.pointCount = static_cast<std::size_t>(pointCount);
         }
-        if (ImGui::SliderFloat("Jitter Strength (J)", &jitterStrength, 0.0F, 1.0F, "%.2f")) {
-            options_.jitterStrength = jitterStrength;
+        if (ImGui::SliderFloat("Poisson Variability (J)", &poissonVariability,
+                               0.0F, 1.0F, "%.2f")) {
+            options_.poissonVariability = poissonVariability;
         }
         ImGui::InputDouble("Raise/Lower speed (units/s)", &pendingRaiseLowerRate_,
                            1.0, 1024.0, "%.0f");
@@ -1276,7 +1277,7 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
         if (ImGui::SliderInt("Relaxation Passes (Lloyd)", &relaxation, 0, 20)) {
             options_.relaxationIterations = static_cast<std::uint32_t>(relaxation);
         }
-        ImGui::TextWrapped("Relaxation evens out the Voronoi cells towards regular hexagons; jitter is applied afterwards.");
+        ImGui::TextWrapped("Relaxation evens out Poisson-distributed sites towards more regular Voronoi cells.");
         ImGui::ColorEdit3("Graticule colour", glm::value_ptr(pendingGraticuleColor_));
         ImGui::ColorEdit3("Highlighted graticule colour",
                           glm::value_ptr(pendingHighlightedGraticuleColor_));
@@ -1306,7 +1307,7 @@ bool UIManager::Render(SphericalFibonacciGrid& grid, GlobeRenderer& renderer,
                 errorMessage_.clear();
                 const auto& currentOptions = grid.GetSnapshot()->GetOptions();
                 if (options_.pointCount != currentOptions.pointCount ||
-                    options_.jitterStrength != currentOptions.jitterStrength ||
+                    options_.poissonVariability != currentOptions.poissonVariability ||
                     options_.seed != currentOptions.seed ||
                     options_.relaxationIterations != currentOptions.relaxationIterations) {
                     StartGridGeneration(grid, renderer);

@@ -11,7 +11,7 @@ Traditional spherical heightfield tools frequently employ a Quadsphere architect
 * **Grid Orientation Artifacts**: Fixed cardinal grid axes cause artificial "stair-casing" during hydraulic erosion simulation, forcing water flow along horizontal or vertical array lines rather than natural drainage channels.
 * **Corner Singularities & Seam Logic**: Quad spheres suffer from area distortion near cube corners ($\sim 30\%$ area variation) and require complex topological rotation matrices to stitch flow and analytical windows across face boundaries.
 
-To eliminate these constraints, the `oswald-gis` Minimum Viable Product (MVP) replaces quad-matrix structures with a **Variable-Density Spherical Fibonacci-Delaunay Point Cloud**. Vertices are distributed across the unit sphere $S^2$ using a sunflower-inspired Fibonacci lattice perturbed by controlled spatial jittering, and connected via a 3D spherical Delaunay triangulation. This produces a topologically closed, seamless 2D manifold without face boundaries, corner singularities, or cardinal alignment biases.
+To eliminate these constraints, the `oswald-gis` Minimum Viable Product (MVP) replaces quad-matrix structures with a **Variable-Density Spherical Poisson-Delaunay Point Cloud**. Vertices are sampled uniformly over the unit sphere $S^2$ with Poisson-disk minimum spacing, then connected via a 3D spherical Delaunay triangulation. This produces a topologically closed, seamless 2D manifold without face boundaries, corner singularities, or cardinal alignment biases.
 
 ### 1.2 Minimum Viable Product (MVP) Scope
 
@@ -66,7 +66,7 @@ The software is structured strictly around a Model-View-Controller design patter
                                   v
 +---------------------------------+---------------------------------+
 |                              MODEL                                |
-|  - SphericalFibonacciGrid (std::vector<GridVertex>)              |
+|  - SphericalGrid (Poisson-sampled std::vector<GridVertex>)         |
 |  - Spherical Half-Edge Topology Graph                             |
 |  - 3D k-d Tree Index (nanoflann Adaptor)                          |
 |  - Single-Channel Elevation Data (-32767 to +32767 feet/meters)   |
@@ -85,35 +85,33 @@ The software is structured strictly around a Model-View-Controller design patter
 
 ### 3.1 Component Responsibilities
 
-* **Model (`SphericalFibonacciGrid`)**: Owns the CPU-side vertex buffers, topological edge connectivities, elevation arrays, and the `nanoflann` 3D k-d tree index. It exposes thread-safe methods for grid generation, local refinement, and spatial point sampling.
+* **Model (`SphericalGrid`)**: Owns the CPU-side vertex buffers, topological edge connectivities, elevation arrays, and the `nanoflann` 3D k-d tree index. It exposes thread-safe methods for grid generation, local refinement, and spatial point sampling.
 * **View (`GlobeRenderer`)**: Manages GPU-side OpenGL resources (Vertex Array Objects, Vertex Buffer Objects, Element Buffer Objects). It compiles GLSL shaders and renders the spherical mesh using an orthographic projection matrix.
 * **Controller (`CameraController` & `UIManager`)**: Processes window input events. It translates 2D mouse drags into 3D camera rotations, handles double-click raycasts for globe re-centering, and renders Dear ImGui interface overlays.
 
 ---
 
-## 4. Spherical Fibonacci-Delaunay Grid Model
+## 4. Spherical Poisson-Delaunay Grid Model
 
-### 4.1 Fibonacci Lattice Generation Mathematics
+### 4.1 Uniform Spherical Poisson Sampling
 
-To distribute $N$ points evenly across the surface of the unit sphere $S^2$ without polar clustering or latitude stretching, vertices are positioned using a sunflower-inspired Fibonacci distribution. For vertex index $i \in [0, N-1]$:
+Each candidate is drawn uniformly by sampling its vertical coordinate and longitude independently:
 
-$$\cos(\phi_i) = 1 - \frac{2i + 1}{N}, \quad \sin(\phi_i) = \sqrt{\max(0, 1 - \cos^2(\phi_i))}$$
+$$z = 2u - 1, \qquad \theta = 2\pi v, \qquad u,v \sim \operatorname{Uniform}(0,1)$$
 
-$$\theta_i = 2\pi \cdot \frac{i}{\Phi}, \quad \text{where } \Phi = \frac{1 + \sqrt{5}}{2} \approx 1.61803398875$$
+$$\mathbf{P} = \begin{pmatrix}\sqrt{1-z^2}\cos\theta \\\sqrt{1-z^2}\sin\theta \\z\end{pmatrix}$$
 
-$$\mathbf{P}_i = \begin{pmatrix} \sin(\phi_i)\cos(\theta_i) \\ \sin(\phi_i)\sin(\theta_i) \\ \cos(\phi_i) \end{pmatrix}$$
+Candidates are accepted only when their chord distance from every existing
+site is at least the Poisson exclusion radius. A spatial hash accelerates this
+test. For $N$ requested sites, the minimum spacing is
 
-### 4.2 Controlled Spatial Jittering
+$$s = (0.78 - 0.16J)\sqrt{\frac{4\pi}{N}}, \qquad J \in [0,1]$$
 
-To break up regular lattice alignments that induce unnatural directional biases during procedural terrain synthesis, a controlled displacement vector $\boldsymbol{\delta}_i$ is added to each base coordinate $\mathbf{P}_i$. The jitter magnitude is scaled relative to the average inter-point distance $r \approx \sqrt{4\pi / N}$:
+Higher $J$ permits closer neighbors and therefore a more variable random
+pattern. A fixed seed makes sampling reproducible. Optional Lloyd passes run
+after sampling to improve Voronoi-cell regularity.
 
-$$\boldsymbol{\delta}_i = J \cdot \frac{r}{2} \cdot \mathbf{u}_i, \quad \text{where } \mathbf{u}_i \sim \text{Uniform}(\mathbb{B}^3), \; J \in [0.0, 1.0]$$
-
-$$\mathbf{P}'_i = \frac{\mathbf{P}_i + \boldsymbol{\delta}_i}{\|\mathbf{P}_i + \boldsymbol{\delta}_i\|}$$
-
-Re-projecting $\mathbf{P}'_i$ onto $\|\mathbf{P}'_i\| = 1.0$ ensures all vertices lie exactly on the surface of unit sphere $S^2$.
-
-### 4.3 Topological Data Structure & Half-Edge Graph
+### 4.2 Topological Data Structure & Half-Edge Graph
 
 Vertices are linked into a convex spherical triangulation. The topology is stored as a **Spherical Half-Edge Graph**:
 
@@ -149,7 +147,7 @@ selection uses geodesic distance and a linearly feathered outer ring; polygon
 selection evaluates a spherical polygon against each vertex. Clear, invert,
 and selection strokes are undoable.
 
-### 4.4 Metric Distance Scaling
+### 4.3 Metric Distance Scaling
 
 Rather than measuring distances in pixels or cell array steps, spatial dimensions are calculated directly in real-world kilometers or miles on $S^2$. The physical arc distance $d$ between two points $\mathbf{P}_1, \mathbf{P}_2$ is defined by:
 
@@ -166,7 +164,7 @@ To support high-detail local mapping in regions of interest while maintaining a 
 ### 5.1 Dynamic Refinement Protocol (Subdivision)
 
 1. **Region Selection**: The user defines a spatial selection domain on the globe using the radius or polygon selection tools.
-2. **Local Point Insertion**: `Mesh -> Refine Selection` considers faces incident to a vertex with selection weight at least 0.5 and inserts one spherical face-centroid site into every eligible face.
+2. **Local Point Insertion**: `Mesh -> Refine Selection` considers faces with interpolated centroid selection weight at least 0.5. It skips faces smaller than half the area-weighted median selected-face area, so small, already-dense boundary triangles do not accumulate extra sites when a coarsened region is refined. If no centroid is selected, faces incident to a selected vertex can seed a tiny selection. Each eligible face receives one spherical face-centroid site.
 3. **Cavity Re-triangulation**: Small batches insert each site incrementally into the spherical convex hull, removing visible facets and connecting their horizon to the new site. Larger batches are triangulated together with Qhull. Both paths produce a closed, outward-facing mesh.
 4. **Data Transfer**: Elevation and selection weight are interpolated from the parent face using planar barycentric coordinates at the ray/triangle intersection:
 
@@ -181,7 +179,7 @@ $$\text{SelectionWeight}(\mathbf{P}_{\text{new}}) = w_A \cdot s_A + w_B \cdot s_
 3. **Constrained Relaxation**: Two damped spherical Lloyd steps move only selected interior vertices. Unselected vertices and the selection boundary remain fixed; the hull is rebuilt after each step.
 4. **Seamless Manifold Maintenance**: The rebuilt mesh is checked for a closed half-edge topology and a convex outward hull, avoiding T-junction cracks or visual gaps.
 
-Both operations publish new immutable snapshots and are undoable/redoable. The refinement API can optionally cap inserted points, while the default UI action processes every eligible face. Coarsening can also be explicitly limited; the default preferentially reverses refinement and otherwise regenerates the selected interior at lower density.
+Both operations publish new immutable snapshots and are undoable/redoable. The refinement API can optionally cap inserted points, while the default UI action processes every eligible face at the selected area's coarser scale. Coarsening can also be explicitly limited; the default preferentially reverses refinement and otherwise regenerates the selected interior at lower density.
 
 ---
 
@@ -226,13 +224,13 @@ using KDTree3D = nanoflann::KDTreeSingleIndexAdaptor<
 
 ### 6.3 Phase 2 Model API and Ownership
 
-`SphericalFibonacciGrid` is implemented in `include/SphericalGrid.hpp` and
+`SphericalGrid` is implemented in `include/SphericalGrid.hpp` and
 `src/SphericalGrid.cpp`. Construction and `GenerateGrid(GridOptions)` accept
-1,000 to 1,000,000 points, finite jitter strength in [0, 1], and an explicit
-32-bit seed. Defaults are 10,000 points, jitter 0.15, and seed 42. Elevations
-start at zero. Seeded jitter uses rejection sampling uniformly inside the
-unit ball, then reprojects each perturbed point onto the unit sphere.
-Positions are stored as `glm::vec3`, accurate to float precision.
+1,000 to 1,000,000 points, Poisson variability in [0, 1], and an explicit
+32-bit seed. Defaults are 10,000 points, variability 0.5, and seed 42.
+Candidates are sampled uniformly over the sphere and rejected when too close
+to accepted points. Elevations start at zero. Positions are stored as
+`glm::vec3`, accurate to float precision.
 
 `GetSnapshot()` returns a shared, immutable `SphericalGridSnapshot`, exposing
 `GetVertices()`, `GetHalfEdges()`, and `GetTriangleIndices()`. Each snapshot
@@ -427,8 +425,8 @@ changing elevations; Cancel or Escape dismisses the dialog without applying.
 
 #### Settings Dialog (`File -> Settings...`)
 * **Point Count ($N$)**: Int slider controlling target base vertex density ($1,000$ to $1,000,000$).
-* **Jitter Strength ($J$)**: Float slider ($0.00$ to $1.00$).
-* **Apply Button**: Triggers `SphericalFibonacciGrid::GenerateGrid()` and updates GPU VBO buffers.
+* **Poisson Variability ($J$)**: Float slider ($0.00$ to $1.00$); higher values allow smaller minimum spacing.
+* **Apply Button**: Triggers `SphericalGrid::GenerateGrid()` and updates GPU VBO buffers.
 
 ### 8.2 Navigation & Viewport Controls
 
@@ -466,7 +464,7 @@ $$L = 0.2126 \cdot R + 0.7152 \cdot G + 0.0722 \cdot B$$
 
 $$\text{Elevation} = -32767.0 + L \cdot (65534.0)$$
 
-4. **Grid Populating**: For each vertex $\mathbf{P}_i = (x, y, z)$ in the Fibonacci point cloud:
+4. **Grid Populating**: For each Poisson-sampled vertex $\mathbf{P}_i = (x, y, z)$:
    * Calculate geographic coordinates: $\text{Lat} = \arcsin(z)$, $\text{Lon} = \arctan(y, x)$.
    * Map $(\text{Lat}, \text{Lon})$ to normalized image pixel coordinates $(u, v) \in [0, 1] \times [0, 1]$.
    * Bilinearly sample the image luminosity and assign the calculated elevation to $\mathbf{P}_i$.
@@ -575,13 +573,14 @@ ctest --test-dir build/ninja -R '^spherical_grid$' --output-on-failure
 ctest --test-dir build/ninja -R '^spherical_grid_scale$' -V
 ```
 
-`BUILD_TESTING` defaults to ON. The focused test checks the Fibonacci formula,
-unit lengths, jitter bounds and seeds, zero elevations, outward winding,
+`BUILD_TESTING` defaults to ON. The focused test checks spherical-area
+uniformity, Poisson minimum spacing, unit lengths and seeded reproducibility,
+zero elevations, outward winding,
 Euler counts, reciprocal twins, closed vertex fans, the spherical Delaunay
 condition, brute-force nearest/arc query agreement, inclusive radius
 boundaries, invalid inputs, and snapshot lifetime during concurrent reads
 and regeneration. The `scale`-labeled test validates the maximum 1,000,000
-points with maximum jitter, including topology and a spatial query.
+points with maximum Poisson variability, including topology and a spatial query.
 
 ### 10.5 Phase 3 Verification
 
@@ -614,7 +613,7 @@ images, including uppercase extensions. TIFF/GeoTIFF is not supported by the
 current stb_image decoder. Navigation and decoding errors appear in the dialog.
 The selected image is decoded with stb_image and resampled to a 2048 x 1024 equirectangular
 luminosity raster. The app maps longitude periodically across the image seam,
-clamps latitude at the poles, bilinearly samples each Fibonacci vertex, and
+clamps latitude at the poles, bilinearly samples each spherical vertex, and
 maps luminosity to elevations in [-32767, 32767]. Applying new grid settings
 resamples the currently loaded raster onto the regenerated grid. Raster
 elevation replacement publishes a new immutable model snapshot and updates the

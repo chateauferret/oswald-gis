@@ -93,23 +93,34 @@ void verifyGeometry(const SphericalGridSnapshot& snapshot) {
     const auto& options = snapshot.GetOptions();
     const auto& vertices = snapshot.GetVertices();
     check(vertices.size() == options.pointCount, "Incorrect vertex count.");
-    const double goldenRatio = (1.0 + std::sqrt(5.0)) / 2.0;
-    const double scale = options.jitterStrength *
-                         std::sqrt(std::numbers::pi / options.pointCount);
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
-        const glm::dvec3 actual(vertices[i].position);
-        check(std::abs(glm::length(actual) - 1.0) < 1e-7, "Vertex is not on unit sphere.");
-        check(vertices[i].elevation == 0.0F, "Initial elevation is not zero.");
-        const double z = 1.0 - (2.0 * i + 1.0) / options.pointCount;
-        const double radius = std::sqrt(std::max(0.0, 1.0 - z * z));
-        const double theta = 2.0 * std::numbers::pi * i / goldenRatio;
-        const glm::dvec3 expected(radius * std::cos(theta), radius * std::sin(theta), z);
-        if (options.jitterStrength == 0.0) {
-            check(glm::length(actual - expected) < 1e-7, "Fibonacci formula mismatch.");
-        } else {
-            const double angle = std::atan2(glm::length(glm::cross(expected, actual)),
-                                            glm::dot(expected, actual));
-            check(angle <= std::asin(scale) + 1e-7, "Jitter exceeded its specified bound.");
+    std::array<std::size_t, 8> latitudeBands{};
+    for (const auto& vertex : vertices) {
+        const glm::dvec3 actual(vertex.position);
+        check(std::abs(glm::length(actual) - 1.0) < 1e-6, "Vertex is not on unit sphere.");
+        check(vertex.elevation == 0.0F, "Initial elevation is not zero.");
+        const auto band = std::min<std::size_t>(7, static_cast<std::size_t>(
+            (1.0 - (actual.z + 1.0) * 0.5) * latitudeBands.size()));
+        ++latitudeBands[band];
+    }
+    const double expectedPerBand = static_cast<double>(options.pointCount) /
+                                   static_cast<double>(latitudeBands.size());
+    const double tolerance = options.pointCount >= 100'000 ? 0.04 : 0.35;
+    for (const auto count : latitudeBands) {
+        check(std::abs(static_cast<double>(count) - expectedPerBand) <=
+                  expectedPerBand * tolerance,
+              "Poisson grid is not approximately uniform by spherical area.");
+    }
+
+    if (vertices.size() <= 2000) {
+        const double minimumSpacing = (0.78 - 0.16 * options.poissonVariability) *
+                                      std::sqrt(4.0 * std::numbers::pi / options.pointCount);
+        for (std::size_t i = 0; i < vertices.size(); ++i) {
+            for (std::size_t j = i + 1; j < vertices.size(); ++j) {
+                const glm::dvec3 delta = glm::dvec3(vertices[i].position) -
+                                         glm::dvec3(vertices[j].position);
+                check(glm::dot(delta, delta) + 1e-10 >= minimumSpacing * minimumSpacing,
+                      "Poisson grid contains points inside its minimum spacing.");
+            }
         }
     }
 }
@@ -172,14 +183,14 @@ void verifyQueries(const SphericalGridSnapshot& snapshot) {
 }
 
 void verifyValidationAndRegeneration() {
-    SphericalFibonacciGrid grid({1000, 0.0, 1});
+    SphericalGrid grid({1000, 0.0, 1});
     const auto original = grid.GetSnapshot();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     for (const auto count : {std::size_t{0}, std::size_t{999}, std::size_t{1'000'001}}) {
         expectInvalid([&] { grid.GenerateGrid({count, 0.0, 1}); });
     }
-    for (const auto jitter : {-1.0, 1.1, nan}) {
-        expectInvalid([&] { grid.GenerateGrid({1000, jitter, 1}); });
+    for (const auto variability : {-1.0, 1.1, nan}) {
+        expectInvalid([&] { grid.GenerateGrid({1000, variability, 1}); });
     }
     check(grid.GetSnapshot() == original, "Failed regeneration replaced the valid snapshot.");
     expectInvalid([&] { original->FindNearest({0, 0, 0}); });
@@ -195,13 +206,20 @@ void verifyValidationAndRegeneration() {
     check(original->FindNearest({1e-300, 0, 0}) == original->FindNearest({1, 0, 0}),
           "Small finite query direction was not normalized safely.");
 
-    SphericalFibonacciGrid oddGrid({1001, 0.0, 42});
+    SphericalGrid oddGrid({1001, 0.0, 42});
     const auto oddSnapshot = oddGrid.GetSnapshot();
-    const auto hemisphere = oddSnapshot->FindWithinRadius({0, 0, 1}, std::numbers::pi / 2.0, 1.0);
-    check(std::find(hemisphere.begin(), hemisphere.end(), 500) != hemisphere.end(),
-          "Inclusive hemisphere boundary excluded the equator.");
-    check(oddSnapshot->FindWithinRadius({0, 0, 1}, std::numbers::pi / 2.0 - 1e-12, 1.0).size() == 500,
-          "Radius boundary included an outside vertex.");
+        const auto& oddVertices = oddSnapshot->GetVertices();
+        const glm::dvec3 boundaryCenter = glm::normalize(glm::dvec3(oddVertices[0].position));
+        const glm::dvec3 boundaryPoint = glm::normalize(glm::dvec3(oddVertices[1].position));
+        const double boundaryAngle = std::atan2(glm::length(glm::cross(boundaryCenter, boundaryPoint)),
+                                  glm::dot(boundaryCenter, boundaryPoint));
+        const auto boundaryHit = oddSnapshot->FindWithinRadius(boundaryCenter, boundaryAngle, 1.0);
+        check(std::find(boundaryHit.begin(), boundaryHit.end(), 1) != boundaryHit.end(),
+            "Inclusive spherical radius excluded a point exactly on its boundary.");
+        const auto boundaryMiss = oddSnapshot->FindWithinRadius(boundaryCenter,
+                                             boundaryAngle - 1e-10, 1.0);
+        check(std::find(boundaryMiss.begin(), boundaryMiss.end(), 1) == boundaryMiss.end(),
+            "Spherical radius included a point outside its boundary.");
 
     std::atomic<bool> stop{false};
     std::atomic<bool> readerFailed{false};
@@ -239,20 +257,14 @@ void verifyValidationAndRegeneration() {
     }
     grid.GenerateGrid({2000, 1.0, 99});
     check(grid.GetSnapshot()->GetVertices()[0].position != repeated->GetVertices()[0].position,
-          "Changing the seed did not change jitter.");
+            "Changing the seed did not change the Poisson sample.");
     grid.GenerateGrid({2000, 0.0, 99});
     check(grid.GetSnapshot()->GetVertices()[0].position != repeated->GetVertices()[0].position,
-          "Jitter did not change points.");
-    const auto unjittered = grid.GetSnapshot();
-    grid.GenerateGrid({2000, 0.0, 1});
-    for (std::size_t i = 0; i < 2000; ++i) {
-        check(unjittered->GetVertices()[i].position == grid.GetSnapshot()->GetVertices()[i].position,
-              "Unjittered generation depends on the seed.");
-    }
+            "Changing the seed did not change the Poisson sample.");
 }
 
 void verifyAdaptiveRefinementAndCoarsening() {
-    SphericalFibonacciGrid grid({1000, 0.0, 314});
+    SphericalGrid grid({1000, 0.0, 314});
     const auto original = grid.GetSnapshot();
     std::vector<float> elevations(original->GetVertices().size(), 1234.0F);
     grid.SetElevations(elevations);
@@ -280,10 +292,11 @@ void verifyAdaptiveRefinementAndCoarsening() {
     };
     verifyHull(*refined);
     const auto fullyRefined = selected->RefineSelectedRegion();
-    const auto expectedInsertions = selected->GetTriangleIndices().size() / 3;
     check(fullyRefined != nullptr &&
-          fullyRefined->GetVertices().size() == selected->GetVertices().size() + expectedInsertions,
-          "Default refinement did not insert one point into every eligible selected face.");
+          fullyRefined->GetVertices().size() > selected->GetVertices().size() * 2 &&
+          fullyRefined->GetVertices().size() <= selected->GetVertices().size() +
+              selected->GetTriangleIndices().size() / 3,
+          "Default refinement did not substantially increase the selected density.");
     verifyTopology(*fullyRefined);
     verifyHull(*fullyRefined);
     const auto conservativeCoarsening = selected->CoarsenSelectedRegion();
@@ -419,6 +432,60 @@ void verifyAdaptiveRefinementAndCoarsening() {
     expectInvalid([&] { selected->CoarsenSelectedRegion(-1.0F); });
 }
 
+void verifyCoarsenThenRefineDensity() {
+    SphericalGrid grid({4000, 0.0, 314});
+    std::vector<float> selection;
+    for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+        selection.push_back(vertex.position.z > 0.2F ? 1.0F : 0.0F);
+    }
+    grid.SetSelectionWeights(selection, true);
+    const auto coarse = grid.GetSnapshot()->CoarsenSelectedRegion();
+    check(coarse != nullptr, "Regional coarsening failed.");
+    const auto refined = coarse->RefineSelectedRegion();
+    check(refined != nullptr, "Refinement after regional coarsening failed.");
+    verifyTopology(*coarse);
+    verifyTopology(*refined);
+
+    std::size_t borderCount = 0;
+    std::size_t interiorCount = 0;
+    for (const auto& vertex : refined->GetVertices()) {
+        borderCount += vertex.position.z >= 0.2F && vertex.position.z < 0.27F;
+        interiorCount += vertex.position.z >= 0.6F;
+    }
+    // Both bands have known spherical area, proportional to their width in z.
+    if (static_cast<double>(borderCount) * (0.4 / 0.07) > static_cast<double>(interiorCount) * 1.3) {
+        throw std::runtime_error("Refinement produced a dense border: " +
+                                 std::to_string(borderCount) + " border vs " +
+                                 std::to_string(interiorCount) + " interior points.");
+    }
+    std::size_t borderInserted = 0;
+    std::size_t interiorInserted = 0;
+    for (std::size_t i = coarse->GetVertices().size(); i < refined->GetVertices().size(); ++i) {
+        const auto z = refined->GetVertices()[i].position.z;
+        borderInserted += z >= 0.2F && z < 0.27F;
+        interiorInserted += z >= 0.6F;
+    }
+    if (static_cast<double>(borderInserted) * (0.4 / 0.07) > static_cast<double>(interiorInserted) * 1.3) {
+        throw std::runtime_error("Refinement concentrated insertions at the border: " +
+                                 std::to_string(borderInserted) + " border vs " +
+                                 std::to_string(interiorInserted) + " interior points.");
+    }
+    for (std::size_t i = coarse->GetVertices().size(); i < refined->GetVertices().size(); ++i) {
+        check(refined->GetVertices()[i].selectionWeight >= 0.5F,
+              "Refinement inserted points outside the selected region.");
+    }
+    const auto restored = refined->CoarsenSelectedRegion();
+    check(restored != nullptr && restored->GetVertices().size() == coarse->GetVertices().size(),
+          "Coarsening did not reverse refinement of the coarsened region.");
+    verifyTopology(*restored);
+    for (std::size_t i = 0; i < coarse->GetVertices().size(); ++i) {
+        check(restored->GetVertices()[i].position == coarse->GetVertices()[i].position &&
+              restored->GetVertices()[i].elevation == coarse->GetVertices()[i].elevation &&
+              restored->GetVertices()[i].selectionWeight == coarse->GetVertices()[i].selectionWeight,
+              "Refinement and coarsening changed an existing coarse site.");
+    }
+}
+
 // Coefficient of variation of all edge lengths; lower means more uniform cells.
 double edgeLengthSpread(const SphericalGridSnapshot& snapshot) {
     const auto& vertices = snapshot.GetVertices();
@@ -446,9 +513,9 @@ void verifyRelaxation() {
     GridOptions plain{2000, 0.0, 7};
     GridOptions relaxed = plain;
     relaxed.relaxationIterations = 5;
-    SphericalFibonacciGrid first(plain);
-    SphericalFibonacciGrid second(relaxed);
-    SphericalFibonacciGrid repeat(relaxed);
+    SphericalGrid first(plain);
+    SphericalGrid second(relaxed);
+    SphericalGrid repeat(relaxed);
     verifyTopology(*second.GetSnapshot());
     for (const auto& vertex : second.GetSnapshot()->GetVertices()) {
         check(std::abs(glm::length(glm::dvec3(vertex.position)) - 1.0) < 1e-6,
@@ -462,11 +529,11 @@ void verifyRelaxation() {
               "Relaxed generation is not reproducible.");
     }
     relaxed.relaxationIterations = 101;
-    expectInvalid([&] { SphericalFibonacciGrid invalid(relaxed); });
+    expectInvalid([&] { SphericalGrid invalid(relaxed); });
     relaxed.relaxationIterations = 3;
-    relaxed.jitterStrength = 0.5;
-    SphericalFibonacciGrid jittered(relaxed);
-    verifyTopology(*jittered.GetSnapshot());
+    relaxed.poissonVariability = 0.5;
+    SphericalGrid variableSpacing(relaxed);
+    verifyTopology(*variableSpacing.GetSnapshot());
 }
 
 void verifyCancellation() {
@@ -487,7 +554,7 @@ void verifyCancellation() {
     }
     check(threw, "Cancelled generation did not throw.");
 
-    SphericalFibonacciGrid grid({1000, 0.0, 1});
+    SphericalGrid grid({1000, 0.0, 1});
     const auto before = grid.GetSnapshot();
     check(grid.GetSnapshot() == before, "Snapshot changed unexpectedly.");
     auto replacement = std::make_shared<const SphericalGridSnapshot>(options);
@@ -502,7 +569,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--scale") {
             const auto start = std::chrono::steady_clock::now();
-            SphericalFibonacciGrid grid({1'000'000, 1.0, 42});
+            SphericalGrid grid({1'000'000, 0.5, 42});
             const auto snapshot = grid.GetSnapshot();
             verifyGeometry(*snapshot);
             verifyTopology(*snapshot);
@@ -512,8 +579,8 @@ int main(int argc, char** argv) {
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                       << " seconds.\n";
         } else {
-            for (const auto jitter : {0.0, 0.15, 1.0}) {
-                SphericalFibonacciGrid grid({1000, jitter, 42});
+            for (const auto variability : {0.0, 0.15, 1.0}) {
+                SphericalGrid grid({1000, variability, 42});
                 const auto snapshot = grid.GetSnapshot();
                 verifyGeometry(*snapshot);
                 verifyTopology(*snapshot);
@@ -521,6 +588,7 @@ int main(int argc, char** argv) {
             }
             verifyValidationAndRegeneration();
             verifyAdaptiveRefinementAndCoarsening();
+            verifyCoarsenThenRefineDensity();
             verifyRelaxation();
             verifyCancellation();
         }

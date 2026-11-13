@@ -26,9 +26,10 @@ struct HalfEdge {
 
 struct GridOptions {
     std::size_t pointCount = 10'000;
-    double jitterStrength = 0.15;
+    // Higher values reduce the Poisson exclusion radius and allow more spacing variation.
+    double poissonVariability = 0.5;
     std::uint32_t seed = 42;
-    // Lloyd relaxation passes applied before jitter; they make the Voronoi cells more regular.
+    // Lloyd relaxation passes applied after Poisson sampling; they make cells more regular.
     std::uint32_t relaxationIterations = 0;
 };
 
@@ -92,11 +93,14 @@ public:
         glm::dvec3 direction, double arcRadius, double planetRadius = 6371.0) const;
 
     // Returns a new immutable snapshot, or nullptr if the selection contains no eligible faces.
-    // A zero limit inserts one site into every eligible face; otherwise the insertion count is capped.
+    // Eligible face centers are selected and not much smaller than the selected region's
+    // area-weighted median face. A tiny selection can instead seed incident faces.
+    // A zero limit processes all eligible faces; otherwise the insertion count is capped.
     std::shared_ptr<const SphericalGridSnapshot> RefineSelectedRegion(
         std::size_t maxNewPoints = 0) const;
-    // A zero limit removes eligible refinement-created sites; otherwise it removes a sparse
-    // non-adjacent subset of flat selected sites. A nonzero limit caps either behavior.
+    // Removes eligible refinement-created sites, or coarsens flat selected interior sites.
+    // A zero limit regenerates the interior at approximately half density when necessary;
+    // a nonzero limit caps removals and uses a sparse subset of existing sites instead.
     std::shared_ptr<const SphericalGridSnapshot> CoarsenSelectedRegion(
         float maximumElevationDifference = 0.0F,
         std::size_t maxRemovedVertices = 0) const;
@@ -117,9 +121,9 @@ private:
     KDTree3D tree_;
 };
 
-class SphericalFibonacciGrid {
+class SphericalGrid {
 public:
-    explicit SphericalFibonacciGrid(const GridOptions& options = {});
+    explicit SphericalGrid(const GridOptions& options = {});
     void GenerateGrid(const GridOptions& options);
     void InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot);
     void SetElevations(std::span<const float> elevations);

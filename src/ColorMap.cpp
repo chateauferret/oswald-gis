@@ -1,6 +1,7 @@
 #include "ColorMap.hpp"
 
 #include <array>
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <fstream>
@@ -10,6 +11,19 @@
 #include <utility>
 
 ColorMap::ColorMap(std::vector<glm::vec4> stops) : stops_(std::move(stops)) {}
+
+glm::vec3 ColorMap::Sample(float elevation) const {
+    if (!std::isfinite(elevation)) {
+        throw std::invalid_argument("Colour-map elevation must be finite.");
+    }
+    const float value = std::clamp(elevation, stops_.front().x, stops_.back().x);
+    auto upper = std::upper_bound(stops_.begin() + 1, stops_.end() - 1, value,
+        [](float height, const glm::vec4& stop) { return height < stop.x; });
+    const auto& lower = *(upper - 1);
+    const float blend = (value - lower.x) / (upper->x - lower.x);
+    return glm::mix(glm::vec3(lower.y, lower.z, lower.w),
+                    glm::vec3(upper->y, upper->z, upper->w), blend);
+}
 
 ColorMap ColorMap::Load(const std::filesystem::path& path) {
     std::ifstream input(path);

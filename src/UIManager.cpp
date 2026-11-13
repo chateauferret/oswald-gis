@@ -1,12 +1,15 @@
 #include "UIManager.hpp"
+#include "ProjectFile.hpp"
 
 #include <imgui.h>
+#include <misc/cpp/imgui_stdlib.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <exception>
 #include <filesystem>
@@ -1225,6 +1228,307 @@ void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& render
     }
 }
 
+void UIManager::BeginProjectDialog(ProjectAction action) {
+    projectAction_ = action;
+    projectDialogOpen_ = true;
+    projectError_.clear();
+    overwritePath_.clear();
+    projectFileName_ = action == ProjectAction::Open ? "" :
+        action == ProjectAction::ExportImage ? "map.png" :
+        action == ProjectAction::Export ? "elevation.png" :
+        projectPath_.empty() ? "project.oswald" : projectPath_.filename().string();
+    if (action == ProjectAction::Export || action == ProjectAction::ExportImage) {
+        const std::array extensions{".png", ".bmp", ".tga", ".tif"};
+        projectFileName_ = std::filesystem::path(projectFileName_)
+                               .replace_extension(extensions[exportFormat_]).string();
+    }
+    try {
+        const auto directory = !projectPath_.empty() ? projectPath_.parent_path() :
+            projectBrowser_.GetDirectory().empty() ? std::filesystem::current_path() :
+                                                    projectBrowser_.GetDirectory();
+        projectBrowser_.Navigate(directory, true);
+        projectDirectory_ = projectBrowser_.GetDirectory().string();
+    } catch (const std::exception& error) {
+        projectError_ = error.what();
+    }
+}
+
+void UIManager::SaveProject(SphericalGrid& grid) {
+    if (projectPath_.empty()) {
+        BeginProjectDialog(ProjectAction::Save);
+        return;
+    }
+    try {
+        ProjectFile::Save(projectPath_, grid);
+    } catch (const std::exception& error) {
+        projectError_ = error.what();
+        projectErrorOpen_ = true;
+    }
+}
+
+void UIManager::PerformProjectAction(SphericalGrid& grid, GlobeRenderer& renderer,
+                                     const std::filesystem::path& path) {
+    if (projectAction_ == ProjectAction::Save) {
+        ProjectFile::Save(path, grid);
+        projectPath_ = std::filesystem::absolute(path);
+    } else if (projectAction_ == ProjectAction::Export) {
+        ElevationRaster::Export(path, grid, exportWidth_, exportWidth_ / 2,
+            static_cast<ElevationRaster::TiffSampleType>(exportTiffSampleType_));
+    } else if (projectAction_ == ProjectAction::ExportImage) {
+        const auto& layer = grid.GetActiveLayer();
+        const auto& map = GetColorMap(std::string(layer.GetColorMap()));
+        const auto* selectionMap = exportSelectionHighlight_ ?
+            &GetColorMap(std::string(layer.GetSelectionColorMap())) : nullptr;
+        ElevationRaster::ExportImage(path, grid, map, selectionMap, exportWidth_, exportWidth_ / 2);
+    } else {
+        auto loaded = ProjectFile::Load(path);
+        std::vector<GlobeRenderLayer> renderLayers;
+        if (!colorMapDirectory_.empty()) {
+            for (const auto& layer : loaded->GetLayers()) {
+                renderLayers.emplace_back(*layer, GetColorMap(std::string(layer->GetColorMap())),
+                    GetColorMap(std::string(layer->GetSelectionColorMap())));
+            }
+        }
+        renderer.ClearLayerStack();
+        renderer.UploadGrid(*loaded->GetSnapshot());
+        ProjectFile::Install(grid, *loaded);
+        if (!colorMapDirectory_.empty()) {
+            renderer.SetLayerStack(std::move(renderLayers));
+        }
+        renderer.SetLayerVisible(true);
+        undoStack_.Clear();
+        stroke_.reset();
+        selectionStroke_.reset();
+        polygonPoints_.clear();
+        brushTools_.SetActive(false);
+        SetSelectionMode(SelectionMode::None);
+        raster_.reset();
+        loadedRasterPath_.clear();
+        nameEditLayer_ = nullptr;
+        layerError_.clear();
+        options_ = grid.GetSnapshot()->GetOptions();
+        previousOptions_ = options_;
+        if (grid.HasActiveLayer()) {
+            ApplyActiveLayerColorMaps(grid, renderer);
+        }
+        projectPath_ = std::filesystem::absolute(path);
+    }
+}
+
+void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (metadataOpen_) {
+        pendingMetadata_ = grid.GetMetadata();
+        ImGui::OpenPopup("Project Metadata");
+        metadataOpen_ = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(540, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::BeginPopupModal("Project Metadata", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputTextMultiline("Description", &pendingMetadata_.description, ImVec2(380, 150));
+        ImGui::InputText("Author", &pendingMetadata_.author);
+        std::string date = grid.GetMetadata().savedAt.empty() ?
+            "Not yet saved" : grid.GetMetadata().savedAt;
+        ImGui::InputText("Date (UTC)", &date, ImGuiInputTextFlags_ReadOnly);
+        if (ImGui::Button("Apply")) {
+            grid.GetMetadata().description = pendingMetadata_.description;
+            grid.GetMetadata().author = pendingMetadata_.author;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (projectDialogOpen_) {
+        ImGui::OpenPopup("Project File");
+        projectDialogOpen_ = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(680, 480), ImGuiCond_FirstUseEver);
+    if (ImGui::BeginPopupModal("Project File")) {
+        const bool opening = projectAction_ == ProjectAction::Open;
+        const bool imageExport = projectAction_ == ProjectAction::ExportImage;
+        const bool exporting = projectAction_ == ProjectAction::Export || imageExport;
+        ImGui::TextUnformatted(opening ? "Open Project" :
+                               imageExport ? "Export Image" : exporting ? "Export Data" : "Save Project");
+        const auto navigate = [&](const std::filesystem::path& directory) {
+            try {
+                projectBrowser_.Navigate(directory, true);
+                projectDirectory_ = projectBrowser_.GetDirectory().string();
+                projectError_.clear();
+            } catch (const std::exception& error) {
+                projectError_ = error.what();
+            }
+        };
+        const bool go = ImGui::InputText("Folder", &projectDirectory_,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if (ImGui::Button("Go") || go) {
+            navigate(projectDirectory_);
+        }
+        if (ImGui::Button("Up")) {
+            navigate(projectBrowser_.GetDirectory().parent_path());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh")) {
+            navigate(projectBrowser_.GetDirectory());
+        }
+        std::filesystem::path nextDirectory;
+        bool perform = false;
+        if (ImGui::BeginChild("ProjectFiles", ImVec2(0, 170), true)) {
+            for (const auto& entry : projectBrowser_.GetEntries()) {
+                ImGui::PushID(&entry);
+                const auto position = ImGui::GetCursorScreenPos();
+                const auto name = entry.path.filename().string();
+                if (ImGui::Selectable("##file", name == projectFileName_,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (entry.isDirectory) {
+                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                            nextDirectory = entry.path;
+                        }
+                    } else {
+                        projectFileName_ = name;
+                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && opening) {
+                            perform = true;
+                        }
+                    }
+                }
+                const auto label = (entry.isDirectory ? "[Folder] " : "") + name;
+                ImGui::GetWindowDrawList()->AddText(position, ImGui::GetColorU32(ImGuiCol_Text),
+                                                   label.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+        if (!nextDirectory.empty()) {
+            navigate(nextDirectory);
+        }
+        perform |= ImGui::InputText("File name", &projectFileName_,
+                                    ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool changedFileName = ImGui::IsItemEdited();
+        if (exporting) {
+            if (changedFileName) {
+                auto extension = std::filesystem::path(projectFileName_).extension().string();
+                std::transform(extension.begin(), extension.end(), extension.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                if (extension == ".png") exportFormat_ = 0;
+                if (extension == ".bmp") exportFormat_ = 1;
+                if (extension == ".tga") exportFormat_ = 2;
+                if (extension == ".tif" || extension == ".tiff") exportFormat_ = 3;
+            }
+            if (ImGui::Combo("Format", &exportFormat_, "PNG\0BMP\0TGA\0TIFF\0")) {
+                const std::array extensions{".png", ".bmp", ".tga", ".tif"};
+                projectFileName_ = std::filesystem::path(projectFileName_)
+                                       .replace_extension(extensions[exportFormat_]).string();
+            }
+            ImGui::InputInt("Width (pixels)", &exportWidth_);
+            ImGui::Text("Height: %d (2:1, maximum 8192 x 4096)", exportWidth_ / 2);
+            if (exportFormat_ == 3) {
+                if (!imageExport) {
+                    ImGui::Combo("TIFF samples", &exportTiffSampleType_,
+                        "8-bit grayscale\0Signed 16-bit elevations\0Float32 elevations\0");
+                    if (exportTiffSampleType_ == 1) {
+                        ImGui::TextWrapped("Direct elevations [-32767, 32767], rounded to whole units.");
+                    } else if (exportTiffSampleType_ == 2) {
+                        ImGui::TextWrapped("Direct Float32 elevations; preserves fractional values.");
+                    }
+                }
+                ImGui::TextWrapped("TIFF also writes .tfw and .tif/.tiff.aux.xml sidecars "
+                                   "for WGS 84 (EPSG:4326). Keep them with the image.");
+            }
+            if (imageExport) {
+                ImGui::Checkbox("Include selection highlighting", &exportSelectionHighlight_);
+                ImGui::TextWrapped("8-bit RGB through the active layer's colourmap. "
+                                   "Selection highlighting matches the globe's colourmaps and weights. "
+                                   "No graticule or globe lighting is included.");
+            } else if (exportFormat_ != 3 || exportTiffSampleType_ == 0) {
+                ImGui::TextWrapped("8-bit grayscale: -32767 = black, +32767 = white "
+                                   "(about 257 elevation units per gray level).");
+            }
+            ImGui::TextWrapped("Cumulative elevation through the active layer. North is at the top.");
+        }
+        if (!projectError_.empty()) {
+            ImGui::TextWrapped("%s", projectError_.c_str());
+        }
+        ImGui::BeginDisabled(projectFileName_.empty());
+        perform |= ImGui::Button(opening ? "Open" : exporting ? "Export" : "Save");
+        ImGui::EndDisabled();
+        if (perform && !projectFileName_.empty()) {
+            try {
+                auto path = std::filesystem::path(projectFileName_);
+                if (path.is_relative()) {
+                    path = projectBrowser_.GetDirectory() / path;
+                }
+                if (!opening && path.extension().empty()) {
+                    const std::array extensions{".png", ".bmp", ".tga", ".tif"};
+                    path += exporting ? extensions[exportFormat_] : ".oswald";
+                }
+                if (exporting && (exportWidth_ < 2 || exportWidth_ > 8192 || exportWidth_ % 2)) {
+                    throw std::invalid_argument("Export width must be even and between 2 and 8192.");
+                }
+                const auto outputs = exporting ? ElevationRaster::ExportPaths(path) :
+                    std::vector<std::filesystem::path>{path};
+                const bool exists = std::any_of(outputs.begin(), outputs.end(),
+                    [](const auto& output) { return std::filesystem::exists(output); });
+                if (!opening && exists) {
+                    overwritePath_ = path;
+                    ImGui::OpenPopup("Overwrite File?");
+                } else {
+                    PerformProjectAction(grid, renderer, path);
+                    projectError_.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+            } catch (const std::exception& error) {
+                projectError_ = error.what();
+            }
+        }
+        bool completedOverwrite = false;
+        const bool overwriteOpen = ImGui::IsPopupOpen("Overwrite File?");
+        if (ImGui::BeginPopupModal("Overwrite File?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextWrapped("Replace %s?", overwritePath_.string().c_str());
+            if ((projectAction_ == ProjectAction::Export || projectAction_ == ProjectAction::ExportImage) &&
+                ElevationRaster::ExportPaths(overwritePath_).size() > 1) {
+                ImGui::TextWrapped("This also replaces the TIFF georeferencing sidecars.");
+            }
+            if (ImGui::Button("Replace")) {
+                try {
+                    PerformProjectAction(grid, renderer, overwritePath_);
+                    projectError_.clear();
+                    completedOverwrite = true;
+                    ImGui::CloseCurrentPopup();
+                } catch (const std::exception& error) {
+                    projectError_ = error.what();
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        if (completedOverwrite) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || (!overwriteOpen && ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (projectErrorOpen_) {
+        ImGui::OpenPopup("Project Error");
+        projectErrorOpen_ = false;
+    }
+    if (ImGui::BeginPopupModal("Project Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", projectError_.c_str());
+        if (ImGui::Button("Close")) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                        const glm::mat4& modelMatrix, float zoom) {
     renderer.SetWireframeEnabled(viewportWireframe_);
@@ -1235,12 +1539,25 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     bool requestExit = false;
     const auto undo = [&] { undoStack_.Undo(); };
     const auto redo = [&] { undoStack_.Redo(); };
-    if (!generating && ImGui::IsKeyPressed(ImGuiKey_O) && ImGui::GetIO().KeyCtrl &&
-        !ImGui::GetIO().WantTextInput) {
-        rasterOpen_ = true;
-        errorMessage_.clear();
+    const bool projectBusy = generating || stroke_.has_value() || selectionStroke_.has_value();
+    if (!projectBusy && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        ImGui::GetIO().KeyCtrl && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_O)) {
+            if (ImGui::GetIO().KeyShift) {
+                rasterOpen_ = true;
+                errorMessage_.clear();
+            } else {
+                BeginProjectDialog(ProjectAction::Open);
+            }
+        } else if (ImGui::IsKeyPressed(ImGuiKey_S)) {
+            if (ImGui::GetIO().KeyShift) {
+                BeginProjectDialog(ProjectAction::Save);
+            } else {
+                SaveProject(grid);
+            }
+        }
     }
-    if (!generating && !ImGui::IsPopupOpen("Select By Value") &&
+    if (!generating && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
         !ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
             undo();
@@ -1278,10 +1595,34 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
 
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open Raster...", "Ctrl+O")) {
+            ImGui::BeginDisabled(projectBusy);
+            if (ImGui::MenuItem("Open", "Ctrl+O")) {
+                BeginProjectDialog(ProjectAction::Open);
+            }
+            if (ImGui::MenuItem("Save", "Ctrl+S")) {
+                SaveProject(grid);
+            }
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) {
+                BeginProjectDialog(ProjectAction::Save);
+            }
+            if (ImGui::BeginMenu("Export", grid.HasActiveLayer())) {
+                if (ImGui::MenuItem("Export data...")) {
+                    BeginProjectDialog(ProjectAction::Export);
+                }
+                if (ImGui::MenuItem("Export Image...")) {
+                    BeginProjectDialog(ProjectAction::ExportImage);
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Metadata...")) {
+                metadataOpen_ = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Open Raster...", "Ctrl+Shift+O", false, grid.HasActiveLayer())) {
                 rasterOpen_ = true;
                 errorMessage_.clear();
             }
+            ImGui::EndDisabled();
             if (ImGui::MenuItem("Settings...")) {
                 settingsOpen_ = true;
                 errorMessage_.clear();
@@ -1512,7 +1853,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
         if (ImGui::Button("Refresh")) {
             NavigateRasterDirectory(directory);
         }
-        ImGui::TextWrapped("Supported images: PNG, JPEG, BMP, TGA, PSD, GIF, HDR, PIC, "
+        ImGui::TextWrapped("Supported images: PNG, JPEG, BMP, TGA, TIFF, PSD, GIF, HDR, PIC, "
                            "binary PPM/PGM/PNM. Select an equirectangular raster.");
 
         bool openSelection = false;
@@ -1681,6 +2022,9 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
         }
         ImGui::EndPopup();
     }
+    RenderProjectDialogs(grid, renderer);
+    const bool projectModal = ImGui::IsPopupOpen("Project File") ||
+        ImGui::IsPopupOpen("Project Metadata") || ImGui::IsPopupOpen("Project Error");
     const bool valueSelectionDialog = valueSelectionOpen_ || ImGui::IsPopupOpen("Select By Value");
     RenderValueSelectionDialog(grid, renderer);
     const bool fillFilterDialog = fillFilterOpen_ || ImGui::IsPopupOpen("Fill Filter");
@@ -1690,11 +2034,11 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
         return requestExit;
     }
     if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings") &&
-        !valueSelectionDialog && !fillFilterDialog) {
+        !valueSelectionDialog && !fillFilterDialog && !projectModal) {
         RenderBrushPanel();
         RenderSelectionPanel();
     }
-    if (!valueSelectionDialog && !fillFilterDialog) {
+    if (!valueSelectionDialog && !fillFilterDialog && !projectModal) {
         ProcessBrushInput(grid, renderer, modelMatrix, zoom);
         ProcessSelectionInput(grid, renderer, modelMatrix, zoom);
     }

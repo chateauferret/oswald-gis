@@ -56,6 +56,7 @@ add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
@@ -100,18 +101,19 @@ FetchContent_MakeAvailable(stb)
 
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(TIFF REQUIRED)
 
-add_library(oswald_model STATIC src/Layer.cpp src/SphericalGrid.cpp src/ElevationRaster.cpp src/BrushTool.cpp
+add_library(oswald_model STATIC src/Layer.cpp src/ColorMap.cpp src/SphericalGrid.cpp src/ProjectFile.cpp src/ElevationRaster.cpp src/BrushTool.cpp
     src/SelectionTool.cpp src/Filter.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
-target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r)
+target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r TIFF::TIFF)
 
 add_library(oswald_controller STATIC src/CameraController.cpp)
 target_include_directories(oswald_controller PUBLIC include)
 target_link_libraries(oswald_controller PUBLIC glm::glm)
 
-add_library(oswald_view STATIC src/ColorMap.cpp src/GlobeRenderer.cpp)
+add_library(oswald_view STATIC src/GlobeRenderer.cpp)
 target_include_directories(oswald_view PUBLIC include)
 target_link_libraries(oswald_view PUBLIC oswald_model glad_gl_core_45)
 
@@ -159,7 +161,8 @@ if(BUILD_TESTING)
     add_test(NAME camera_controller COMMAND camera_controller_tests)
 
     add_executable(elevation_raster_tests tests/ElevationRasterTests.cpp)
-    target_link_libraries(elevation_raster_tests PRIVATE oswald_model)
+    target_include_directories(elevation_raster_tests PRIVATE "${stb_SOURCE_DIR}")
+    target_link_libraries(elevation_raster_tests PRIVATE oswald_model TIFF::TIFF)
     add_test(NAME elevation_raster COMMAND elevation_raster_tests)
 
     add_executable(brush_tool_tests tests/BrushToolTests.cpp)
@@ -177,6 +180,10 @@ if(BUILD_TESTING)
     add_executable(layer_tests tests/LayerTests.cpp)
     target_link_libraries(layer_tests PRIVATE oswald_model)
     add_test(NAME layer COMMAND layer_tests)
+
+    add_executable(project_file_tests tests/ProjectFileTests.cpp)
+    target_link_libraries(project_file_tests PRIVATE oswald_model)
+    add_test(NAME project_file COMMAND project_file_tests)
 
     add_executable(raster_file_browser_tests tests/RasterFileBrowserTests.cpp src/RasterFileBrowser.cpp)
     target_include_directories(raster_file_browser_tests PRIVATE include)

@@ -12,6 +12,7 @@ public:
 
     // Each stop contains elevation (nominally feet), followed by normalized RGB.
     std::span<const glm::vec4> GetStops() const { return stops_; }
+    glm::vec3 Sample(float elevation) const;
 
 private:
     explicit ColorMap(std::vector<glm::vec4> stops);

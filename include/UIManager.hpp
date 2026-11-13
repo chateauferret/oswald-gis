@@ -78,6 +78,28 @@ private:
                                const glm::mat4& modelMatrix, float zoom);
     void SetSelectionMode(SelectionMode mode);
     void FinishPolygonSelection(SphericalGrid& grid, GlobeRenderer& renderer);
+    enum class ProjectAction { Open, Save, Export, ExportImage };
+    void BeginProjectDialog(ProjectAction action);
+    void RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& renderer);
+    void PerformProjectAction(SphericalGrid& grid, GlobeRenderer& renderer,
+                              const std::filesystem::path& path);
+    void SaveProject(SphericalGrid& grid);
+
+    std::filesystem::path projectPath_;
+    RasterFileBrowser projectBrowser_;
+    ProjectAction projectAction_ = ProjectAction::Open;
+    bool projectDialogOpen_ = false;
+    bool metadataOpen_ = false;
+    ProjectMetadata pendingMetadata_;
+    std::string projectFileName_;
+    std::string projectDirectory_;
+    std::string projectError_;
+    bool projectErrorOpen_ = false;
+    int exportFormat_ = 0;
+    int exportTiffSampleType_ = 2;
+    bool exportSelectionHighlight_ = false;
+    int exportWidth_ = 2048;
+    std::filesystem::path overwritePath_;
 
     GridOptions options_;
     GridOptions previousOptions_;

@@ -1,4 +1,5 @@
 #include "UIManager.hpp"
+#include "ProjectFile.hpp"
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -67,7 +68,7 @@ struct TemporaryDirectory {
         output.close();
         check(static_cast<bool>(output), "Could not write dialog raster fixture.");
         std::ofstream(path / "images" / "broken.png") << "not an image";
-        std::ofstream(path / "images" / "unsupported.tiff") << "not supported";
+        std::ofstream(path / "images" / "unsupported.xyz") << "not supported";
         std::filesystem::current_path(path);
     }
     ~TemporaryDirectory() {
@@ -130,11 +131,13 @@ void testDialog() {
     };
     auto openDialog = [&] {
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
         key(ImGuiKey_O);
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
         frame();
         check(dialogOpen(),
-              "Ctrl+O did not open the file dialog.");
+              "Ctrl+Shift+O did not open the raster file dialog.");
     };
     auto selectRow = [&](int row) {
         ImGuiWindow* listing = nullptr;
@@ -252,6 +255,7 @@ void testDialog() {
         auto* popup = popups.back().Window;
         ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 20.0F,
             popup->DC.CursorStartPos.y + row * ImGui::GetTextLineHeightWithSpacing() +
+            (menu == 0 && row >= 5 ? ImGui::GetStyle().ItemSpacing.y : 0.0F) +
             ImGui::GetTextLineHeight() * 0.5F);
         frame();
         check(ImGui::GetCurrentContext()->HoveredId == popup->GetID(label),
@@ -302,7 +306,7 @@ void testDialog() {
     check(grid.GetSnapshot()->GetVertices()[0].elevation == 32767.0F,
           "Selected raster did not update grid elevations.");
     const auto paintedSnapshot = grid.GetSnapshot();
-    selectMenuItem(0, 1, "Settings...");
+    selectMenuItem(0, 6, "Settings...");
     auto* settings = ImGui::FindWindowByName("Settings");
     check(settings != nullptr && settings->Active, "Settings dialog did not open.");
     const float rowHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y;
@@ -337,7 +341,7 @@ void testDialog() {
     settingsButton(true);
     check(!dialogOpen(), "Valid Raise/Lower speed did not apply.");
     check(grid.GetSnapshot() == paintedSnapshot, "Changing brush speed regenerated the terrain.");
-    selectMenuItem(0, 1, "Settings...");
+    selectMenuItem(0, 6, "Settings...");
     focusSpeed();
     speedInput = ImGui::GetInputTextState(settings->GetID("Raise/Lower speed (units/s)"));
     check(speedInput != nullptr && std::string_view(speedInput->TextA.Data) == "4096",
@@ -348,7 +352,7 @@ void testDialog() {
           "Invalid Raise/Lower speed applied or changed the terrain.");
     settingsButton(false);
     check(!dialogOpen(), "Cancel did not close the Settings dialog.");
-    selectMenuItem(0, 1, "Settings...");
+    selectMenuItem(0, 6, "Settings...");
     focusSpeed();
     speedInput = ImGui::GetInputTextState(settings->GetID("Raise/Lower speed (units/s)"));
     check(speedInput != nullptr && std::string_view(speedInput->TextA.Data) == "4096",
@@ -732,6 +736,227 @@ void testDialog() {
         shortcut(ImGuiKey_Z);
             check(grid.GetSnapshot()->GetVertices().size() == afterRefinement,
             "Undo did not restore the mesh before coarsening.");
+
+    const auto selectExport = [&](bool image = false) {
+        selectMenuItem(0, 3, "Export");
+        frame();
+        const auto& popups = ImGui::GetCurrentContext()->OpenPopupStack;
+        check(popups.Size >= 2 && popups.back().Window != nullptr,
+              "File Export did not open a submenu.");
+        auto* menu = popups.back().Window;
+        const auto* label = image ? "Export Image..." : "Export data...";
+        const float x = menu->DC.CursorStartPos.x + 20;
+        const float y = menu->DC.CursorStartPos.y +
+            (image ? ImGui::GetTextLineHeightWithSpacing() : 0) +
+            ImGui::GetTextLineHeight() * 0.5F;
+        ImGui::GetIO().AddMousePosEvent(x, y);
+        frame();
+        check(ImGui::GetCurrentContext()->HoveredId == menu->GetID(label),
+              "Export submenu is missing the requested export action.");
+        click(x, y);
+        frame();
+    };
+    const auto clickDialogItem = [&](const char* windowName, const char* label) {
+        frame();
+        auto* dialog = ImGui::FindWindowByName(windowName);
+        check(dialog && dialog->Active, "Expected project dialog is not active.");
+        const auto id = dialog->GetID(label);
+        const float x = dialog->DC.CursorStartPos.x + 12;
+        const float firstY = dialog->DC.CursorStartPos.y;
+        const float lastY = dialog->Pos.y + dialog->Size.y - 8;
+        for (float y = firstY; y < lastY; y += 4) {
+            ImGui::GetIO().AddMousePosEvent(x, y);
+            frame();
+            if (ImGui::GetCurrentContext()->HoveredId == id) {
+                click(x, y);
+                return;
+            }
+        }
+        throw std::runtime_error(std::string("Project dialog item was not interactive: ") + label);
+    };
+    const auto replaceDialogText = [&](const char* window, const char* label, const char* text) {
+        clickDialogItem(window, label);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        key(ImGuiKey_A);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        ImGui::GetIO().AddInputCharactersUTF8(text);
+        frame();
+        key(ImGuiKey_Tab);
+    };
+    selectMenuItem(0, 4, "Metadata...");
+    auto* metadataDialog = ImGui::FindWindowByName("Project Metadata");
+    check(metadataDialog && metadataDialog->Active, "Metadata menu did not open its dialog.");
+    click(metadataDialog->DC.CursorStartPos.x + 20, metadataDialog->DC.CursorStartPos.y + 20);
+    ImGui::GetIO().AddInputCharactersUTF8("Project description");
+    frame();
+    replaceDialogText("Project Metadata", "Author", "Project author");
+    clickDialogItem("Project Metadata", "Apply");
+    check(grid.GetMetadata().author == "Project author" &&
+          grid.GetMetadata().description == "Project description" &&
+          grid.GetMetadata().savedAt.empty(),
+          "Metadata dialog did not apply author/description or changed the save date.");
+    selectMenuItem(0, 4, "Metadata...");
+    replaceDialogText("Project Metadata", "Author", "Cancelled author");
+    key(ImGuiKey_Escape);
+    check(grid.GetMetadata().author == "Project author",
+          "Cancelling metadata edits changed the project.");
+    shortcut(ImGuiKey_S);
+    check(ImGui::FindWindowByName("Project File")->Active,
+          "Saving an untitled project did not request a filename.");
+    replaceDialogText("Project File", "File name", "ui.oswald");
+    clickDialogItem("Project File", "Save");
+    check(!dialogOpen() && std::filesystem::exists(temporary.path / "ui.oswald"),
+          "Save dialog failed to write the selected project.");
+    const auto savedSnapshot = grid.GetSnapshot();
+    auto saved = ProjectFile::Load(temporary.path / "ui.oswald");
+    check(saved->GetMetadata().author == "Project author" &&
+          !saved->GetMetadata().savedAt.empty(),
+          "UI save failed to persist metadata and the save date.");
+    grid.GetMetadata().author = "Updated author";
+    shortcut(ImGuiKey_S);
+    check(!dialogOpen() &&
+          ProjectFile::Load(temporary.path / "ui.oswald")->GetMetadata().author == "Updated author",
+          "Save did not reuse the existing project filename.");
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+    shortcut(ImGuiKey_S);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+    frame();
+    clickDialogItem("Project File", "Save");
+    check(ImGui::FindWindowByName("Overwrite File?") &&
+          ImGui::FindWindowByName("Overwrite File?")->Active,
+          "Save As did not ask before replacing an existing file.");
+    key(ImGuiKey_Escape);
+    check(ImGui::FindWindowByName("Project File")->Active,
+          "Cancelling overwrite unexpectedly closed Save As.");
+    replaceDialogText("Project File", "File name", "copy.oswald");
+    clickDialogItem("Project File", "Save");
+    check(std::filesystem::exists(temporary.path / "copy.oswald"), "Save As did not write a copy.");
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+    shortcut(ImGuiKey_S);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+    frame();
+    clickDialogItem("Project File", "Save");
+    clickDialogItem("Overwrite File?", "Replace");
+    check(!dialogOpen() && ProjectFile::Load(temporary.path / "copy.oswald")->GetMetadata().author ==
+          "Updated author", "Confirmed overwrite did not save and close both dialogs.");
+    shortcut(ImGuiKey_O);
+    replaceDialogText("Project File", "File name", "images/broken.png");
+    clickDialogItem("Project File", "Open");
+    check(dialogOpen() && grid.GetSnapshot() == savedSnapshot,
+          "Opening an invalid project closed the dialog or changed the model.");
+    replaceDialogText("Project File", "File name", "ui.oswald");
+    clickDialogItem("Project File", "Open");
+    check(!dialogOpen() && grid.GetMetadata().author == "Updated author" &&
+          grid.GetSnapshot()->GetVertices().size() == savedSnapshot->GetVertices().size(),
+          "Project Open did not restore the saved model and metadata.");
+    const auto openedSnapshot = grid.GetSnapshot();
+    shortcut(ImGuiKey_Z);
+    check(grid.GetSnapshot() == openedSnapshot, "Project Open retained the previous undo history.");
+    selectExport();
+    replaceDialogText("Project File", "File name", "ui.png");
+    replaceDialogText("Project File", "Width (pixels)", "64");
+    clickDialogItem("Project File", "Export");
+    check(!dialogOpen() && std::filesystem::exists(temporary.path / "ui.png") &&
+          ElevationRaster::Load(temporary.path / "ui.png").GetWidth() == 2048,
+          "Export dialog did not write a loadable image.");
+    const auto tiff = temporary.path / "ui.TIFF";
+    const auto tiffOutputs = ElevationRaster::ExportPaths(tiff);
+    std::ofstream(tiffOutputs[1]) << "Existing world file";
+    selectExport();
+    replaceDialogText("Project File", "File name", "ui.TIFF");
+    clickDialogItem("Project File", "Export");
+    check(ImGui::FindWindowByName("Overwrite File?")->Active && !std::filesystem::exists(tiff),
+          "TIFF export did not ask before replacing an existing sidecar alone.");
+    key(ImGuiKey_Escape);
+    check(ImGui::FindWindowByName("Project File")->Active && !std::filesystem::exists(tiff),
+          "Cancelling TIFF overwrite wrote output or closed the export dialog.");
+    clickDialogItem("Project File", "Export");
+    clickDialogItem("Overwrite File?", "Replace");
+    check(!dialogOpen() && ElevationRaster::Load(tiff).GetWidth() == 2048 &&
+          std::filesystem::exists(tiffOutputs[1]) && std::filesystem::exists(tiffOutputs[2]),
+          "Confirmed TIFF export did not write the image and both georeferencing sidecars.");
+    selectExport();
+    replaceDialogText("Project File", "File name", "no-extension");
+    clickDialogItem("Project File", "Export");
+    check(!dialogOpen() && std::filesystem::exists(temporary.path / "no-extension.tif") &&
+          std::filesystem::exists(temporary.path / "no-extension.tif.aux.xml"),
+          "TIFF filename editing did not retain the selected export format.");
+    check(grid.GetSnapshot() == openedSnapshot, "TIFF export changed the project.");
+    grid.SetElevations(std::vector<float>(grid.GetSnapshot()->GetVertices().size(), -1234.75F));
+    const auto precisionSnapshot = grid.GetSnapshot();
+    renderer.UploadGrid(*grid.GetSnapshot());
+    for (int type = 0; type < 3; ++type) {
+        selectExport();
+        clickDialogItem("Project File", "TIFF samples");
+        frame();
+        ImGuiWindow* sampleCombo = nullptr;
+        for (auto* window : ImGui::GetCurrentContext()->Windows) {
+            if (window->Active && std::string_view(window->Name).starts_with("##Combo_")) {
+                sampleCombo = window;
+                break;
+            }
+        }
+        check(sampleCombo != nullptr, "TIFF sample selection did not open a combo.");
+        click(sampleCombo->DC.CursorStartPos.x + 10,
+              sampleCombo->DC.CursorStartPos.y + type * ImGui::GetTextLineHeightWithSpacing() +
+              ImGui::GetTextLineHeight() * 0.5F);
+        const auto name = std::string("sample-type-") + std::to_string(type) + ".tif";
+        replaceDialogText("Project File", "File name", name.c_str());
+        clickDialogItem("Project File", "Export");
+        check(!dialogOpen(), "Choosing TIFF sample precision did not allow export.");
+        const auto values = ElevationRaster::Load(temporary.path / name)
+                                .SampleElevations(*grid.GetSnapshot());
+        const float expected = type == 0 ?
+            -32767.0F + std::round((-1234.75F + 32767.0F) / 65534.0F * 255) / 255 * 65534.0F :
+            type == 1 ? -1235.0F : -1234.75F;
+        check(std::abs(values.front() - expected) < 0.001F,
+              "TIFF precision combo did not export the chosen sample representation.");
+    }
+    check(grid.GetSnapshot() == precisionSnapshot, "TIFF precision export changed the project.");
+    grid.SetSelectionWeights(std::vector<float>(grid.GetSnapshot()->GetVertices().size(), 0.25F), true);
+    const auto imageSnapshot = grid.GetSnapshot();
+    renderer.UploadGrid(*imageSnapshot);
+    const auto& activeLayer = grid.GetActiveLayer();
+    const auto maps = std::filesystem::path(OSWALD_RESOURCE_DIR) / "assets/colormaps";
+    const auto map = ColorMap::Load(maps / activeLayer.GetColorMap());
+    const auto selectionMap = ColorMap::Load(maps / activeLayer.GetSelectionColorMap());
+    const auto exportedImage = temporary.path / "map-image.png";
+    const auto expectedImage = temporary.path / "expected-image.png";
+    const auto checkExportedImage = [&](bool selection) {
+        ElevationRaster::ExportImage(expectedImage, grid, map, selection ? &selectionMap : nullptr, 64, 32);
+        std::ifstream actual(exportedImage, std::ios::binary);
+        std::ifstream expected(expectedImage, std::ios::binary);
+        check(actual && expected &&
+              std::string((std::istreambuf_iterator<char>(actual)), {}) ==
+              std::string((std::istreambuf_iterator<char>(expected)), {}),
+              "Image export dialog did not use active colourmaps and the selection option.");
+    };
+    selectExport(true);
+    replaceDialogText("Project File", "File name", "map-image.png");
+    clickDialogItem("Project File", "Export");
+    check(!dialogOpen(), "Export Image did not write and close its dialog.");
+    checkExportedImage(false);
+    selectExport(true);
+    clickDialogItem("Project File", "Include selection highlighting");
+    replaceDialogText("Project File", "File name", "map-image.png");
+    clickDialogItem("Project File", "Export");
+    check(ImGui::FindWindowByName("Overwrite File?")->Active,
+          "Image export did not confirm replacement of an existing image.");
+    clickDialogItem("Overwrite File?", "Replace");
+    check(!dialogOpen(), "Confirmed image export did not close its dialogs.");
+    checkExportedImage(true);
+    selectExport();
+    replaceDialogText("Project File", "File name", "data-after-image.tif");
+    clickDialogItem("Project File", "Export");
+    check(!dialogOpen() && ElevationRaster::Load(temporary.path / "data-after-image.tif")
+              .SampleElevations(*imageSnapshot).front() == -1234.75F,
+          "Image export changed the data export precision or output mode.");
+    check(grid.GetSnapshot() == imageSnapshot, "Image export changed the project or selection.");
+    selectMenuItem(0, 0, "Open");
+    check(ImGui::FindWindowByName("Project File")->Active,
+          "File menu Open did not open the project browser.");
+    key(ImGuiKey_Escape);
+    check(grid.GetSnapshot() == imageSnapshot, "Cancelling Open changed the project.");
 }
 
 } // namespace

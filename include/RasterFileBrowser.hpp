@@ -11,7 +11,7 @@ public:
     };
 
     static bool IsSupportedFile(const std::filesystem::path& path);
-    void Navigate(const std::filesystem::path& directory);
+    void Navigate(const std::filesystem::path& directory, bool allFiles = false);
 
     const std::filesystem::path& GetDirectory() const { return directory_; }
     const std::vector<Entry>& GetEntries() const { return entries_; }

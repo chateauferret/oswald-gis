@@ -7,9 +7,9 @@
 #include <utility>
 
 bool RasterFileBrowser::IsSupportedFile(const std::filesystem::path& path) {
-    constexpr std::array<std::string_view, 13> extensions{
+    constexpr std::array<std::string_view, 15> extensions{
         ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".psd", ".gif",
-        ".hdr", ".pic", ".ppm", ".pgm", ".pnm", ".jpe"
+        ".hdr", ".pic", ".ppm", ".pgm", ".pnm", ".jpe", ".tif", ".tiff"
     };
     auto extension = path.extension().string();
     std::transform(extension.begin(), extension.end(), extension.begin(),
@@ -17,7 +17,7 @@ bool RasterFileBrowser::IsSupportedFile(const std::filesystem::path& path) {
     return std::find(extensions.begin(), extensions.end(), extension) != extensions.end();
 }
 
-void RasterFileBrowser::Navigate(const std::filesystem::path& directory) {
+void RasterFileBrowser::Navigate(const std::filesystem::path& directory, bool allFiles) {
     auto absoluteDirectory = std::filesystem::canonical(directory);
     std::vector<Entry> entries;
     for (const auto& entry : std::filesystem::directory_iterator(absoluteDirectory)) {
@@ -26,7 +26,7 @@ void RasterFileBrowser::Navigate(const std::filesystem::path& directory) {
             continue;
         }
         const bool isDirectory = entry.is_directory();
-        if (isDirectory || (entry.is_regular_file() && IsSupportedFile(entry.path()))) {
+        if (isDirectory || (entry.is_regular_file() && (allFiles || IsSupportedFile(entry.path())))) {
             entries.push_back({entry.path(), isDirectory});
         }
     }

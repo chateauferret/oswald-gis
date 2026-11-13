@@ -400,7 +400,12 @@ Dear ImGui provides the main application interface overlay.
 ```
 +-------------------------------------------------------------------+
 | File                                                              |
-|   ├── Open Raster...  (Ctrl+O)                                    |
+|   ├── Open           (Ctrl+O)                                     |
+|   ├── Save           (Ctrl+S)                                     |
+|   ├── Save As...     (Ctrl+Shift+S)                               |
+|   ├── Export                                                     |
+|   ├── Metadata...                                                |
+|   ├── Open Raster... (Ctrl+Shift+O)                               |
 |   ├── Settings...                                                 |
 |   └── Exit                                                        |
 +-------------------------------------------------------------------+
@@ -518,8 +523,15 @@ builds `imgui_lib` with the GLFW/OpenGL3 backends, and exposes `oswald_model`
 as an OpenGL-independent C++20 library. The `oswald_gis` executable links the
 model and graphics dependencies. `spherical_grid_tests` links only the model
 and thread library; no display is needed to run the model tests.
+TIFF image I/O additionally requires a system libtiff development package
+(`libtiff-dev` on Debian/Ubuntu, `libtiff-devel` on Fedora, or `libtiff` via
+Homebrew). CMake discovers it with `find_package(TIFF REQUIRED)` and links
+`TIFF::TIFF`; a nonstandard installation can be selected with CMake's
+`TIFF_INCLUDE_DIR` and `TIFF_LIBRARY` cache variables.
 
-`oswald_view` builds the renderer and colour-map loader. Shaders and all `.map`
+`oswald_view` builds the renderer; the OpenGL-independent colour-map loader and
+stop interpolator live in `oswald_model` for use by both rendering and RGB export.
+Shaders and all `.map`
 files in `assets/colormaps` are copied at configuration time into the build's
 `resources` directory. Editing a source shader/map triggers CMake regeneration
 on the next build.
@@ -608,16 +620,27 @@ project tests with
 
 ### 10.6 Phase 4 and 5 Verification
 
-`File -> Open Raster...` (or Ctrl+O) opens an in-app file dialog. It starts in
+`File -> Open Raster...` (or Ctrl+Shift+O) opens an in-app file dialog. It starts in
 the working directory and remembers the last browsed folder. Use Up to navigate
 to the parent folder, or select a folder and choose Open Folder. Open loads the
 selected image; Enter or double-click also opens folders and files. Refresh
 reloads the folder listing; Cancel or
 Escape closes the dialog without changing the raster. The listing shows folders
-and supported PNG, JPEG, BMP, TGA, PSD, GIF, HDR, PIC, and binary PPM/PGM/PNM
-images, including uppercase extensions. TIFF/GeoTIFF is not supported by the
-current stb_image decoder. Navigation and decoding errors appear in the dialog.
-The selected image is decoded with stb_image and resampled to a 2048 x 1024 equirectangular
+and supported PNG, JPEG, BMP, TGA, TIFF (`.tif`/`.tiff`), PSD, GIF, HDR, PIC,
+and binary PPM/PGM/PNM images, including uppercase extensions.
+Navigation and decoding errors appear in the dialog. TIFF uses libtiff's
+RGBA decoder (unsigned integer imagery, including grayscale and RGB, converted
+to 8-bit channels before Rec. 709 luminance); other formats use stb_image.
+Single-band, stripped, black-is-zero Int16 and Float32 TIFFs are instead read
+as direct elevations, retaining precision through resampling and grid sampling.
+Samples must be finite and in [-32767, 32767]; there is no NoData masking.
+TIFF orientation tags are honoured for unrotated images; rotated orientations,
+unsupported numeric layouts, corrupt images, and TIFFs exceeding
+32768 pixels per side or 128 Mi pixels are rejected explicitly.
+Import treats every image as a full-world equirectangular raster:
+GeoTIFF tags and sidecars are not used to crop or reproject.
+Regional/projected GIS rasters must first be converted externally.
+The selected image is resampled to a 2048 x 1024 equirectangular
 luminosity raster. The app maps longitude periodically across the image seam,
 clamps latitude at the poles, bilinearly samples each spherical vertex, and
 maps luminosity to elevations in [-32767, 32767]. Applying new grid settings
@@ -630,7 +653,7 @@ The CPU-only `elevation_raster` test checks image decoding, 2:1 resampling,
 Rec. 709 luminance, bilinear sampling, seam wrapping, pole clamping, elevation
 ranges, grid population, and snapshot lifetime. The CPU `raster_file_browser`
 test covers format filtering, directory ordering, navigation, refresh, and
-failed navigation. The GPU `raster_file_dialog` test exercises Ctrl+O, folder
+failed navigation. The GPU `raster_file_dialog` test exercises Ctrl+Shift+O, folder
 navigation, image selection, decoding errors, double-click, and cancellation
 using a hidden OpenGL window. The GPU `globe_renderer` test also verifies
 elevation-only buffer updates. Run the CPU checks with:
@@ -641,3 +664,121 @@ ctest --test-dir build/ninja -R '^(spherical_grid(_scale)?|camera_controller|ele
 
 With a working display and OpenGL 4.5, run the dialog interaction check with
 `ctest --test-dir build/ninja -R '^raster_file_dialog$' --output-on-failure`.
+
+### 10.7 Phase 15: Project Metadata, Persistence, and Export
+
+`SphericalGrid` owns project description, author, and last-saved UTC timestamp.
+`File -> Metadata...` edits description and author; its date field is read-only.
+Changes are applied explicitly or discarded with Cancel. Only a successful project
+save changes the date (`YYYY-MM-DDTHH:MM:SSZ`); exporting does not change it.
+
+`File -> Open` (Ctrl+O), `Save` (Ctrl+S), and `Save As...` (Ctrl+Shift+S) manage
+binary `.oswald` projects. Save asks for a filename when the project is untitled;
+subsequent saves reuse the path. Save As and Export ask before overwriting an
+existing destination. The in-app browser supports a typed folder path and Go,
+Up/Refresh, folder double-clicks, and typed or selected filenames. Enter submits
+the filename; Cancel/Escape closes the dialog. File and validation errors remain
+visible without closing the dialog.
+
+Project format version 1 uses the following ordered layout. All integers and
+IEEE-754 floats are little-endian; strings are a uint32 byte count followed by
+text bytes (no terminator). String fields are limited to 1 MiB and cannot contain
+null characters. Booleans are uint32 values 0 or 1.
+
+| Section | Contents |
+| --- | --- |
+| Header | Eight bytes `OSWALD\r\n`, uint32 version (1). |
+| Metadata | Description, author, last-saved date strings. |
+| Grid options | uint32 requested point count, float64 Poisson variability, uint32 seed, uint32 relaxation iterations. |
+| Mesh header | uint32 actual vertex count, uint32 triangle-index count, selection-active boolean. |
+| Vertices | Per vertex: float32 x/y/z, raw snapshot elevation, selection weight; uint32 refinement-created flag. |
+| Faces | uint32 vertex indices, three per triangle, preserving exact order. |
+| Layer header | uint32 layer count, uint32 active-layer index (`0xffffffff` for none). |
+| Layers | In top-to-bottom order: uint32 layer type and data type; name, description, unselected colour-map name, selected colour-map name strings; uint32 blend mode; visibility boolean; uint32 value count followed by float32 raw values. |
+
+Version 1 accepts only Raster (type 0) / Float32 (data type 0) elevation layers.
+Blend mode identifiers are Overlay=0, Add=1, Subtract=2, Multiply=3, Minimum=4,
+Maximum=5. Each layer has exactly one value per vertex. Limits are 1,000,000
+vertices and 1,024 layers. Generation options retain their existing limits.
+Loading validates sizes against remaining file bytes before allocation, unit
+positions, finite/range-checked attributes, layer names and enum identifiers,
+active-layer consistency, closed mesh topology, and absence of trailing data.
+It reconstructs half-edges and the spatial index from saved geometry rather than
+regenerating points, preserving adaptive refinements. Colour-map assets are
+referenced by name, not embedded; the UI validates their availability before
+replacing the current project. Opening clears prior undo history, brush and
+selection tool state, and the previous raster-import source.
+
+Save and export first write a temporary file in a uniquely created sibling
+directory, close it successfully, then rename it over the destination. Failed
+writes leave the existing destination and last-saved date intact; temporary
+files are cleaned up. This guards against partial-file replacement, but does
+not promise power-loss durability (no explicit disk fsync).
+
+`File -> Export -> Export data...` samples cumulative elevation through the active layer,
+excluding layers above it and retaining contributions from visible layers below.
+Export does not mutate layer data or selection. PNG, BMP, TGA, and TIFF are supported,
+with default size 2048 x 1024 and selectable
+2:1 sizes through 8192 x 4096. Pixel centres span longitudes -180 to +180 degrees
+left-to-right and latitudes +90 to -90 degrees top-to-bottom, matching import.
+Each pixel uses the nearest mesh site. PNG/BMP/TGA and the optional 8-bit TIFF
+map elevations linearly from [-32767, 32767] to [0, 255], about 257 elevation
+units per gray level. TIFF offers three sample representations in the export dialog:
+
+- **8-bit grayscale:** the existing luminosity mapping, useful for image rasters.
+- **Signed 16-bit elevations:** direct values rounded to whole units, with no offset/scale.
+- **Float32 elevations (default):** direct values, preserving fractional elevations
+  at each sampled mesh site without quantization.
+
+Project saves preserve all mesh/layer data rather than a sampled raster. Export is
+disabled when no layer is active.
+
+TIFF exports use lossless LZW compression, embed GeoTIFF WGS84 geographic,
+pixel-is-area keys and the global transform, and also write two georeferencing
+sidecars: `name.tfw` contains the six world-file coefficients
+`360/width, 0, 0, -180/height, -180+180/width, 90-90/height` (pixel-centre
+coordinates); `name.tif.aux.xml` (or `name.tiff.aux.xml`) declares WGS 84
+(EPSG:4326) in GDAL PAM format with longitude-first raster coordinates.
+Keep both sidecars beside the image when importing it into QGIS. GDAL
+recognizes the outer extent as [-180, 180] x [-90, 90], north-up.
+Embedded georeferencing allows QGIS/GDAL to place the TIFF even without sidecars.
+QGIS identifies the band as Byte, Int16, or Float32 according to the export choice;
+Int16/Float32 values are actual elevations, not unsigned brightness values needing
+rescaling. Display contrast/stretch is independent of stored elevation precision.
+Overwrite confirmation covers existing sidecars even if the image is absent.
+All three files are staged and closed before replacement; each replacement
+is atomic, but the three-file set is not a single filesystem transaction.
+
+`File -> Export -> Export Image...` exports a colourmapped RGB map rather than
+numeric data. It shares the same cumulative-through-active-layer data,
+north-up global equirectangular extent, nearest-site sampling, resolution
+choices, file formats (PNG/BMP/TGA/TIFF), atomic staging, and overwrite checks.
+The active layer's colourmap is sampled using clamped, piecewise-linear stop
+interpolation, matching the globe shader. Output uses three 8-bit RGB channels;
+TIFF image export always writes unsigned RGB bytes, independently of the data
+export precision choice, and includes the same GeoTIFF tags and sidecars.
+
+The image dialog offers **Include selection highlighting** (off by default).
+When enabled and a selection is active, it blends the active layer's two
+colourmaps using the sampled site's selection weight, exactly as the globe
+shader does. Without the option or without an active selection, the normal
+colourmap is used throughout. Selection, elevations, and layer metadata are
+never changed by export. Map images omit globe lighting, graticules, and UI
+overlays so they can be used as artwork or GIS raster layers.
+Both export submenu actions are disabled without an active layer.
+
+The CPU `project_file` test covers exact multi-layer/adaptive-mesh round trips,
+metadata and dates, inactive projects, old-reader lifetime, failed-write safety,
+and malformed/truncated/version-mismatched files. `elevation_raster` additionally
+tests all export formats, actual default image dimensions, signed endpoint
+mapping, geographic orientation, cumulative-layer semantics, TIFF RGB decoding
+and orientation tags, georeferencing coefficients/CRS, and sidecar failure paths.
+It also verifies raw TIFF sample tags/values for all three precisions, exact
+fractional Float32 round trips, integer rounding, signed endpoints, and invalid samples.
+RGB export tests compare every output pixel against cumulative data and
+colourmap interpolation in each format, including selection weights 0, 0.25,
+0.5, and 1, inactive selection, geographic orientation, and RGB TIFF tags.
+The GPU-backed `raster_file_dialog` test also exercises metadata editing,
+untitled Save, repeated Save, Save As, overwrite confirmation/cancellation, invalid and valid
+project Open, undo-history clearing, both Export submenu actions, RGB selection
+highlighting, TIFF precision selection, and image/sidecar overwrite handling.

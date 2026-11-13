@@ -11,6 +11,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 struct GridVertex {
@@ -110,6 +111,7 @@ public:
         std::size_t maxRemovedVertices = 0) const;
 
 private:
+    friend class ProjectFile;
     SphericalGridSnapshot(const GridOptions& options, std::vector<GridVertex> vertices,
                           std::vector<std::uint32_t> triangleIndices,
                           std::vector<std::uint8_t> refinementVertices,
@@ -124,6 +126,12 @@ private:
     std::shared_ptr<const SpatialIndex> spatialIndex_;
 };
 
+struct ProjectMetadata {
+    std::string description;
+    std::string author;
+    std::string savedAt;
+};
+
 class SphericalGrid {
 public:
     explicit SphericalGrid(const GridOptions& options = {});
@@ -132,6 +140,8 @@ public:
     void SetElevations(std::span<const float> elevations);
     void SetSelectionWeights(std::span<const float> selectionWeights, bool active = true);
     std::shared_ptr<const SphericalGridSnapshot> GetSnapshot() const;
+    ProjectMetadata& GetMetadata() { return metadata_; }
+    const ProjectMetadata& GetMetadata() const { return metadata_; }
     const std::vector<std::unique_ptr<ElevationLayer>>& GetLayers() const { return layers_; }
     const ElevationLayer& GetElevationLayer() const { return *activeLayer_; }
     ElevationLayer& GetElevationLayer() { return *activeLayer_; }
@@ -149,6 +159,9 @@ public:
     void MoveLayer(std::string_view name, std::size_t newIndex);
 
 private:
+    friend class ProjectFile;
+    explicit SphericalGrid(std::nullptr_t) {}
+    ProjectMetadata metadata_;
     std::atomic<std::shared_ptr<const SphericalGridSnapshot>> snapshot_;
     std::vector<std::unique_ptr<ElevationLayer>> layers_;
     ElevationLayer* activeLayer_ = nullptr;

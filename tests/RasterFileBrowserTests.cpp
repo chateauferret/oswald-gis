@@ -33,11 +33,11 @@ struct TemporaryDirectory {
 void testFormats() {
     for (const auto* extension : {".png", ".jpg", ".jpeg", ".jpe", ".bmp", ".tga", ".psd",
                                  ".gif", ".hdr", ".pic", ".ppm", ".pgm", ".pnm", ".PNG",
-                                 ".JpEg"}) {
+                                 ".JpEg", ".tif", ".tiff", ".TIF", ".TiFf"}) {
         check(RasterFileBrowser::IsSupportedFile(std::string("raster") + extension),
               "Supported raster extension was rejected.");
     }
-    for (const auto* name : {"raster.tif", "raster.tiff", "raster.txt", "raster",
+    for (const auto* name : {"raster.tfw", "raster.aux.xml", "raster.txt", "raster",
                              "raster.png.txt"}) {
         check(!RasterFileBrowser::IsSupportedFile(name),
               "Unsupported raster extension was accepted.");
@@ -49,7 +49,7 @@ void testNavigation() {
     const auto child = temporary.path / "z folder";
     std::filesystem::create_directory(child);
     std::filesystem::create_directory(temporary.path / "a folder.png");
-    for (const auto* name : {"b raster.PNG", "a raster.ppm", "ignored.tiff", "ignored.txt"}) {
+    for (const auto* name : {"b raster.PNG", "a raster.ppm", "ignored.xyz", "ignored.txt"}) {
         std::ofstream(temporary.path / name) << "fixture";
     }
     RasterFileBrowser browser;
@@ -64,6 +64,11 @@ void testNavigation() {
     check(!entries[2].isDirectory && !entries[3].isDirectory &&
           entries[2].path.filename() == "a raster.ppm" &&
           entries[3].path.filename() == "b raster.PNG", "Raster files are not sorted.");
+    browser.Navigate(root, true);
+    check(browser.GetEntries().size() == 6 &&
+          browser.GetEntries()[0].isDirectory && browser.GetEntries()[1].isDirectory,
+          "Project browsing did not expose non-raster files or keep folders first.");
+    browser.Navigate(root);
 
     bool failed = false;
     try {

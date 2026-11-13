@@ -10,10 +10,12 @@
 #include "CameraController.hpp"
 
 #include <filesystem>
+#include <array>
 #include <future>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 class SphericalGrid;
@@ -44,7 +46,6 @@ private:
         std::vector<float> original;
         std::vector<float> working;
         std::vector<float> scratch;
-        std::vector<GridVertex> renderVertices;
     };
 
     enum class SelectionMode { None, Radius, Polygon };
@@ -68,6 +69,9 @@ private:
     void RenderSelectionPanel();
     void RenderValueSelectionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderFillFilterDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer);
+    void ApplyActiveLayerColorMaps(SphericalGrid& grid, GlobeRenderer& renderer);
+    const ColorMap& GetColorMap(const std::string& name);
     void ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
                            const glm::mat4& modelMatrix, float zoom);
     void ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& renderer,
@@ -111,10 +115,20 @@ private:
     std::shared_ptr<const ElevationRaster> raster_;
     std::filesystem::path loadedRasterPath_;
     std::filesystem::path colorMapDirectory_;
+    std::unordered_map<std::string, ColorMap> colorMapCache_;
     std::string colorMapName_ = "default.map";
     std::string selectionColorMapName_ = "grayscale.map";
     std::string legendError_;
     bool legendErrorOpen_ = false;
+    bool layerDialogOpen_ = false;
+    bool deleteLayerDialogOpen_ = false;
+    std::array<char, 128> newLayerName_{};
+    std::string newLayerColorMap_ = "default.map";
+    std::string newLayerSelectionColorMap_ = "grayscale.map";
+    std::string pendingLayerDeletion_;
+    ElevationLayer* nameEditLayer_ = nullptr;
+    std::array<char, 128> layerNameBuffer_{};
+    std::string layerError_;
     std::string meshError_;
     bool meshErrorOpen_ = false;
     glm::vec3 graticuleColor_{0.75F};

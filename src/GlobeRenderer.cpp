@@ -69,14 +69,18 @@ GLsizeiptr bufferSize(std::span<const T> data) {
 }
 
 GLuint linkProgram(const std::filesystem::path& vertexPath,
-                   const std::filesystem::path& fragmentPath) {
-    Shader vertex(GL_VERTEX_SHADER);
+                   const std::filesystem::path& fragmentPath = {}) {
+    Shader vertex(fragmentPath.empty() ? GL_COMPUTE_SHADER : GL_VERTEX_SHADER);
     Shader fragment(GL_FRAGMENT_SHADER);
     compileShader(vertex, vertexPath);
-    compileShader(fragment, fragmentPath);
+    if (!fragmentPath.empty()) {
+        compileShader(fragment, fragmentPath);
+    }
     const GLuint program = glCreateProgram();
     glAttachShader(program, vertex.id);
-    glAttachShader(program, fragment.id);
+    if (!fragmentPath.empty()) {
+        glAttachShader(program, fragment.id);
+    }
     glLinkProgram(program);
     GLint linked = GL_FALSE;
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
@@ -89,7 +93,9 @@ GLuint linkProgram(const std::filesystem::path& vertexPath,
         throw std::runtime_error("Shader linking failed:\n" + log);
     }
     glDetachShader(program, vertex.id);
-    glDetachShader(program, fragment.id);
+    if (!fragmentPath.empty()) {
+        glDetachShader(program, fragment.id);
+    }
     return program;
 }
 
@@ -102,6 +108,18 @@ bool validColor(const glm::vec3& color) {
 } // namespace
 
 GlobeRenderer::Resources::~Resources() {
+    for (const auto& [layer, buffer] : layerElevationBuffers) {
+        (void)layer;
+        glDeleteBuffers(1, &buffer);
+    }
+    for (const auto& [map, texture] : layerColorTextures) {
+        (void)map;
+        glDeleteTextures(1, &texture);
+    }
+    for (const auto& [map, texture] : layerSelectionColorTextures) {
+        (void)map;
+        glDeleteTextures(1, &texture);
+    }
     glDeleteVertexArrays(1, &wireVao);
     glDeleteBuffers(1, &wirePositionBuffer);
     glDeleteBuffers(1, &wireWeightBuffer);
@@ -111,6 +129,10 @@ GlobeRenderer::Resources::~Resources() {
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &positionBuffer);
     glDeleteBuffers(1, &elevationBuffer);
+    glDeleteBuffers(1, &compositeElevationBuffer);
+    if (compositeProgram != 0) {
+        glDeleteProgram(compositeProgram);
+    }
     glDeleteBuffers(1, &selectionBuffer);
     glDeleteBuffers(1, &indexBuffer);
     glDeleteTextures(1, &colorTexture);
@@ -155,9 +177,13 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
     glProgramUniform1i(resources_.program,
                        uniform(resources_.program, "uSelectionColorLut"), 2);
 
+    resources_.compositeProgram = linkProgram(shaderDirectory / "elevation.comp");
+    compositeCountLocation_ = uniform(resources_.compositeProgram, "uVertexCount");
+    compositeModeLocation_ = uniform(resources_.compositeProgram, "uBlendMode");
     glCreateVertexArrays(1, &resources_.vao);
     glCreateBuffers(1, &resources_.positionBuffer);
     glCreateBuffers(1, &resources_.elevationBuffer);
+    glCreateBuffers(1, &resources_.compositeElevationBuffer);
     glCreateBuffers(1, &resources_.selectionBuffer);
     glCreateBuffers(1, &resources_.indexBuffer);
     glCreateTextures(GL_TEXTURE_1D, 1, &resources_.colorTexture);
@@ -236,8 +262,16 @@ void GlobeRenderer::UploadMesh(std::span<const GridVertex> vertices,
     }
     const auto positionBytes = bufferSize(std::span<const glm::vec3>(positions));
     const auto elevationBytes = bufferSize(std::span<const float>(elevations));
+    for (const auto& [layer, buffer] : resources_.layerElevationBuffers) {
+        (void)layer;
+        glDeleteBuffers(1, &buffer);
+    }
+    resources_.layerElevationBuffers.clear();
     glNamedBufferData(resources_.positionBuffer, positionBytes, positions.data(), GL_STATIC_DRAW);
     glNamedBufferData(resources_.elevationBuffer, elevationBytes, elevations.data(), GL_DYNAMIC_DRAW);
+    glNamedBufferData(resources_.compositeElevationBuffer, elevationBytes, nullptr, GL_DYNAMIC_DRAW);
+    compositeDirty_ = true;
+    composedLayers_.clear();
     const auto selectionBytes = bufferSize(std::span<const float>(selectionWeights));
     glNamedBufferData(resources_.selectionBuffer, selectionBytes, selectionWeights.data(), GL_DYNAMIC_DRAW);
     glNamedBufferData(resources_.indexBuffer, indexBytes, indices.data(), GL_STATIC_DRAW);
@@ -361,6 +395,53 @@ void GlobeRenderer::UpdateElevations(std::span<const GridVertex> vertices) {
     checkGl("Updating globe elevations");
 }
 
+void GlobeRenderer::UpdateLayerElevations(const ElevationLayer& layer,
+                                          std::span<const float> elevations,
+                                          std::span<const std::size_t> changedIndices) {
+    if (elevations.size() != vertexCount_ || elevations.size() != layer.GetValueCount()) {
+        throw std::invalid_argument("Layer elevation update must match the uploaded vertex count.");
+    }
+    const auto found = resources_.layerElevationBuffers.find(&layer);
+    GLuint targetBuffer = resources_.elevationBuffer;
+    if (found != resources_.layerElevationBuffers.end()) {
+        targetBuffer = found->second;
+    } else if (layerStackEnabled_) {
+        throw std::logic_error("Layer elevation buffer has not been initialized.");
+    }
+    if (changedIndices.empty()) {
+        for (const float elevation : elevations) {
+            if (!std::isfinite(elevation)) {
+                throw std::invalid_argument("Layer elevation update contains a non-finite value.");
+            }
+        }
+        glNamedBufferSubData(targetBuffer, 0, bufferSize(elevations), elevations.data());
+    } else {
+        std::vector<std::size_t> ordered(changedIndices.begin(), changedIndices.end());
+        std::sort(ordered.begin(), ordered.end());
+        ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+        if (std::any_of(ordered.begin(), ordered.end(), [&](std::size_t index) {
+                return index >= elevations.size() || !std::isfinite(elevations[index]);
+            })) {
+            throw std::invalid_argument("Changed layer elevation index is invalid.");
+        }
+        for (std::size_t cursor = 0; cursor < ordered.size();) {
+            const std::size_t start = ordered[cursor];
+            std::size_t end = cursor + 1;
+            while (end < ordered.size() && ordered[end] == ordered[end - 1] + 1) {
+                ++end;
+            }
+            const std::size_t count = end - cursor;
+            glNamedBufferSubData(targetBuffer,
+                                 static_cast<GLintptr>(start * sizeof(float)),
+                                 bufferSize(elevations.subspan(start, count)),
+                                 elevations.data() + start);
+            cursor = end;
+        }
+    }
+    compositeDirty_ = true;
+    checkGl("Updating layer elevations");
+}
+
 void GlobeRenderer::SetColorMap(const ColorMap& map) {
     UploadColorMap(map, resources_.colorTexture);
     hasColorMap_ = true;
@@ -369,6 +450,72 @@ void GlobeRenderer::SetColorMap(const ColorMap& map) {
 void GlobeRenderer::SetSelectionColorMap(const ColorMap& map) {
     UploadColorMap(map, resources_.selectionColorTexture);
     hasSelectionColorMap_ = true;
+}
+
+void GlobeRenderer::SetLayerStack(std::vector<GlobeRenderLayer> layers) {
+    for (const auto& layer : layers) {
+        if (layer.layer == nullptr ||
+            layer.colorMap == nullptr || layer.selectionColorMap == nullptr ||
+            layer.layer->GetValueCount() != vertexCount_) {
+            throw std::invalid_argument("Layer elevation count must match the uploaded mesh.");
+        }
+    }
+    for (auto buffer = resources_.layerElevationBuffers.begin();
+         buffer != resources_.layerElevationBuffers.end();) {
+        const bool present = std::any_of(layers.begin(), layers.end(), [&](const auto& layer) {
+            return layer.layer == buffer->first;
+        });
+        if (present) {
+            ++buffer;
+        } else {
+            glDeleteBuffers(1, &buffer->second);
+            buffer = resources_.layerElevationBuffers.erase(buffer);
+        }
+    }
+    for (const auto& layer : layers) {
+        if (resources_.layerElevationBuffers.contains(layer.layer)) {
+            continue;
+        }
+        GLuint buffer = 0;
+        glCreateBuffers(1, &buffer);
+        if (buffer == 0) {
+            throw std::runtime_error("Could not allocate a layer elevation buffer.");
+        }
+        const auto values = layer.layer->GetValues();
+        glNamedBufferData(buffer, bufferSize(values), values.data(), GL_DYNAMIC_DRAW);
+        resources_.layerElevationBuffers.emplace(layer.layer, buffer);
+        compositeDirty_ = true;
+    }
+    checkGl("Setting globe layer stack");
+    layerStack_ = std::move(layers);
+    layerStackEnabled_ = true;
+}
+
+void GlobeRenderer::ClearLayerStack() {
+    layerStack_.clear();
+    layerStackEnabled_ = false;
+}
+
+GLuint GlobeRenderer::GetLayerTexture(const ColorMap& map, bool selection) {
+    auto& textures = selection ? resources_.layerSelectionColorTextures
+                               : resources_.layerColorTextures;
+    const auto found = textures.find(&map);
+    if (found != textures.end()) {
+        return found->second;
+    }
+    GLuint texture = 0;
+    glCreateTextures(GL_TEXTURE_1D, 1, &texture);
+    if (texture == 0) {
+        throw std::runtime_error("Could not allocate a layer colour-map texture.");
+    }
+    try {
+        UploadColorMap(map, texture);
+        textures.emplace(&map, texture);
+    } catch (...) {
+        glDeleteTextures(1, &texture);
+        throw;
+    }
+    return texture;
 }
 
 void GlobeRenderer::SetGraticuleColors(const glm::vec3& ordinary,
@@ -431,10 +578,13 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
     if (framebufferWidth == 0 || framebufferHeight == 0) {
         return;
     }
-    if (indexCount_ == 0 || !hasColorMap_) {
+    if (!layerStackEnabled_ && !layerVisible_) {
+        return;
+    }
+    if (indexCount_ == 0 || (!layerStackEnabled_ && !hasColorMap_)) {
         throw std::logic_error("Upload a mesh and colour map before drawing the globe.");
     }
-    if (selectionActive_ && !hasSelectionColorMap_) {
+    if (selectionActive_ && !layerStackEnabled_ && !hasSelectionColorMap_) {
         throw std::logic_error("Upload a selection colour map before drawing an active selection.");
     }
     const float aspect = static_cast<float>(framebufferWidth) / framebufferHeight;
@@ -463,14 +613,65 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
     glProgramUniform3fv(resources_.program, highlightedGraticuleColorLocation_, 1,
                         glm::value_ptr(highlightedGraticuleColor_));
     glProgramUniform1i(resources_.program, graticuleEnabledLocation_, graticuleEnabled_ ? 1 : 0);
-    glBindTextureUnit(1, resources_.colorTexture);
-    glBindTextureUnit(2, resources_.selectionColorTexture);
-    glProgramUniform1i(resources_.program, selectionActiveLocation_, selectionActive_ ? 1 : 0);
     glBindVertexArray(resources_.vao);
-    glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
+    bool renderedLayer = false;
+    if (layerStackEnabled_) {
+        std::vector<std::pair<const ElevationLayer*, LayerBlendMode>> visibleLayers;
+        const GlobeRenderLayer* topLayer = nullptr;
+        for (auto layerIt = layerStack_.rbegin(); layerIt != layerStack_.rend(); ++layerIt) {
+            const auto& layer = *layerIt;
+            if (!layer.layer->IsVisible()) {
+                continue;
+            }
+            visibleLayers.emplace_back(layer.layer, layer.layer->GetBlendMode());
+            topLayer = &layer;
+        }
+        if (topLayer != nullptr) {
+            if (compositeDirty_ || composedLayers_ != visibleLayers) {
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                glUseProgram(resources_.compositeProgram);
+                glProgramUniform1ui(resources_.compositeProgram, compositeCountLocation_,
+                                   static_cast<GLuint>(vertexCount_));
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, resources_.compositeElevationBuffer);
+                bool hasBaseLayer = false;
+                for (const auto& [layer, mode] : visibleLayers) {
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0,
+                                     resources_.layerElevationBuffers.at(layer));
+                    glProgramUniform1i(resources_.compositeProgram, compositeModeLocation_,
+                        static_cast<GLint>(hasBaseLayer ? mode : LayerBlendMode::Overlay));
+                    glDispatchCompute(static_cast<GLuint>((vertexCount_ + 255) / 256), 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                    hasBaseLayer = true;
+                }
+                glMemoryBarrier(GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0);
+                composedLayers_ = std::move(visibleLayers);
+                compositeDirty_ = false;
+            }
+            glUseProgram(resources_.program);
+            glVertexArrayVertexBuffer(resources_.vao, 1,
+                                      resources_.compositeElevationBuffer, 0, sizeof(float));
+            glBindTextureUnit(1, GetLayerTexture(*topLayer->colorMap, false));
+            glBindTextureUnit(2, GetLayerTexture(*topLayer->selectionColorMap, true));
+            glProgramUniform1i(resources_.program, selectionActiveLocation_,
+                               selectionActive_ ? 1 : 0);
+            glDisable(GL_BLEND);
+            glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
+            renderedLayer = true;
+        }
+    } else {
+        glBindTextureUnit(1, resources_.colorTexture);
+        glBindTextureUnit(2, resources_.selectionColorTexture);
+        glProgramUniform1i(resources_.program, selectionActiveLocation_,
+                           selectionActive_ ? 1 : 0);
+        glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
+    }
+    glVertexArrayVertexBuffer(resources_.vao, 1, resources_.elevationBuffer, 0, sizeof(float));
     glBindVertexArray(0);
 
-    if (wireframeEnabled_ && wireVertexCount_ > 0) {
+    if (wireframeEnabled_ && wireVertexCount_ > 0 &&
+        (!layerStackEnabled_ || renderedLayer)) {
         glUseProgram(resources_.wireProgram);
         glProgramUniformMatrix4fv(resources_.wireProgram, wireMatrixLocation_, 1, GL_FALSE,
                                   glm::value_ptr(matrix));

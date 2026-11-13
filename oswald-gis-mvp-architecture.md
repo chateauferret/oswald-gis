@@ -69,7 +69,8 @@ The software is structured strictly around a Model-View-Controller design patter
 |  - SphericalGrid (Poisson-sampled std::vector<GridVertex>)         |
 |  - Spherical Half-Edge Topology Graph                             |
 |  - 3D k-d Tree Index (nanoflann Adaptor)                          |
-|  - Single-Channel Elevation Data (-32767 to +32767 feet/meters)   |
+|  - Layer Collection (currently a Float32 Elevation raster)        |
+|  - Separate Per-Vertex Selection Channel                         |
 +---------------------------------+---------------------------------+
                                   |
                                   | Uploads Position &
@@ -85,9 +86,14 @@ The software is structured strictly around a Model-View-Controller design patter
 
 ### 3.1 Component Responsibilities
 
-* **Model (`SphericalGrid`)**: Owns the CPU-side vertex buffers, topological edge connectivities, elevation arrays, and the `nanoflann` 3D k-d tree index. It exposes thread-safe methods for grid generation, local refinement, and spatial point sampling.
-* **View (`GlobeRenderer`)**: Manages GPU-side OpenGL resources (Vertex Array Objects, Vertex Buffer Objects, Element Buffer Objects). It compiles GLSL shaders and renders the spherical mesh using an orthographic projection matrix.
+* **Model (`SphericalGrid`)**: Owns the CPU-side vertex buffers, topological edge connectivities, its data-layer collection, and the `nanoflann` 3D k-d tree index. `Layer` defines shared metadata, `RasterLayer` stores raster values, and each `ElevationLayer` has independent values synchronized with immutable mesh snapshots when active. Elevation- and selection-only snapshots share the geometry's immutable spatial index; it is rebuilt only when mesh geometry changes. The per-vertex selection channel remains separate from the layer collection. The model exposes cancellable grid generation, immutable snapshots, and spatial point sampling.
+* **View (`GlobeRenderer`)**: Manages GPU-side OpenGL resources (Vertex Array Objects, Vertex Buffer Objects, Element Buffer Objects). Each layer has a persistent elevation buffer, and brush previews update changed vertex ranges in the active layer. A compute shader combines visible elevations bottom-to-top before a single globe draw, using the topmost visible layer's selected/unselected colour maps. Overlay replaces the accumulated value; Add, Subtract (lower minus upper), Multiply, Minimum, and Maximum operate on elevations, not RGB colours. Each operation clamps to the supported elevation range [-32767, 32767]; the bottommost visible layer seeds the result regardless of its blend mode. Composition is cached until values, order, visibility, or blend modes change. Selection, graticules, and rim shading are applied once, after composition.
 * **Controller (`CameraController` & `UIManager`)**: Processes window input events. It translates 2D mouse drags into 3D camera rotations, handles double-click raycasts for globe re-centering, and renders Dear ImGui interface overlays.
+
+The single hover readout reports the cumulative elevation through the active layer,
+including visible layers below it and any in-progress brush preview, but excluding
+layers above it. Painting and filters still edit the active layer's raw values;
+composition does not modify the stored layer data.
 
 ---
 

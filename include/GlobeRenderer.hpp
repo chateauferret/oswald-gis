@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ColorMap.hpp"
+#include "Layer.hpp"
 #include "SphericalGrid.hpp"
 
 #include <glad/gl.h>
@@ -9,7 +10,21 @@
 #include <array>
 #include <filesystem>
 #include <span>
+#include <string>
+#include <utility>
+#include <unordered_map>
 #include <vector>
+
+struct GlobeRenderLayer {
+    const ElevationLayer* layer;
+    const ColorMap* colorMap;
+    const ColorMap* selectionColorMap;
+
+    GlobeRenderLayer(const ElevationLayer& source, const ColorMap& layerColorMap,
+                     const ColorMap& layerSelectionColorMap)
+        : layer(&source), colorMap(&layerColorMap),
+          selectionColorMap(&layerSelectionColorMap) {}
+};
 
 class GlobeRenderer {
 public:
@@ -24,9 +39,15 @@ public:
     void UploadMesh(std::span<const GridVertex> vertices,
                     std::span<const std::uint32_t> indices, bool selectionActive = false);
     void UpdateElevations(std::span<const GridVertex> vertices);
+    void UpdateLayerElevations(const ElevationLayer& layer, std::span<const float> elevations,
+                               std::span<const std::size_t> changedIndices = {});
     void UpdateSelection(std::span<const GridVertex> vertices, bool active);
     void SetColorMap(const ColorMap& map);
     void SetSelectionColorMap(const ColorMap& map);
+    void SetLayerStack(std::vector<GlobeRenderLayer> layers);
+    void ClearLayerStack();
+    void SetLayerVisible(bool visible) { layerVisible_ = visible; }
+    bool IsLayerVisible() const { return layerVisible_; }
     void SetGraticuleColors(const glm::vec3& ordinary, const glm::vec3& highlighted);
     void SetWireframeColors(const glm::vec3& unselected, const glm::vec3& selected);
     void SetWireframeEnabled(bool enabled);
@@ -42,10 +63,15 @@ private:
         GLuint vao = 0;
         GLuint positionBuffer = 0;
         GLuint elevationBuffer = 0;
+        GLuint compositeElevationBuffer = 0;
+        GLuint compositeProgram = 0;
         GLuint selectionBuffer = 0;
         GLuint indexBuffer = 0;
         GLuint colorTexture = 0;
         GLuint selectionColorTexture = 0;
+        std::unordered_map<const ElevationLayer*, GLuint> layerElevationBuffers;
+        std::unordered_map<const ColorMap*, GLuint> layerColorTextures;
+        std::unordered_map<const ColorMap*, GLuint> layerSelectionColorTextures;
         GLuint program = 0;
         GLuint wireVao = 0;
         GLuint wirePositionBuffer = 0;
@@ -54,6 +80,10 @@ private:
         ~Resources();
     } resources_;
     GLint matrixLocation_ = -1;
+    GLint compositeCountLocation_ = -1;
+    GLint compositeModeLocation_ = -1;
+    bool compositeDirty_ = true;
+    std::vector<std::pair<const ElevationLayer*, LayerBlendMode>> composedLayers_;
     GLint viewDirectionLocation_ = -1;
     GLint graticuleSpacingLocation_ = -1;
     GLint graticuleColorLocation_ = -1;
@@ -64,6 +94,9 @@ private:
     std::size_t vertexCount_ = 0;
     bool hasColorMap_ = false;
     bool hasSelectionColorMap_ = false;
+    bool layerVisible_ = true;
+    bool layerStackEnabled_ = false;
+    std::vector<GlobeRenderLayer> layerStack_;
     bool selectionActive_ = false;
     bool wireframeEnabled_ = false;
     bool graticuleEnabled_ = true;
@@ -81,6 +114,7 @@ private:
     std::vector<std::array<std::uint32_t, 2>> wireSites_;
 
     void UploadColorMap(const ColorMap& map, GLuint texture);
+    GLuint GetLayerTexture(const ColorMap& map, bool selection);
     void BuildVoronoi(std::span<const GridVertex> vertices, std::span<const std::uint32_t> indices);
     void UploadWireWeights(std::span<const GridVertex> vertices);
 };

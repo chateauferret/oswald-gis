@@ -1,0 +1,30 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Source {
+    float source[];
+};
+layout(std430, binding = 1) buffer Composite {
+    float composite[];
+};
+uniform uint uVertexCount;
+uniform int uBlendMode;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uVertexCount) {
+        return;
+    }
+    float upper = source[index];
+    float lower = uBlendMode == 0 ? 0.0 : composite[index];
+    float result = upper;
+    // Matches LayerBlendMode and BlendElevations on the CPU.
+    switch (uBlendMode) {
+    case 1: result = lower + upper; break;
+    case 2: result = lower - upper; break;
+    case 3: result = lower * upper; break;
+    case 4: result = min(lower, upper); break;
+    case 5: result = max(lower, upper); break;
+    }
+    composite[index] = clamp(result, -32767.0, 32767.0);
+}

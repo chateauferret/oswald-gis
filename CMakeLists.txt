@@ -101,7 +101,7 @@ FetchContent_MakeAvailable(stb)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 
-add_library(oswald_model STATIC src/SphericalGrid.cpp src/ElevationRaster.cpp src/BrushTool.cpp
+add_library(oswald_model STATIC src/Layer.cpp src/SphericalGrid.cpp src/ElevationRaster.cpp src/BrushTool.cpp
     src/SelectionTool.cpp src/Filter.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
@@ -116,7 +116,7 @@ target_include_directories(oswald_view PUBLIC include)
 target_link_libraries(oswald_view PUBLIC oswald_model glad_gl_core_45)
 
 set(OSWALD_RESOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/resources")
-foreach(resource shaders/globe.vert shaders/globe.frag shaders/wire.vert shaders/wire.frag)
+foreach(resource shaders/globe.vert shaders/globe.frag shaders/wire.vert shaders/wire.frag shaders/elevation.comp)
     configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
 endforeach()
 file(GLOB OSWALD_COLORMAP_FILES CONFIGURE_DEPENDS
@@ -173,6 +173,10 @@ if(BUILD_TESTING)
     add_executable(filter_tests tests/FilterTests.cpp)
     target_link_libraries(filter_tests PRIVATE oswald_model)
     add_test(NAME filter COMMAND filter_tests)
+
+    add_executable(layer_tests tests/LayerTests.cpp)
+    target_link_libraries(layer_tests PRIVATE oswald_model)
+    add_test(NAME layer COMMAND layer_tests)
 
     add_executable(raster_file_browser_tests tests/RasterFileBrowserTests.cpp src/RasterFileBrowser.cpp)
     target_include_directories(raster_file_browser_tests PRIVATE include)

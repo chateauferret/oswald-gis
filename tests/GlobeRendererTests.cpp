@@ -208,6 +208,109 @@ void testGpu() {
           std::abs(static_cast<int>(corner[2]) - 31) <= 1,
           "Globe overwrote background outside its silhouette.");
 
+    const auto grayscaleMap =
+        ColorMap::Load(resources / "assets/colormaps/grayscale.map");
+    const auto defaultMap = ColorMap::Load(resources / "assets/colormaps/default.map");
+    const auto vertexCount = snapshot->GetVertices().size();
+    ElevationLayer baseLayer("Base", "default.map", "grayscale.map",
+                             std::vector<float>(vertexCount, 0.0F));
+    ElevationLayer topLayer("Top", "grayscale.map", "grayscale.map",
+                            std::vector<float>(vertexCount, -32767.0F));
+    ElevationLayer invalidLayer("Invalid", "grayscale.map", "grayscale.map", {0.0F});
+    expectFailure([&] {
+        renderer.SetLayerStack({
+            GlobeRenderLayer(invalidLayer, grayscaleMap, grayscaleMap)
+        });
+    });
+    renderer.SetGraticuleEnabled(false);
+    renderer.SetLayerStack({
+        GlobeRenderLayer(topLayer, grayscaleMap, grayscaleMap),
+        GlobeRenderLayer(baseLayer, defaultMap, grayscaleMap)
+    });
+    clear();
+    renderer.Draw(width, height);
+    const auto overlayPixel = palettePixel(width, height);
+    check(overlayPixel[0] < 10 && overlayPixel[1] < 10 && overlayPixel[2] < 10,
+          "Visible overlay layer was not drawn above the base layer.");
+    const std::vector<float> previewValues(vertexCount, 32767.0F);
+    renderer.UpdateLayerElevations(topLayer, previewValues);
+    clear();
+    renderer.Draw(width, height);
+    const auto previewPixel = palettePixel(width, height);
+    check(previewPixel[0] > 40 &&
+          std::abs(static_cast<int>(previewPixel[0]) - previewPixel[1]) <= 2 &&
+          std::abs(static_cast<int>(previewPixel[1]) - previewPixel[2]) <= 2,
+          "Active-layer elevation preview was overwritten by another layer during drawing.");
+    const std::array<std::size_t, 1> sparseUpdate{0};
+    renderer.UpdateLayerElevations(topLayer, topLayer.GetValues(), sparseUpdate);
+    expectFailure([&] {
+        const std::array<std::size_t, 1> invalidUpdate{vertexCount};
+        renderer.UpdateLayerElevations(topLayer, topLayer.GetValues(), invalidUpdate);
+    });
+    const std::vector<float> topLayerValues(vertexCount, -32767.0F);
+    renderer.UpdateLayerElevations(topLayer, topLayerValues);
+    topLayer.SetBlendMode(LayerBlendMode::Multiply);
+    clear();
+    renderer.Draw(width, height);
+    const auto multiplyPixel = palettePixel(width, height);
+    for (const auto channel : multiplyPixel) {
+        check(std::abs(channel - 127.5F) <= 2,
+              "Multiply did not map the product of elevations (zero) to grayscale.");
+    }
+    topLayer.SetVisible(false);
+    clear();
+    renderer.Draw(width, height);
+    const auto hiddenPixel = palettePixel(width, height);
+    check(hiddenPixel[1] > hiddenPixel[0] * 2 && hiddenPixel[1] > hiddenPixel[2] * 2,
+          "Hidden layer remained visible or obscured the base layer.");
+    topLayer.SetVisible(true);
+    renderer.SetLayerStack({
+        GlobeRenderLayer(topLayer, defaultMap, grayscaleMap),
+        GlobeRenderLayer(baseLayer, grayscaleMap, grayscaleMap)
+    });
+    const auto checkElevationPixel = [&](float elevation) {
+        clear();
+        renderer.Draw(width, height);
+        const auto actual = palettePixel(width, height);
+        const auto expected = expectedColor(elevation);
+        for (int channel = 0; channel < 3; ++channel) {
+            check(std::abs(actual[channel] - expected[channel] * 255.0F) <= 2,
+                  "Layer composition did not colour the combined elevation.");
+        }
+    };
+    renderer.UpdateLayerElevations(topLayer, std::vector<float>(vertexCount, 0));
+    topLayer.SetBlendMode(LayerBlendMode::Add);
+    checkElevationPixel(0);
+    checkElevationPixel(0);
+    renderer.UpdateLayerElevations(baseLayer, std::vector<float>(vertexCount, 1000));
+    checkElevationPixel(1000);
+    renderer.UpdateLayerElevations(topLayer, std::vector<float>(vertexCount, 10000));
+    for (const auto& [mode, elevation] : std::array{
+             std::pair{LayerBlendMode::Overlay, 10000.0F},
+             std::pair{LayerBlendMode::Add, 11000.0F},
+             std::pair{LayerBlendMode::Subtract, -9000.0F},
+             std::pair{LayerBlendMode::Multiply, 32767.0F},
+             std::pair{LayerBlendMode::Minimum, 1000.0F},
+             std::pair{LayerBlendMode::Maximum, 10000.0F}}) {
+        topLayer.SetBlendMode(mode);
+        checkElevationPixel(elevation);
+    }
+    renderer.SetLayerStack({
+        GlobeRenderLayer(baseLayer, defaultMap, grayscaleMap),
+        GlobeRenderLayer(topLayer, grayscaleMap, grayscaleMap)
+    });
+    baseLayer.SetBlendMode(LayerBlendMode::Subtract);
+    checkElevationPixel(9000);
+    baseLayer.SetVisible(false);
+    topLayer.SetVisible(false);
+    clear();
+    renderer.Draw(width, height);
+    check(palettePixel(width, height) == corner,
+          "A stack with all layers hidden still rendered a globe.");
+    renderer.ClearLayerStack();
+    renderer.UpdateElevations(snapshot->GetVertices());
+    renderer.SetGraticuleEnabled(true);
+
     clear();
     renderer.Draw(width, height);
     const auto graticuleCrossing = pixel(width / 2, height / 2);

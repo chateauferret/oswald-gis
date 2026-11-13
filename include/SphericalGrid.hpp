@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Layer.hpp"
+
 #include <glm/glm.hpp>
 #include <nanoflann.hpp>
 
@@ -52,7 +54,7 @@ public:
 };
 
 struct PointCloudAdaptor {
-    const std::vector<GridVertex>& points;
+    const std::vector<glm::vec3>& points;
 
     std::size_t kdtree_get_point_count() const { return points.size(); }
     float kdtree_get_pt(std::size_t index, std::size_t dimension) const;
@@ -64,6 +66,8 @@ struct PointCloudAdaptor {
 using KDTree3D = nanoflann::KDTreeSingleIndexAdaptor<
     nanoflann::L2_Simple_Adaptor<float, PointCloudAdaptor>,
     PointCloudAdaptor, 3, std::size_t>;
+
+struct SpatialIndex;
 
 class SphericalGridSnapshot {
 public:
@@ -117,8 +121,7 @@ private:
     std::vector<std::uint32_t> triangleIndices_;
     std::vector<std::uint8_t> refinementVertices_;
     bool selectionActive_ = false;
-    PointCloudAdaptor adaptor_;
-    KDTree3D tree_;
+    std::shared_ptr<const SpatialIndex> spatialIndex_;
 };
 
 class SphericalGrid {
@@ -129,7 +132,28 @@ public:
     void SetElevations(std::span<const float> elevations);
     void SetSelectionWeights(std::span<const float> selectionWeights, bool active = true);
     std::shared_ptr<const SphericalGridSnapshot> GetSnapshot() const;
+    const std::vector<std::unique_ptr<ElevationLayer>>& GetLayers() const { return layers_; }
+    const ElevationLayer& GetElevationLayer() const { return *activeLayer_; }
+    ElevationLayer& GetElevationLayer() { return *activeLayer_; }
+    bool HasActiveLayer() const { return activeLayer_ != nullptr; }
+    const Layer& GetActiveLayer() const;
+    float GetActiveCompositedElevation(std::size_t vertexIndex,
+                                      std::span<const float> activePreview = {}) const;
+    void SetActiveLayer(std::string_view name);
+    void DeactivateActiveLayer();
+    void SetLayerVisible(std::string_view name, bool visible);
+    void RenameLayer(std::string_view oldName, std::string newName);
+    ElevationLayer& AddElevationLayer(std::string name, std::string colorMap,
+                                     std::string selectionColorMap);
+    void RemoveLayer(std::string_view name);
+    void MoveLayer(std::string_view name, std::size_t newIndex);
 
 private:
     std::atomic<std::shared_ptr<const SphericalGridSnapshot>> snapshot_;
+    std::vector<std::unique_ptr<ElevationLayer>> layers_;
+    ElevationLayer* activeLayer_ = nullptr;
+
+    std::vector<float> ValuesForLayer(const ElevationLayer& layer,
+                                      const SphericalGridSnapshot& target,
+                                      const SphericalGridSnapshot& source) const;
 };

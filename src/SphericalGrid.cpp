@@ -329,14 +329,34 @@ void relaxOnce(std::vector<GridVertex>& vertices, const std::vector<std::uint32_
 } // namespace
 
 float PointCloudAdaptor::kdtree_get_pt(std::size_t index, std::size_t dimension) const {
-    return points[index].position[static_cast<glm::vec3::length_type>(dimension)];
+    return points[index][static_cast<glm::vec3::length_type>(dimension)];
 }
+
+struct SpatialIndex {
+    explicit SpatialIndex(std::span<const GridVertex> vertices)
+        : positions(), adaptor{positions},
+          tree(3, adaptor, nanoflann::KDTreeSingleIndexAdaptorParams(
+              10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+        positions.reserve(vertices.size());
+        for (const auto& vertex : vertices) {
+            positions.push_back(vertex.position);
+        }
+        tree.buildIndex();
+    }
+
+    SpatialIndex(const SpatialIndex&) = delete;
+    SpatialIndex& operator=(const SpatialIndex&) = delete;
+    SpatialIndex(SpatialIndex&&) = delete;
+    SpatialIndex& operator=(SpatialIndex&&) = delete;
+
+    std::vector<glm::vec3> positions;
+    PointCloudAdaptor adaptor;
+    KDTree3D tree;
+};
 
 SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
                                              GridGenerationControl* control)
-    : options_(options), adaptor_{vertices_},
-      tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
-          10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+    : options_(options) {
     validateOptions(options);
     const float stageCount = static_cast<float>(options.relaxationIterations) + 1.0F;
     const auto checkpoint = [&](float completedStages) {
@@ -441,7 +461,7 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
     }
     triangulate(vertices_, halfEdges_, triangleIndices_);
     refinementVertices_.assign(vertices_.size(), 0);
-    tree_.buildIndex();
+    spatialIndex_ = std::make_shared<const SpatialIndex>(vertices_);
     checkpoint(stageCount);
 }
 
@@ -450,9 +470,7 @@ SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source
     : options_(source.options_), vertices_(source.vertices_), halfEdges_(source.halfEdges_),
     triangleIndices_(source.triangleIndices_),
     refinementVertices_(source.refinementVertices_), selectionActive_(source.selectionActive_),
-      adaptor_{vertices_},
-      tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
-          10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+      spatialIndex_(source.spatialIndex_) {
     if (elevations.size() != vertices_.size()) {
         throw std::invalid_argument("Elevation count must match the grid vertex count.");
     }
@@ -463,7 +481,6 @@ SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source
         }
         vertices_[i].elevation = elevations[i];
     }
-    tree_.buildIndex();
 }
 
 SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source,
@@ -473,9 +490,7 @@ SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source
     : options_(source.options_), vertices_(source.vertices_), halfEdges_(source.halfEdges_),
     triangleIndices_(source.triangleIndices_),
     refinementVertices_(source.refinementVertices_), selectionActive_(selectionActive),
-      adaptor_{vertices_},
-      tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
-          10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+      spatialIndex_(source.spatialIndex_) {
     if (elevations.size() != vertices_.size()) {
         throw std::invalid_argument("Elevation count must match the grid vertex count.");
     }
@@ -493,7 +508,6 @@ SphericalGridSnapshot::SphericalGridSnapshot(const SphericalGridSnapshot& source
         vertices_[i].elevation = elevations[i];
         vertices_[i].selectionWeight = selectionActive ? selectionWeights[i] : 0.0F;
     }
-    tree_.buildIndex();
 }
 
 SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
@@ -503,10 +517,7 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
                                              bool selectionActive)
     : options_(options), vertices_(std::move(vertices)),
             triangleIndices_(std::move(triangleIndices)),
-            refinementVertices_(std::move(refinementVertices)), selectionActive_(selectionActive),
-      adaptor_{vertices_},
-      tree_(3, adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(
-          10, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex)) {
+            refinementVertices_(std::move(refinementVertices)), selectionActive_(selectionActive) {
     buildHalfEdges(vertices_, triangleIndices_, halfEdges_);
     if (refinementVertices_.size() != vertices_.size()) {
         throw std::invalid_argument("Refinement provenance count must match the mesh vertex count.");
@@ -520,7 +531,7 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
             throw std::invalid_argument("Adaptive mesh attributes are outside their supported ranges.");
         }
     }
-    tree_.buildIndex();
+    spatialIndex_ = std::make_shared<const SpatialIndex>(vertices_);
 }
 
 std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::RefineSelectedRegion(
@@ -938,7 +949,7 @@ std::size_t SphericalGridSnapshot::FindNearest(glm::dvec3 direction) const {
     const glm::vec3 query(unitDirection(direction));
     std::size_t index = 0;
     float squaredDistance = 0.0F;
-    if (tree_.knnSearch(&query.x, 1, &index, &squaredDistance) != 1) {
+    if (spatialIndex_->tree.knnSearch(&query.x, 1, &index, &squaredDistance) != 1) {
         throw std::runtime_error("Spatial index failed to return a nearest vertex.");
     }
     return index;
@@ -956,7 +967,7 @@ std::vector<std::size_t> SphericalGridSnapshot::FindWithinRadius(
     const glm::vec3 query(center);
     std::vector<nanoflann::ResultItem<std::size_t, float>> candidates;
     // Pad float k-d tree distances, then enforce the inclusive arc boundary in doubles.
-    tree_.radiusSearch(&query.x, static_cast<float>(chord * chord) +
+    spatialIndex_->tree.radiusSearch(&query.x, static_cast<float>(chord * chord) +
                        16.0F * std::numeric_limits<float>::epsilon(), candidates);
     std::vector<std::size_t> result;
     result.reserve(candidates.size());
@@ -973,32 +984,64 @@ std::vector<std::size_t> SphericalGridSnapshot::FindWithinRadius(
 }
 
 SphericalGrid::SphericalGrid(const GridOptions& options) {
+    auto elevationLayer = std::make_unique<ElevationLayer>();
+    activeLayer_ = elevationLayer.get();
+    layers_.push_back(std::move(elevationLayer));
     GenerateGrid(options);
 }
 
 void SphericalGrid::GenerateGrid(const GridOptions& options) {
-    snapshot_.store(std::make_shared<const SphericalGridSnapshot>(options));
+    auto snapshot = std::make_shared<const SphericalGridSnapshot>(options);
+    const std::vector<float> elevations(snapshot->GetVertices().size(), 0.0F);
+    for (auto& layer : layers_) {
+        layer->SetElevations(elevations);
+    }
+    snapshot_.store(std::move(snapshot));
 }
 
 void SphericalGrid::InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot) {
     if (!snapshot) {
         throw std::invalid_argument("Cannot install a null grid snapshot.");
     }
+    const auto previous = GetSnapshot();
+    for (auto& layer : layers_) {
+        if (layer.get() == activeLayer_) {
+            std::vector<float> elevations;
+            elevations.reserve(snapshot->GetVertices().size());
+            for (const auto& vertex : snapshot->GetVertices()) {
+                elevations.push_back(vertex.elevation);
+            }
+            layer->SetElevations(elevations);
+        } else {
+            layer->SetElevations(ValuesForLayer(*layer, *snapshot, *previous));
+        }
+    }
     snapshot_.store(std::move(snapshot));
 }
 
 void SphericalGrid::SetElevations(std::span<const float> elevations) {
+    if (activeLayer_ == nullptr) {
+        throw std::logic_error("Cannot edit raster data without an active layer.");
+    }
     const auto current = GetSnapshot();
-    snapshot_.store(std::make_shared<const SphericalGridSnapshot>(*current, elevations));
+    auto snapshot = std::make_shared<const SphericalGridSnapshot>(*current, elevations);
+    activeLayer_->SetElevations(elevations);
+    snapshot_.store(std::move(snapshot));
 }
 
 void SphericalGrid::SetSelectionWeights(std::span<const float> selectionWeights,
                                                  bool active) {
     const auto current = GetSnapshot();
+    const auto currentVertices = current->GetVertices();
     std::vector<float> elevations;
-    elevations.reserve(current->GetVertices().size());
-    for (const auto& vertex : current->GetVertices()) {
-        elevations.push_back(vertex.elevation);
+    elevations.reserve(currentVertices.size());
+    if (activeLayer_ != nullptr) {
+        const auto activeValues = activeLayer_->GetValues();
+        elevations.assign(activeValues.begin(), activeValues.end());
+    } else {
+        for (const auto& vertex : currentVertices) {
+            elevations.push_back(vertex.elevation);
+        }
     }
     snapshot_.store(std::make_shared<const SphericalGridSnapshot>(
         *current, elevations, std::vector<float>(selectionWeights.begin(), selectionWeights.end()),
@@ -1007,4 +1050,188 @@ void SphericalGrid::SetSelectionWeights(std::span<const float> selectionWeights,
 
 std::shared_ptr<const SphericalGridSnapshot> SphericalGrid::GetSnapshot() const {
     return snapshot_.load();
+}
+
+const Layer& SphericalGrid::GetActiveLayer() const {
+    if (activeLayer_ == nullptr) {
+        throw std::logic_error("There is no active layer.");
+    }
+    return *activeLayer_;
+}
+
+float SphericalGrid::GetActiveCompositedElevation(
+    std::size_t vertexIndex, std::span<const float> activePreview) const {
+    if (activeLayer_ == nullptr) {
+        throw std::logic_error("There is no active layer.");
+    }
+    if (vertexIndex >= activeLayer_->GetValueCount() ||
+        (!activePreview.empty() && activePreview.size() != activeLayer_->GetValueCount())) {
+        throw std::invalid_argument("Composited elevation query must match the grid vertices.");
+    }
+    float result = 0.0F;
+    bool hasBase = false;
+    for (auto layer = layers_.rbegin(); layer != layers_.rend(); ++layer) {
+        if (!(*layer)->IsVisible()) {
+            continue;
+        }
+        const float value = layer->get() == activeLayer_ && !activePreview.empty()
+            ? activePreview[vertexIndex] : (*layer)->GetValues()[vertexIndex];
+        result = BlendElevations(result, value,
+            hasBase ? (*layer)->GetBlendMode() : LayerBlendMode::Overlay);
+        hasBase = true;
+        if (layer->get() == activeLayer_) {
+            return result;
+        }
+    }
+    throw std::logic_error("The active layer must be visible.");
+}
+
+void SphericalGrid::SetActiveLayer(std::string_view name) {
+    const auto found = std::find_if(layers_.begin(), layers_.end(), [&](const auto& layer) {
+        return layer->GetName() == name;
+    });
+    if (found == layers_.end()) {
+        throw std::out_of_range("Layer does not exist: " + std::string(name));
+    }
+    if (activeLayer_ == found->get()) {
+        (*found)->SetVisible(true);
+        return;
+    }
+    const auto current = GetSnapshot();
+    auto snapshot = std::make_shared<const SphericalGridSnapshot>(
+        *current, (*found)->GetValues());
+    activeLayer_ = found->get();
+    activeLayer_->SetVisible(true);
+    snapshot_.store(std::move(snapshot));
+}
+
+void SphericalGrid::DeactivateActiveLayer() {
+    activeLayer_ = nullptr;
+}
+
+void SphericalGrid::SetLayerVisible(std::string_view name, bool visible) {
+    const auto found = std::find_if(layers_.begin(), layers_.end(), [&](const auto& layer) {
+        return layer->GetName() == name;
+    });
+    if (found == layers_.end()) {
+        throw std::out_of_range("Layer does not exist: " + std::string(name));
+    }
+    (*found)->SetVisible(visible);
+    if (!visible && found->get() == activeLayer_) {
+        activeLayer_ = nullptr;
+    }
+}
+
+void SphericalGrid::RenameLayer(std::string_view oldName, std::string newName) {
+    const auto found = std::find_if(layers_.begin(), layers_.end(), [&](const auto& layer) {
+        return layer->GetName() == oldName;
+    });
+    if (found == layers_.end()) {
+        throw std::out_of_range("Layer does not exist: " + std::string(oldName));
+    }
+    if (std::any_of(layers_.begin(), layers_.end(), [&](const auto& layer) {
+            return layer.get() != found->get() && layer->GetName() == newName;
+        })) {
+        throw std::invalid_argument("Layer names must be unique.");
+    }
+    (*found)->SetName(std::move(newName));
+}
+
+ElevationLayer& SphericalGrid::AddElevationLayer(std::string name, std::string colorMap,
+                                                  std::string selectionColorMap) {
+    if (name.empty()) {
+        throw std::invalid_argument("Layer names must not be empty.");
+    }
+    if (std::any_of(layers_.begin(), layers_.end(), [&](const auto& layer) {
+            return layer->GetName() == name;
+        })) {
+        throw std::invalid_argument("Layer names must be unique.");
+    }
+    const auto vertexCount = GetSnapshot()->GetVertices().size();
+    auto values = std::vector<float>(vertexCount, 0.0F);
+    auto layer = std::make_unique<ElevationLayer>(std::move(name), std::move(colorMap),
+                                                   std::move(selectionColorMap),
+                                                   std::move(values));
+    auto* result = layer.get();
+    const auto current = GetSnapshot();
+    auto snapshot = std::make_shared<const SphericalGridSnapshot>(
+        *current, layer->GetValues());
+    const auto active = std::find_if(layers_.begin(), layers_.end(), [&](const auto& current) {
+        return current.get() == activeLayer_;
+    });
+    const auto insertionIndex = active == layers_.end()
+                                    ? std::size_t{0}
+                                    : static_cast<std::size_t>(
+                                          std::distance(layers_.begin(), active));
+    layers_.reserve(layers_.size() + 1);
+    activeLayer_ = result;
+    layers_.insert(layers_.begin() + static_cast<std::ptrdiff_t>(insertionIndex),
+                   std::move(layer));
+    snapshot_.store(std::move(snapshot));
+    return *result;
+}
+
+void SphericalGrid::RemoveLayer(std::string_view name) {
+    const auto found = std::find_if(layers_.begin(), layers_.end(), [&](const auto& layer) {
+        return layer->GetName() == name;
+    });
+    if (found == layers_.end()) {
+        throw std::out_of_range("Layer does not exist: " + std::string(name));
+    }
+    if (layers_.size() == 1) {
+        throw std::logic_error("The last data layer cannot be removed.");
+    }
+    const bool removingActive = found->get() == activeLayer_;
+    const auto index = static_cast<std::size_t>(std::distance(layers_.begin(), found));
+    ElevationLayer* nextActive = nullptr;
+    std::shared_ptr<const SphericalGridSnapshot> snapshot;
+    if (removingActive) {
+        nextActive = layers_[std::min(index + 1, layers_.size() - 1)].get();
+        if (nextActive == found->get()) {
+            nextActive = layers_[index == 0 ? 1 : index - 1].get();
+        }
+        snapshot = std::make_shared<const SphericalGridSnapshot>(
+            *GetSnapshot(), nextActive->GetValues());
+    }
+    layers_.erase(found);
+    if (removingActive) {
+        activeLayer_ = nextActive;
+        snapshot_.store(std::move(snapshot));
+    }
+}
+
+void SphericalGrid::MoveLayer(std::string_view name, std::size_t newIndex) {
+    const auto found = std::find_if(layers_.begin(), layers_.end(), [&](const auto& layer) {
+        return layer->GetName() == name;
+    });
+    if (found == layers_.end()) {
+        throw std::out_of_range("Layer does not exist: " + std::string(name));
+    }
+    if (newIndex >= layers_.size()) {
+        throw std::out_of_range("Layer position is out of range.");
+    }
+    const auto oldIndex = static_cast<std::size_t>(std::distance(layers_.begin(), found));
+    if (oldIndex == newIndex) {
+        return;
+    }
+    auto layer = std::move(*found);
+    layers_.erase(found);
+    layers_.insert(layers_.begin() + static_cast<std::ptrdiff_t>(newIndex),
+                   std::move(layer));
+}
+
+std::vector<float> SphericalGrid::ValuesForLayer(
+    const ElevationLayer& layer, const SphericalGridSnapshot& target,
+    const SphericalGridSnapshot& source) const {
+    if (layer.GetValueCount() != source.GetVertices().size()) {
+        throw std::logic_error("Layer values do not match the source mesh.");
+    }
+    std::vector<float> values;
+    values.reserve(target.GetVertices().size());
+    const auto layerValues = layer.GetValues();
+    for (const auto& vertex : target.GetVertices()) {
+        const auto nearest = source.FindNearest(glm::dvec3(vertex.position));
+        values.push_back(layerValues[nearest]);
+    }
+    return values;
 }

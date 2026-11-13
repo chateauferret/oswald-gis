@@ -99,7 +99,8 @@ void testDialog() {
     GlobeRenderer renderer(std::filesystem::path(OSWALD_RESOURCE_DIR) / "shaders");
     SphericalGrid grid({1000, 0.0, 42});
     renderer.UploadGrid(*grid.GetSnapshot());
-    UIManager ui(grid.GetSnapshot()->GetOptions());
+    UIManager ui(grid.GetSnapshot()->GetOptions(),
+                 std::filesystem::path(OSWALD_RESOURCE_DIR) / "assets/colormaps");
     const ImGuiSession imgui;
     const TemporaryDirectory temporary;
     auto frame = [&] {
@@ -107,6 +108,10 @@ void testDialog() {
         check(!ui.Render(grid, renderer), "Dialog unexpectedly requested application exit.");
         ImGui::Render();
     };
+    frame();
+    const auto* layersPanel = ImGui::FindWindowByName("Layers");
+    check(layersPanel != nullptr && layersPanel->Active,
+          "The layer management panel was not rendered.");
     auto key = [&](ImGuiKey key) {
         ImGui::GetIO().AddKeyEvent(key, true);
         frame();

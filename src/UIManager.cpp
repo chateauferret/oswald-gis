@@ -152,7 +152,7 @@ private:
                const std::shared_ptr<const ElevationRaster>& raster,
                const std::filesystem::path& path) {
         grid_.SetElevations(elevations);
-        renderer_.UpdateElevations(grid_.GetSnapshot()->GetVertices());
+        renderer_.UpdateLayerElevations(grid_.GetElevationLayer(), elevations);
         ui_.raster_ = raster;
         ui_.loadedRasterPath_ = path;
     }
@@ -180,7 +180,7 @@ public:
 private:
     void Apply(const std::vector<float>& elevations) {
         grid_.SetElevations(elevations);
-        renderer_.UpdateElevations(grid_.GetSnapshot()->GetVertices());
+        renderer_.UpdateLayerElevations(grid_.GetElevationLayer(), elevations);
     }
 
     SphericalGrid& grid_;
@@ -202,7 +202,7 @@ public:
 private:
     void Apply(const std::vector<float>& elevations) {
         grid_.SetElevations(elevations);
-        renderer_.UpdateElevations(grid_.GetSnapshot()->GetVertices());
+        renderer_.UpdateLayerElevations(grid_.GetElevationLayer(), elevations);
     }
 
     SphericalGrid& grid_;
@@ -617,6 +617,390 @@ void UIManager::RenderFillFilterDialog(SphericalGrid& grid,
     ImGui::EndPopup();
 }
 
+void UIManager::ApplyActiveLayerColorMaps(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (!grid.HasActiveLayer()) {
+        renderer.ClearLayerStack();
+        return;
+    }
+    if (colorMapDirectory_.empty()) {
+        renderer.UpdateElevations(grid.GetSnapshot()->GetVertices());
+        return;
+    }
+    const auto& layer = grid.GetElevationLayer();
+    renderer.SetColorMap(GetColorMap(std::string(layer.GetColorMap())));
+    renderer.SetSelectionColorMap(GetColorMap(std::string(layer.GetSelectionColorMap())));
+    colorMapName_ = layer.GetColorMap();
+    selectionColorMapName_ = layer.GetSelectionColorMap();
+}
+
+const ColorMap& UIManager::GetColorMap(const std::string& name) {
+    const auto found = colorMapCache_.find(name);
+    if (found != colorMapCache_.end()) {
+        return found->second;
+    }
+    auto [inserted, wasInserted] = colorMapCache_.emplace(
+        name, ColorMap::Load(colorMapDirectory_ / name));
+    (void)wasInserted;
+    return inserted->second;
+}
+
+void UIManager::RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer) {
+    const auto colorMaps = [&]() {
+        std::vector<std::filesystem::path> maps;
+        if (colorMapDirectory_.empty()) {
+            return maps;
+        }
+        try {
+            for (const auto& entry : std::filesystem::directory_iterator(colorMapDirectory_)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".map") {
+                    maps.push_back(entry.path());
+                }
+            }
+        } catch (const std::exception& error) {
+            layerError_ = error.what();
+        }
+        std::sort(maps.begin(), maps.end());
+        return maps;
+    };
+    if (ImGui::Begin("Layers")) {
+        if (layerDialogOpen_) {
+            std::fill(newLayerName_.begin(), newLayerName_.end(), '\0');
+            const std::string defaultName = "Elevation " +
+                                            std::to_string(grid.GetLayers().size() + 1);
+            std::copy_n(defaultName.c_str(),
+                        std::min(defaultName.size(), newLayerName_.size() - 1),
+                        newLayerName_.begin());
+            const auto& templateLayer = grid.HasActiveLayer()
+                                            ? grid.GetElevationLayer()
+                                            : *grid.GetLayers().front();
+            newLayerColorMap_ = std::string(templateLayer.GetColorMap());
+            newLayerSelectionColorMap_ = std::string(templateLayer.GetSelectionColorMap());
+            ImGui::OpenPopup("New Layer");
+            layerDialogOpen_ = false;
+        }
+        if (deleteLayerDialogOpen_) {
+            ImGui::OpenPopup("Delete Layer");
+            deleteLayerDialogOpen_ = false;
+        }
+        if (ImGui::Button("New layer")) {
+            layerError_.clear();
+            layerDialogOpen_ = true;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(grid.GetLayers().size() <= 1 || !grid.HasActiveLayer());
+        if (ImGui::Button("Delete layer")) {
+            pendingLayerDeletion_ = std::string(grid.GetActiveLayer().GetName());
+            deleteLayerDialogOpen_ = true;
+        }
+        ImGui::EndDisabled();
+        if (!layerError_.empty()) {
+            ImGui::TextWrapped("%s", layerError_.c_str());
+        }
+
+        const auto renderMapChoice = [&](const char* label, std::string value,
+                                         ElevationLayer* layer) {
+            ImGui::TextUnformatted(label);
+            ImGui::SameLine();
+            const ImVec2 previewSize(98.0F, ImGui::GetFrameHeight());
+            ImGui::InvisibleButton(label, previewSize);
+            auto* drawList = ImGui::GetWindowDrawList();
+            const ImVec2 minimum = ImGui::GetItemRectMin();
+            const ImVec2 maximum = ImGui::GetItemRectMax();
+            if (!colorMapDirectory_.empty()) {
+                try {
+                    const auto stops = GetColorMap(value).GetStops();
+                    constexpr int gradientSegments = 24;
+                    for (int segment = 0; segment < gradientSegments; ++segment) {
+                        const float t = (static_cast<float>(segment) + 0.5F) /
+                                        static_cast<float>(gradientSegments);
+                        const float elevation = -32767.0F + t * 65534.0F;
+                        std::size_t high = 1;
+                        while (high + 1 < stops.size() && elevation > stops[high].x) {
+                            ++high;
+                        }
+                        const auto& lowStop = stops[high - 1];
+                        const auto& highStop = stops[high];
+                        const float blend = (elevation - lowStop.x) /
+                                            (highStop.x - lowStop.x);
+                        const glm::vec3 color = glm::mix(
+                            glm::vec3(lowStop.y, lowStop.z, lowStop.w),
+                            glm::vec3(highStop.y, highStop.z, highStop.w),
+                            std::clamp(blend, 0.0F, 1.0F));
+                        const float x0 = minimum.x + previewSize.x * segment /
+                                                     gradientSegments;
+                        const float x1 = minimum.x + previewSize.x * (segment + 1) /
+                                                     gradientSegments;
+                        drawList->AddRectFilled(
+                            ImVec2(x0, minimum.y), ImVec2(x1, maximum.y),
+                            ImGui::ColorConvertFloat4ToU32(
+                                ImVec4(color.r, color.g, color.b, 1.0F)));
+                    }
+                } catch (const std::exception& error) {
+                    layerError_ = error.what();
+                }
+            }
+            drawList->AddRect(minimum, maximum, ImGui::GetColorU32(ImGuiCol_Border));
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", value.c_str());
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            const std::string comboId = std::string("##") + label;
+            if (ImGui::BeginCombo(comboId.c_str(), value.c_str())) {
+                for (const auto& path : colorMaps()) {
+                    const std::string name = path.filename().string();
+                    if (ImGui::Selectable(name.c_str(), name == value)) {
+                        value = name;
+                        if (std::string_view(label) == "Legend") {
+                            layer->SetColorMap(name);
+                        } else {
+                            layer->SetSelectionColorMap(name);
+                        }
+                        if (grid.HasActiveLayer() && layer == &grid.GetElevationLayer()) {
+                            try {
+                                ApplyActiveLayerColorMaps(grid, renderer);
+                                layerError_.clear();
+                            } catch (const std::exception& error) {
+                                layerError_ = error.what();
+                            }
+                        }
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        };
+
+        bool reordered = false;
+        for (std::size_t index = 0; index < grid.GetLayers().size(); ++index) {
+            auto& layer = *grid.GetLayers()[index];
+            ImGui::PushID(static_cast<int>(index));
+            const bool isActive = grid.HasActiveLayer() &&
+                                  grid.GetActiveLayer().GetName() == layer.GetName();
+            bool visible = layer.IsVisible();
+            if (ImGui::Checkbox("##visible", &visible)) {
+                if (isActive && !visible) {
+                    if (stroke_ || selectionStroke_) {
+                        layerError_ = "Finish the current stroke before hiding the active layer.";
+                    } else {
+                        grid.SetLayerVisible(layer.GetName(), false);
+                        brushTools_.SetActive(false);
+                        undoStack_.Clear();
+                    }
+                } else {
+                    grid.SetLayerVisible(layer.GetName(), visible);
+                }
+            }
+            ImGui::SameLine();
+            const std::string activeLabel = std::string(layer.GetName()) +
+                                            (isActive ? " *" : "");
+            if (ImGui::Selectable(activeLabel.c_str(), isActive)) {
+                if (!isActive) {
+                    try {
+                        if (stroke_ || selectionStroke_) {
+                            throw std::logic_error(
+                                "Finish the current stroke before switching layers.");
+                        }
+                        undoStack_.Clear();
+                        grid.SetActiveLayer(layer.GetName());
+                        ApplyActiveLayerColorMaps(grid, renderer);
+                        renderer.UpdateSelection(grid.GetSnapshot()->GetVertices(),
+                                                 grid.GetSnapshot()->HasSelection());
+                        layerError_.clear();
+                    } catch (const std::exception& error) {
+                        layerError_ = error.what();
+                    }
+                }
+            }
+            if (ImGui::BeginDragDropSource()) {
+                const std::string payload(layer.GetName());
+                ImGui::SetDragDropPayload("OSWALD_LAYER", payload.c_str(), payload.size() + 1);
+                ImGui::TextUnformatted(payload.c_str());
+                ImGui::EndDragDropSource();
+            }
+            if (ImGui::BeginDragDropTarget()) {
+                if (const auto* payload = ImGui::AcceptDragDropPayload("OSWALD_LAYER")) {
+                    const std::string source(static_cast<const char*>(payload->Data));
+                    try {
+                        grid.MoveLayer(source, index);
+                        reordered = true;
+                    } catch (const std::exception& error) {
+                        layerError_ = error.what();
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+
+            if (nameEditLayer_ != &layer) {
+                nameEditLayer_ = &layer;
+                std::fill(layerNameBuffer_.begin(), layerNameBuffer_.end(), '\0');
+                const auto name = layer.GetName();
+                std::copy_n(name.data(), std::min(name.size(), layerNameBuffer_.size() - 1),
+                            layerNameBuffer_.begin());
+            }
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputText("Name", layerNameBuffer_.data(), layerNameBuffer_.size())) {
+                try {
+                    grid.RenameLayer(layer.GetName(), layerNameBuffer_.data());
+                    layerError_.clear();
+                } catch (const std::exception& error) {
+                    layerError_ = error.what();
+                }
+            }
+            ImGui::Text("Type: Elevation (Raster)");
+            if (ImGui::TreeNode("Properties")) {
+                constexpr std::array blendModes{"Overlay", "Add", "Subtract", "Multiply",
+                                                "Minimum", "Maximum"};
+                int blendMode = static_cast<int>(layer.GetBlendMode());
+                if (ImGui::Combo("Blend mode", &blendMode, blendModes.data(),
+                                 static_cast<int>(blendModes.size()))) {
+                    layer.SetBlendMode(static_cast<LayerBlendMode>(blendMode));
+                }
+                std::array<char, 1024> description{};
+                const auto descriptionText = layer.GetDescription();
+                std::copy_n(descriptionText.data(),
+                            std::min(descriptionText.size(), description.size() - 1),
+                            description.begin());
+                if (ImGui::InputTextMultiline("Description", description.data(),
+                                              description.size(), ImVec2(-FLT_MIN, 54.0F))) {
+                    layer.SetDescription(description.data());
+                }
+                ImGui::BeginDisabled(layer.GetType() != LayerType::Raster);
+                renderMapChoice("Legend", std::string(layer.GetColorMap()), &layer);
+                renderMapChoice("Selected legend",
+                                std::string(layer.GetSelectionColorMap()), &layer);
+                if (!layer.GetValues().empty()) {
+                    std::array<float, 32> bins{};
+                    for (const float value : layer.GetValues()) {
+                        const auto bin = static_cast<std::size_t>(std::clamp(
+                            (value + 32767.0F) / 65534.0F * static_cast<float>(bins.size()),
+                            0.0F, static_cast<float>(bins.size() - 1)));
+                        bins[bin] += 1.0F;
+                    }
+                    float peakFrequency = 0.0F;
+                    const float valueCount = static_cast<float>(layer.GetValues().size());
+                    for (auto& frequency : bins) {
+                        frequency /= valueCount;
+                        peakFrequency = std::max(peakFrequency, frequency);
+                    }
+                    ImGui::TextUnformatted("Hypsography");
+                    ImGui::PlotHistogram("##hypsography", bins.data(),
+                                         static_cast<int>(bins.size()), 0, nullptr,
+                                         0.0F, peakFrequency,
+                                         ImVec2(-FLT_MIN, 64.0F));
+                }
+                ImGui::EndDisabled();
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+            if (reordered) {
+                break;
+            }
+        }
+    }
+
+    if (ImGui::BeginPopupModal("New Layer", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputText("Name", newLayerName_.data(), newLayerName_.size());
+        constexpr const char* layerTypes[]{"Elevation (Raster)"};
+        int layerType = 0;
+        ImGui::BeginDisabled();
+        ImGui::Combo("Layer type", &layerType, layerTypes, 1);
+        ImGui::EndDisabled();
+        if (colorMapDirectory_.empty()) {
+            ImGui::TextDisabled("No colour maps are available.");
+        } else {
+            const auto maps = colorMaps();
+            const auto choose = [&](const char* label, std::string& selected) {
+                if (ImGui::BeginCombo(label, selected.c_str())) {
+                    for (const auto& path : maps) {
+                        const std::string name = path.filename().string();
+                        if (ImGui::Selectable(name.c_str(), selected == name)) {
+                            selected = name;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            };
+            choose("Legend", newLayerColorMap_);
+            choose("Selected legend", newLayerSelectionColorMap_);
+        }
+        if (ImGui::Button("Create")) {
+            try {
+                if (stroke_ || selectionStroke_) {
+                    throw std::logic_error(
+                        "Finish the current stroke before adding a layer.");
+                }
+                auto& created = grid.AddElevationLayer(newLayerName_.data(),
+                    newLayerColorMap_, newLayerSelectionColorMap_);
+                undoStack_.Clear();
+                nameEditLayer_ = &created;
+                ApplyActiveLayerColorMaps(grid, renderer);
+                renderer.UpdateSelection(grid.GetSnapshot()->GetVertices(),
+                                         grid.GetSnapshot()->HasSelection());
+                layerError_.clear();
+                ImGui::CloseCurrentPopup();
+            } catch (const std::exception& error) {
+                layerError_ = error.what();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (ImGui::BeginPopupModal("Delete Layer", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("Delete layer \"%s\"?", pendingLayerDeletion_.c_str());
+        if (ImGui::Button("Delete")) {
+            try {
+                if (stroke_ || selectionStroke_) {
+                    throw std::logic_error(
+                        "Finish the current stroke before deleting a layer.");
+                }
+                const bool wasActive = grid.HasActiveLayer() &&
+                    grid.GetActiveLayer().GetName() == pendingLayerDeletion_;
+                grid.RemoveLayer(pendingLayerDeletion_);
+                if (wasActive) {
+                    undoStack_.Clear();
+                    ApplyActiveLayerColorMaps(grid, renderer);
+                    renderer.UpdateSelection(grid.GetSnapshot()->GetVertices(),
+                                             grid.GetSnapshot()->HasSelection());
+                }
+                nameEditLayer_ = nullptr;
+                layerError_.clear();
+                ImGui::CloseCurrentPopup();
+            } catch (const std::exception& error) {
+                layerError_ = error.what();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::End();
+    if (colorMapDirectory_.empty()) {
+        renderer.ClearLayerStack();
+        renderer.SetLayerVisible(grid.HasActiveLayer() && grid.GetActiveLayer().IsVisible());
+        return;
+    }
+    try {
+        std::vector<GlobeRenderLayer> renderLayers;
+        renderLayers.reserve(grid.GetLayers().size());
+        for (const auto& layer : grid.GetLayers()) {
+            renderLayers.emplace_back(*layer, GetColorMap(std::string(layer->GetColorMap())),
+                GetColorMap(std::string(layer->GetSelectionColorMap())));
+        }
+        renderer.SetLayerStack(std::move(renderLayers));
+        renderer.SetLayerVisible(true);
+    } catch (const std::exception& error) {
+        renderer.ClearLayerStack();
+        renderer.SetLayerVisible(true);
+        layerError_ = error.what();
+    }
+}
+
 void UIManager::FinishPolygonSelection(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (polygonPoints_.size() >= 3) {
         const auto snapshot = grid.GetSnapshot();
@@ -655,8 +1039,7 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
             Stroke stroke;
             const auto snapshot = grid.GetSnapshot();
             stroke.original.reserve(snapshot->GetVertices().size());
-            stroke.renderVertices = snapshot->GetVertices();
-            for (const auto& vertex : stroke.renderVertices) {
+            for (const auto& vertex : snapshot->GetVertices()) {
                 stroke.original.push_back(vertex.elevation);
             }
             stroke.working = stroke.original;
@@ -668,30 +1051,31 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
         !captured && cursorCenter) {
         const auto snapshot = grid.GetSnapshot();
         const auto& tool = brushTools_.GetSelectedTool();
+        std::vector<std::size_t> changed;
         if (tool.IsContinuous()) {
-            tool.Apply(*snapshot, *cursorCenter, stroke_->working, brushTools_.GetSettings(),
-                       io.DeltaTime);
+            changed = tool.Apply(*snapshot, *cursorCenter, stroke_->working,
+                                 brushTools_.GetSettings(), io.DeltaTime);
         } else {
             // Evaluate each dab against the pre-stroke terrain and keep the strongest
             // effect per vertex, so overlapping or stationary dabs never compound.
             if (stroke_->scratch.empty()) {
                 stroke_->scratch = stroke_->original;
             }
-            const auto changed = tool.Apply(*snapshot, *cursorCenter, stroke_->scratch,
-                                            brushTools_.GetSettings(), io.DeltaTime);
-            for (const auto index : changed) {
+            const auto dabChanged = tool.Apply(*snapshot, *cursorCenter, stroke_->scratch,
+                                               brushTools_.GetSettings(), io.DeltaTime);
+            for (const auto index : dabChanged) {
                 const float original = stroke_->original[index];
                 if (std::abs(stroke_->scratch[index] - original) >
                     std::abs(stroke_->working[index] - original)) {
                     stroke_->working[index] = stroke_->scratch[index];
+                    changed.push_back(index);
                 }
                 stroke_->scratch[index] = original;
             }
         }
-        for (std::size_t i = 0; i < stroke_->working.size(); ++i) {
-            stroke_->renderVertices[i].elevation = stroke_->working[i];
+        if (!changed.empty()) {
+            renderer.UpdateLayerElevations(grid.GetElevationLayer(), stroke_->working, changed);
         }
-        renderer.UpdateElevations(stroke_->renderVertices);
     }
 
     if (brushTools_.IsActive() && cursorCenter && !captured) {
@@ -1021,6 +1405,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
+            ImGui::BeginDisabled(!grid.HasActiveLayer());
             if (ImGui::BeginMenu("Legend")) {
                 const auto renderColorMapChoices = [&](const char* label, bool selected) {
                     if (!ImGui::BeginMenu(label)) {
@@ -1053,9 +1438,11 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                                     if (selected) {
                                         renderer.SetSelectionColorMap(map);
                                         selectionColorMapName_ = name;
+                                        grid.GetElevationLayer().SetSelectionColorMap(name);
                                     } else {
                                         renderer.SetColorMap(map);
                                         colorMapName_ = name;
+                                        grid.GetElevationLayer().SetColorMap(name);
                                     }
                                 } catch (const std::exception& error) {
                                     legendError_ = error.what();
@@ -1073,42 +1460,13 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                 renderColorMapChoices("Selected points", true);
                 ImGui::EndMenu();
             }
+            ImGui::EndDisabled();
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
     }
 
-    const auto& io = ImGui::GetIO();
-    if (!io.WantCaptureMouse && isInsideViewport(io.MousePos, io.DisplaySize)) {
-        const auto point = inspectHoverPoint(io.MousePos, io.DisplaySize, modelMatrix, zoom);
-        if (point) {
-            const auto normalized = glm::normalize(*point);
-            const double latitude = glm::degrees(std::atan2(normalized.z,
-                std::sqrt(normalized.x * normalized.x + normalized.y * normalized.y)));
-            const double longitude = glm::degrees(std::atan2(normalized.y, normalized.x));
-            const auto snapshot = grid.GetSnapshot();
-            const auto nearestIndex = snapshot->FindNearest(normalized);
-            const auto& vertex = snapshot->GetVertices()[nearestIndex];
-            const double elevation = static_cast<double>(vertex.elevation);
-            const double feet = elevation * 3.28083989501312;
-            const std::string label = "Lat " + std::to_string(latitude) + "° / Lon " +
-                                     std::to_string(longitude) + "°\nElev " +
-                                     std::to_string(elevation) + " m / " +
-                                     std::to_string(feet) + " ft";
-            ImGui::SetNextWindowPos(ImVec2(std::min(io.MousePos.x + 18.0F, io.DisplaySize.x - 260.0F),
-                                           std::min(io.MousePos.y + 18.0F, io.DisplaySize.y - 80.0F)),
-                                    ImGuiCond_Always);
-            ImGui::SetNextWindowBgAlpha(0.7F);
-            if (ImGui::Begin("Hover Readout", nullptr,
-                             ImGuiWindowFlags_NoDecoration |
-                             ImGuiWindowFlags_AlwaysAutoResize |
-                             ImGuiWindowFlags_NoSavedSettings |
-                             ImGuiWindowFlags_NoFocusOnAppearing)) {
-                ImGui::TextUnformatted(label.c_str());
-                ImGui::End();
-            }
-        }
-    }
+    RenderLayerPanel(grid, renderer);
 
     if (legendErrorOpen_) {
         ImGui::OpenPopup("Legend Error");
@@ -1339,6 +1697,39 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     if (!valueSelectionDialog && !fillFilterDialog) {
         ProcessBrushInput(grid, renderer, modelMatrix, zoom);
         ProcessSelectionInput(grid, renderer, modelMatrix, zoom);
+    }
+
+    const auto& io = ImGui::GetIO();
+    if (grid.HasActiveLayer() && !io.WantCaptureMouse &&
+        isInsideViewport(io.MousePos, io.DisplaySize)) {
+        const auto point = inspectHoverPoint(io.MousePos, io.DisplaySize, modelMatrix, zoom);
+        if (point) {
+            const auto normalized = glm::normalize(*point);
+            const double latitude = glm::degrees(std::atan2(normalized.z,
+                std::sqrt(normalized.x * normalized.x + normalized.y * normalized.y)));
+            const double longitude = glm::degrees(std::atan2(normalized.y, normalized.x));
+            const auto snapshot = grid.GetSnapshot();
+            const auto nearestIndex = snapshot->FindNearest(normalized);
+            const double elevation = grid.GetActiveCompositedElevation(nearestIndex,
+                stroke_ ? std::span<const float>(stroke_->working) : std::span<const float>{});
+            const double feet = elevation * 3.28083989501312;
+            const std::string label = "Lat " + std::to_string(latitude) + "° / Lon " +
+                                     std::to_string(longitude) + "°\nElev " +
+                                     std::to_string(elevation) + " m / " +
+                                     std::to_string(feet) + " ft";
+            ImGui::SetNextWindowPos(ImVec2(std::min(io.MousePos.x + 18.0F, io.DisplaySize.x - 260.0F),
+                                           std::min(io.MousePos.y + 18.0F, io.DisplaySize.y - 80.0F)),
+                                    ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.7F);
+            if (ImGui::Begin("Hover Readout", nullptr,
+                             ImGuiWindowFlags_NoDecoration |
+                             ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoFocusOnAppearing)) {
+                ImGui::TextUnformatted(label.c_str());
+            }
+            ImGui::End();
+        }
     }
     return requestExit;
 }

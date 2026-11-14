@@ -101,6 +101,35 @@ void testDoubleClickRecentering() {
           "Ray miss unexpectedly changed the camera.");
 }
 
+void testEquirectangularNavigation() {
+    CameraController camera;
+    camera.SetProjection(ViewProjection::Equirectangular);
+    camera.HandleMouseButton(true, 400.0, 200.0, 1.0, 800, 400, false, false);
+    camera.HandleCursorPosition(500.0, 300.0, true, false);
+    check(std::abs(camera.GetMapCenterLongitude() + std::acos(-1.0) / 4.0) < 1e-6 &&
+        std::abs(camera.GetMapCenterLatitude() - std::acos(-1.0) / 4.0) < 1e-6,
+        "Equirectangular dragging did not pan in longitude and latitude.");
+    camera.HandleCursorPosition(500.0, 10000.0, true, false);
+    check(std::abs(camera.GetMapCenterLatitude() - std::acos(-1.0) / 2.0) < 1e-6,
+        "Equirectangular panning wrapped past a pole.");
+    camera.HandleMouseButton(false, 500.0, 10000.0, 1.1, 800, 400, false, false);
+
+    CameraController recentered;
+    recentered.SetProjection(ViewProjection::Equirectangular);
+    recentered.HandleMouseButton(true, 600.0, 100.0, 2.0, 800, 400, false);
+    recentered.HandleMouseButton(false, 600.0, 100.0, 2.05, 800, 400, false);
+    recentered.HandleMouseButton(true, 600.0, 100.0, 2.2, 800, 400, false);
+    check(std::abs(recentered.GetMapCenterLongitude() - std::acos(-1.0) / 2.0) < 1e-6 &&
+        std::abs(recentered.GetMapCenterLatitude() - std::acos(-1.0) / 4.0) < 1e-6,
+        "Map double-click did not recenter on the clicked coordinate.");
+
+    camera.HandleMouseButton(true, 400.0, 200.0, 3.0, 800, 400, false, false);
+    camera.HandleCursorPosition(10000.0, 200.0, true, false);
+    check(camera.GetMapCenterLongitude() >= -std::acos(-1.0) &&
+        camera.GetMapCenterLongitude() < std::acos(-1.0),
+        "Equirectangular horizontal panning did not wrap around the world.");
+}
+
 } // namespace
 
 int main() {
@@ -109,6 +138,7 @@ int main() {
         testPitchClampAndZoom();
         testMiddleButtonNavigation();
         testDoubleClickRecentering();
+        testEquirectangularNavigation();
         std::cout << "Camera controller tests passed.\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

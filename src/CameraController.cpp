@@ -12,12 +12,20 @@ namespace {
 constexpr float pitchLimit = 1.45F;
 constexpr double doubleClickSeconds = 0.35;
 constexpr double doubleClickDistance = 6.0;
+constexpr double pi = 3.14159265358979323846;
+
+double wrapLongitude(double longitude) {
+    longitude = std::remainder(longitude, 2.0 * pi);
+    return longitude >= pi ? longitude - 2.0 * pi : longitude;
+}
 
 } // namespace
 
 void CameraController::HandleMouseButton(bool pressed, double cursorX, double cursorY,
                                          double time, int viewportWidth, int viewportHeight,
                                          bool captureMouse, bool allowRecentering) {
+    viewportWidth_ = viewportWidth;
+    viewportHeight_ = viewportHeight;
     if (!std::isfinite(cursorX) || !std::isfinite(cursorY) || !std::isfinite(time)) {
         dragging_ = false;
         lastClickTime_ = -1.0;
@@ -73,10 +81,22 @@ void CameraController::HandleCursorPosition(double cursorX, double cursorY,
     if (dx * dx + dy * dy > 1.0) {
         lastClickTime_ = -1.0;
     }
-    constexpr float rotationPerPixel = 0.005F;
-    yaw_ += static_cast<float>(dx) * rotationPerPixel;
-    pitch_ = std::clamp(pitch_ + static_cast<float>(dy) * rotationPerPixel,
-                        -pitchLimit, pitchLimit);
+    if (projection_ == ViewProjection::Equirectangular) {
+        if (viewportWidth_ > 0 && viewportHeight_ > 0) {
+            const double aspect = static_cast<double>(viewportWidth_) / viewportHeight_;
+            const double vertical = std::max(pi / 2.0, pi / aspect) / zoom_;
+            const double horizontal = vertical * aspect;
+            mapCenterLongitude_ = wrapLongitude(mapCenterLongitude_ - dx * 2.0 * horizontal /
+                                                viewportWidth_);
+            mapCenterLatitude_ = std::clamp(mapCenterLatitude_ + dy * 2.0 * vertical /
+                                            viewportHeight_, -pi / 2.0, pi / 2.0);
+        }
+    } else {
+        constexpr float rotationPerPixel = 0.005F;
+        yaw_ += static_cast<float>(dx) * rotationPerPixel;
+        pitch_ = std::clamp(pitch_ + static_cast<float>(dy) * rotationPerPixel,
+                            -pitchLimit, pitchLimit);
+    }
     lastCursorX_ = cursorX;
     lastCursorY_ = cursorY;
 }
@@ -93,7 +113,12 @@ void CameraController::Update(float deltaSeconds) {
         return;
     }
     if (autoSpin_) {
-        yaw_ += glm::radians(spinRate_ * deltaSeconds);
+        const float delta = glm::radians(spinRate_ * deltaSeconds);
+        if (projection_ == ViewProjection::Equirectangular) {
+            mapCenterLongitude_ = wrapLongitude(mapCenterLongitude_ + delta);
+        } else {
+            yaw_ += delta;
+        }
     }
 }
 
@@ -101,6 +126,14 @@ void CameraController::Reset() {
     yaw_ = 0.0F;
     pitch_ = 0.0F;
     zoom_ = 1.0F;
+    mapCenterLongitude_ = 0.0;
+    mapCenterLatitude_ = 0.0;
+    dragging_ = false;
+    lastClickTime_ = -1.0;
+}
+
+void CameraController::SetProjection(ViewProjection projection) {
+    projection_ = projection;
     dragging_ = false;
     lastClickTime_ = -1.0;
 }
@@ -117,6 +150,10 @@ void CameraController::SetSpinRate(float degreesPerSecond) {
 }
 
 glm::mat4 CameraController::GetModelMatrix() const {
+    if (projection_ == ViewProjection::Equirectangular) {
+        return glm::translate(glm::mat4(1.0F),
+                              glm::vec3(-mapCenterLongitude_, -mapCenterLatitude_, 0.0));
+    }
     const auto yaw = glm::rotate(glm::mat4(1.0F), yaw_, glm::vec3(0.0F, 0.0F, 1.0F));
     const auto pitch = glm::rotate(glm::mat4(1.0F), pitch_, glm::vec3(1.0F, 0.0F, 0.0F));
     return pitch * yaw;
@@ -127,6 +164,21 @@ bool CameraController::Recenter(double cursorX, double cursorY,
     if (viewportWidth <= 0 || viewportHeight <= 0 || !std::isfinite(cursorX) ||
         !std::isfinite(cursorY)) {
         return false;
+    }
+
+    if (projection_ == ViewProjection::Equirectangular) {
+        const double aspect = static_cast<double>(viewportWidth) / viewportHeight;
+        const double vertical = std::max(pi / 2.0, pi / aspect) / zoom_;
+        const double horizontal = vertical * aspect;
+        const double latitude = (1.0 - 2.0 * cursorY / viewportHeight) * vertical +
+                                mapCenterLatitude_;
+        if (latitude < -pi / 2.0 || latitude > pi / 2.0) {
+            return false;
+        }
+        mapCenterLongitude_ = wrapLongitude((2.0 * cursorX / viewportWidth - 1.0) * horizontal +
+                                            mapCenterLongitude_);
+        mapCenterLatitude_ = latitude;
+        return true;
     }
 
     const float aspect = static_cast<float>(viewportWidth) / viewportHeight;

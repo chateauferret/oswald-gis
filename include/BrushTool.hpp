@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
@@ -36,7 +37,7 @@ struct BrushSettings {
     float value = 0.0F;
 };
 
-struct SimplexNoiseSettings {
+struct NoiseSettings {
     enum class Operation {
         Replace,
         Add,
@@ -49,11 +50,41 @@ struct SimplexNoiseSettings {
     float rangeBetween = -32767.0F;
     float rangeAnd = 32767.0F;
     std::uint64_t seed = 0;
+    bool domainWarpEnabled = false;
+    float warpFrequency = 4.0F;
+    float warpStrength = 1.25F;
+    float warpLacunarity = 2.0F;
+    float warpPersistence = 0.5F;
+    int warpOctaves = 3;
+};
+
+struct FractalNoiseSettings : NoiseSettings {
     float frequency = 4.0F;
     float lacunarity = 2.0F;
     float persistence = 0.5F;
     int octaves = 4;
+};
+
+struct SimplexNoiseSettings : FractalNoiseSettings {
+    using Operation = NoiseSettings::Operation;
     bool billowed = false;
+};
+
+struct ValueNoiseSettings : FractalNoiseSettings {
+    enum class Interpolation { Linear, Cubic, Quintic };
+    float amplitude = 1.0F;
+    Interpolation interpolation = Interpolation::Quintic;
+};
+
+struct RidgeNoiseSettings : FractalNoiseSettings {
+    float ridgeOffset = 1.0F;
+    float gainExponent = 1.0F;
+};
+
+struct PowerLawNoiseSettings : NoiseSettings {
+    float frequency = 4.0F;
+    float spectralExponent = 2.0F;
+    int gridResolution = 32;
 };
 
 struct GaussianBlurSettings {
@@ -112,6 +143,56 @@ public:
 
 private:
     SimplexNoiseSettings settings_;
+};
+
+class ValueNoiseBrushTool final : public BrushTool {
+public:
+    std::string_view GetName() const override { return "Value Noise"; }
+    bool IsContinuous() const override { return false; }
+    std::vector<std::size_t> Apply(
+        const SphericalGridSnapshot& grid, glm::dvec3 center,
+        std::vector<float>& elevations, const BrushSettings& settings,
+        double elapsedSeconds) const override;
+    ValueNoiseSettings& GetSettings() { return settings_; }
+    const ValueNoiseSettings& GetSettings() const { return settings_; }
+
+private:
+    ValueNoiseSettings settings_;
+};
+
+class RidgeNoiseBrushTool final : public BrushTool {
+public:
+    std::string_view GetName() const override { return "Ridge Noise"; }
+    bool IsContinuous() const override { return false; }
+    std::vector<std::size_t> Apply(
+        const SphericalGridSnapshot& grid, glm::dvec3 center,
+        std::vector<float>& elevations, const BrushSettings& settings,
+        double elapsedSeconds) const override;
+    RidgeNoiseSettings& GetSettings() { return settings_; }
+    const RidgeNoiseSettings& GetSettings() const { return settings_; }
+
+private:
+    RidgeNoiseSettings settings_;
+};
+
+class PowerLawNoiseBrushTool final : public BrushTool {
+public:
+    std::string_view GetName() const override { return "Power-Law Spectral Noise"; }
+    bool IsContinuous() const override { return false; }
+    std::vector<std::size_t> Apply(
+        const SphericalGridSnapshot& grid, glm::dvec3 center,
+        std::vector<float>& elevations, const BrushSettings& settings,
+        double elapsedSeconds) const override;
+    PowerLawNoiseSettings& GetSettings() { return settings_; }
+    const PowerLawNoiseSettings& GetSettings() const { return settings_; }
+
+private:
+    PowerLawNoiseSettings settings_;
+    mutable std::mutex cacheMutex_;
+    mutable std::shared_ptr<const std::vector<float>> cachedField_;
+    mutable std::uint64_t cachedSeed_ = 0;
+    mutable int cachedResolution_ = 0;
+    mutable float cachedExponent_ = 0.0F;
 };
 
 class GaussianBlurBrushTool final : public BrushTool {

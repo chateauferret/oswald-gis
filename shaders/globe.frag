@@ -1,8 +1,8 @@
 #version 450 core
 
-in float vElevation;
-in float vSelectionWeight;
-in vec3 vObjectPosition;
+in float gElevation;
+in float gSelectionWeight;
+in vec3 gObjectPosition;
 
 uniform sampler1D uColorLut;
 uniform sampler1D uSelectionColorLut;
@@ -12,6 +12,7 @@ uniform float uGraticuleSpacing;
 uniform vec3 uViewDirectionObject;
 uniform vec3 uGraticuleColor;
 uniform vec3 uHighlightedGraticuleColor;
+uniform bool uEquirectangular;
 
 out vec4 FragColor;
 
@@ -51,13 +52,13 @@ float highlightedLine(float angle) {
 }
 
 void main() {
-    vec3 color = GetHypsometricColor(vElevation, uColorLut);
+    vec3 color = GetHypsometricColor(gElevation, uColorLut);
     if (uSelectionActive) {
-        color = mix(GetHypsometricColor(vElevation, uSelectionColorLut), color,
-                    clamp(vSelectionWeight, 0.0, 1.0));
+        color = mix(GetHypsometricColor(gElevation, uSelectionColorLut), color,
+                clamp(gSelectionWeight, 0.0, 1.0));
     }
 
-    vec3 normal = normalize(vObjectPosition);
+    vec3 normal = normalize(gObjectPosition);
     float latitude = asin(clamp(normal.z, -1.0, 1.0));
     float longitude = atan(normal.x, -normal.y);
     float graticule = 0.0;
@@ -72,8 +73,10 @@ void main() {
     color = mix(color, uGraticuleColor, graticule);
     color = mix(color, uHighlightedGraticuleColor, max(equator, primeMeridian));
 
-    float facing = max(dot(normal, normalize(uViewDirectionObject)), 0.0);
-    float rim = pow(1.0 - facing, 3.0);
-    color = mix(color, vec3(0.24, 0.62, 0.95), rim * 0.35);
+    if (!uEquirectangular) {
+        float facing = max(dot(normal, normalize(uViewDirectionObject)), 0.0);
+        float rim = pow(1.0 - facing, 3.0);
+        color = mix(color, vec3(0.24, 0.62, 0.95), rim * 0.35);
+    }
     FragColor = vec4(color, 1.0);
 }

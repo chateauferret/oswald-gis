@@ -54,6 +54,8 @@ public:
     bool IsWireframeEnabled() const { return wireframeEnabled_; }
     void SetGraticuleEnabled(bool enabled);
     bool IsGraticuleEnabled() const { return graticuleEnabled_; }
+    void SetEquirectangular(bool enabled) { equirectangular_ = enabled; }
+    bool IsEquirectangular() const { return equirectangular_; }
     void Draw(int framebufferWidth, int framebufferHeight,
               const glm::mat4& modelMatrix = glm::mat4(1.0F), float zoom = 1.0F);
 
@@ -100,15 +102,18 @@ private:
     bool selectionActive_ = false;
     bool wireframeEnabled_ = false;
     bool graticuleEnabled_ = true;
+    bool equirectangular_ = false;
     glm::vec3 graticuleColor_{0.75F};
     glm::vec3 highlightedGraticuleColor_{1.0F};
     glm::vec3 wireframeColor_{1.0F, 1.0F, 0.0F};
     glm::vec3 wireframeSelectedColor_{0.5F, 0.5F, 0.0F};
     GLint wireMatrixLocation_ = -1;
     GLint wireDepthBiasLocation_ = -1;
+    GLint equirectangularLocation_ = -1;
     GLint wireSelectionActiveLocation_ = -1;
     GLint wireUnselectedColorLocation_ = -1;
     GLint wireSelectedColorLocation_ = -1;
+    GLint wireEquirectangularLocation_ = -1;
     GLsizei wireVertexCount_ = 0;
     // Delaunay sites on either side of each Voronoi edge, used to blend selection weights.
     std::vector<std::array<std::uint32_t, 2>> wireSites_;

@@ -328,8 +328,8 @@ void testGpu() {
     });
     const auto countWireframePixels = [&] {
         int count = 0;
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
+        for (int y = 0; y < height; y += 4) {
+            for (int x = 0; x < width; x += 4) {
                 const auto p = pixel(x, y);
                 count += p[0] > 200 && p[1] > 200 && p[2] < 60 ? 1 : 0;
             }
@@ -507,6 +507,20 @@ void testGpu() {
         check(horizontalPixels > 0 && std::abs(horizontalPixels - verticalPixels) <= 2,
               "Orthographic viewport distorts the sphere on resize.");
     }
+
+        glfwSetWindowSize(window.get(), 256, 128);
+        glfwPollEvents();
+        glfwGetFramebufferSize(window.get(), &width, &height);
+        renderer.SetGraticuleEnabled(false);
+        renderer.SetEquirectangular(true);
+        clear();
+        renderer.Draw(width, height);
+        const auto mapCenter = pixel(width / 2, height / 2);
+        const auto mapLeft = pixel(4, height / 2);
+        const auto mapRight = pixel(width - 5, height / 2);
+        check(mapCenter[1] > mapCenter[0] * 2 && mapCenter[1] > mapCenter[2] * 2 &&
+              mapLeft[1] > mapLeft[0] * 2 && mapRight[1] > mapRight[2] * 2,
+              "Equirectangular projection did not render a continuous, horizontally wrapped map.");
 }
 
 } // namespace

@@ -2,6 +2,8 @@
 
 #include <glm/glm.hpp>
 
+enum class ViewProjection { Orthographic, Equirectangular };
+
 class CameraController {
 public:
     void HandleMouseButton(bool pressed, double cursorX, double cursorY, double time,
@@ -16,6 +18,10 @@ public:
     bool IsAutoSpinEnabled() const { return autoSpin_; }
     void SetSpinRate(float degreesPerSecond);
     float GetSpinRate() const { return spinRate_; }
+    void SetProjection(ViewProjection projection);
+    ViewProjection GetProjection() const { return projection_; }
+    double GetMapCenterLongitude() const { return mapCenterLongitude_; }
+    double GetMapCenterLatitude() const { return mapCenterLatitude_; }
 
     glm::mat4 GetModelMatrix() const;
     float GetZoom() const { return zoom_; }
@@ -30,6 +36,11 @@ private:
     float zoom_ = 1.0F;
     float spinRate_ = 16.0F;
     bool autoSpin_ = false;
+    ViewProjection projection_ = ViewProjection::Orthographic;
+    double mapCenterLongitude_ = 0.0;
+    double mapCenterLatitude_ = 0.0;
+    int viewportWidth_ = 0;
+    int viewportHeight_ = 0;
     double lastCursorX_ = 0.0;
     double lastCursorY_ = 0.0;
     double lastClickX_ = 0.0;

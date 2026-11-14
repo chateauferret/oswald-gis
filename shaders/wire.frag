@@ -1,6 +1,6 @@
 #version 450 core
 
-in float vSelectionWeight;
+in float gSelectionWeight;
 
 uniform bool uSelectionActive;
 uniform vec3 uUnselectedColor;
@@ -12,7 +12,7 @@ void main() {
     vec3 color = uUnselectedColor;
     if (uSelectionActive) {
         // Same blend direction as the elevation colour maps in globe.frag.
-        color = mix(uSelectedColor, uUnselectedColor, clamp(vSelectionWeight, 0.0, 1.0));
+        color = mix(uSelectedColor, uUnselectedColor, clamp(gSelectionWeight, 0.0, 1.0));
     }
     FragColor = vec4(color, 1.0);
 }

@@ -118,7 +118,8 @@ target_include_directories(oswald_view PUBLIC include)
 target_link_libraries(oswald_view PUBLIC oswald_model glad_gl_core_45)
 
 set(OSWALD_RESOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/resources")
-foreach(resource shaders/globe.vert shaders/globe.frag shaders/wire.vert shaders/wire.frag shaders/elevation.comp)
+foreach(resource shaders/globe.vert shaders/globe.geom shaders/globe.frag shaders/wire.vert
+                 shaders/wire.geom shaders/wire.frag shaders/elevation.comp)
     configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
 endforeach()
 file(GLOB OSWALD_COLORMAP_FILES CONFIGURE_DEPENDS

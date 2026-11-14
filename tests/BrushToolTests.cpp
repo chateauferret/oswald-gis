@@ -350,6 +350,146 @@ void testSimplexNoiseValueRange() {
     check(invalidRangeRejected, "Simplex noise accepted an out-of-range noise bound.");
 }
 
+void testPhase18NoiseTools() {
+    SphericalGrid model({1000, 0.0, 53});
+    const auto& grid = *model.GetSnapshot();
+    BrushSettings brushSettings;
+    brushSettings.radius = 20020.0;
+    brushSettings.falloffPercent = 0.0;
+
+    ValueNoiseBrushTool value;
+    auto& valueSettings = value.GetSettings();
+    valueSettings.seed = 13;
+    valueSettings.frequency = 5.0F;
+    valueSettings.octaves = 3;
+    valueSettings.rangeBetween = -1200.0F;
+    valueSettings.rangeAnd = 1800.0F;
+    std::vector<float> valueField(grid.GetVertices().size(), 0.0F);
+    const auto valueChanged = value.Apply(grid, {0, 0, 1}, valueField, brushSettings, 0.0);
+    check(valueChanged.size() == valueField.size() &&
+          *std::min_element(valueField.begin(), valueField.end()) <
+              *std::max_element(valueField.begin(), valueField.end()),
+          "Value noise did not generate a varying field across the full brush.");
+    auto repeatedValue = std::vector<float>(grid.GetVertices().size(), 0.0F);
+    value.Apply(grid, {0, 0, 1}, repeatedValue, brushSettings, 0.0);
+    check(repeatedValue == valueField, "Value noise was not deterministic for a fixed seed.");
+    valueSettings.seed++;
+    auto changedSeed = std::vector<float>(grid.GetVertices().size(), 0.0F);
+    value.Apply(grid, {0, 0, 1}, changedSeed, brushSettings, 0.0);
+    check(changedSeed != valueField, "Value noise ignored its seed.");
+    valueSettings.amplitude = 0.0F;
+    auto zeroAmplitude = std::vector<float>(grid.GetVertices().size(), 0.0F);
+        value.Apply(grid, {0, 0, 1}, zeroAmplitude, brushSettings, 0.0);
+        check(std::all_of(zeroAmplitude.begin(), zeroAmplitude.end(),
+                    [](float height) { return height == 300.0F; }),
+            "Zero value-noise amplitude did not map to the output range midpoint.");
+    valueSettings.amplitude = 1.0F;
+    valueSettings.interpolation = static_cast<ValueNoiseSettings::Interpolation>(99);
+    bool invalidInterpolationRejected = false;
+    try {
+        value.Apply(grid, {0, 0, 1}, zeroAmplitude, brushSettings, 0.0);
+    } catch (const std::invalid_argument&) {
+        invalidInterpolationRejected = true;
+    }
+    check(invalidInterpolationRejected, "Value noise accepted an invalid interpolation mode.");
+
+    RidgeNoiseBrushTool ridge;
+    auto& ridgeSettings = ridge.GetSettings();
+    ridgeSettings.seed = 17;
+    ridgeSettings.frequency = 6.0F;
+    ridgeSettings.octaves = 4;
+    ridgeSettings.persistence = 0.55F;
+    ridgeSettings.ridgeOffset = 1.1F;
+    ridgeSettings.gainExponent = 1.4F;
+    std::vector<float> ridgeField(grid.GetVertices().size(), 0.0F);
+    ridge.Apply(grid, {0, 0, 1}, ridgeField, brushSettings, 0.0);
+    check(*std::min_element(ridgeField.begin(), ridgeField.end()) <
+              *std::max_element(ridgeField.begin(), ridgeField.end()) &&
+          std::all_of(ridgeField.begin(), ridgeField.end(), [](float height) {
+              return height >= -32767.0F && height <= 32767.0F;
+          }), "Ridged multifractal noise did not produce bounded relief.");
+    auto repeatedRidge = std::vector<float>(grid.GetVertices().size(), 0.0F);
+    ridge.Apply(grid, {0, 0, 1}, repeatedRidge, brushSettings, 0.0);
+    check(repeatedRidge == ridgeField, "Ridge noise was not deterministic for a fixed seed.");
+    ridgeSettings.gainExponent = 0.0F;
+    bool invalidGainRejected = false;
+    try {
+        ridge.Apply(grid, {0, 0, 1}, repeatedRidge, brushSettings, 0.0);
+    } catch (const std::invalid_argument&) {
+        invalidGainRejected = true;
+    }
+    check(invalidGainRejected, "Ridge noise accepted an invalid gain exponent.");
+
+    PowerLawNoiseBrushTool spectral;
+    auto& spectralSettings = spectral.GetSettings();
+    spectralSettings.seed = 29;
+    spectralSettings.gridResolution = 16;
+    spectralSettings.frequency = 3.0F;
+    spectralSettings.spectralExponent = 2.0F;
+    std::vector<float> spectralField(grid.GetVertices().size(), 0.0F);
+    spectral.Apply(grid, {0, 0, 1}, spectralField, brushSettings, 0.0);
+    check(*std::min_element(spectralField.begin(), spectralField.end()) <
+              *std::max_element(spectralField.begin(), spectralField.end()) &&
+          std::all_of(spectralField.begin(), spectralField.end(), [](float height) {
+              return std::isfinite(height) && height >= -32767.0F && height <= 32767.0F;
+          }), "Power-law spectral noise did not generate bounded spatial variation.");
+    auto repeatedSpectral = std::vector<float>(grid.GetVertices().size(), 0.0F);
+    spectral.Apply(grid, {0, 0, 1}, repeatedSpectral, brushSettings, 0.0);
+    check(repeatedSpectral == spectralField,
+          "Power-law spectral noise was not deterministic for a fixed seed.");
+    spectralSettings.spectralExponent = 4.0F;
+    auto changedSpectrum = std::vector<float>(grid.GetVertices().size(), 0.0F);
+    spectral.Apply(grid, {0, 0, 1}, changedSpectrum, brushSettings, 0.0);
+    check(changedSpectrum != spectralField,
+          "Changing the spectral exponent did not alter the generated spectrum.");
+    spectralSettings.gridResolution = 12;
+    bool invalidResolutionRejected = false;
+    try {
+        spectral.Apply(grid, {0, 0, 1}, changedSpectrum, brushSettings, 0.0);
+    } catch (const std::invalid_argument&) {
+        invalidResolutionRejected = true;
+    }
+    check(invalidResolutionRejected, "Spectral noise accepted a non-power-of-two grid.");
+
+    const auto checkModifiers = [&](BrushTool& tool, NoiseSettings& parameters) {
+        std::vector<float> unmodified(grid.GetVertices().size(), 0.0F);
+        tool.Apply(grid, {0, 0, 1}, unmodified, brushSettings, 0.0);
+        parameters.domainWarpEnabled = true;
+        parameters.warpFrequency = 4.0F;
+        parameters.warpStrength = 5.0F;
+        parameters.warpOctaves = 1;
+        std::vector<float> warped(grid.GetVertices().size(), 0.0F);
+        tool.Apply(grid, {0, 0, 1}, warped, brushSettings, 0.0);
+        double warpDifference = 0.0;
+        for (std::size_t i = 0; i < warped.size(); ++i) {
+            warpDifference += std::abs(warped[i] - unmodified[i]);
+        }
+        warpDifference /= warped.size();
+        check(warpDifference > 100.0,
+              (std::string("Domain warp change was too small: ") +
+               std::to_string(warpDifference)).c_str());
+
+          parameters.warpOctaves = 5;
+          std::vector<float> multiOctaveWarped(grid.GetVertices().size(), 0.0F);
+          tool.Apply(grid, {0, 0, 1}, multiOctaveWarped, brushSettings, 0.0);
+          check(multiOctaveWarped != warped,
+              "Increasing domain-warp octaves did not change the terrain pattern.");
+
+        std::vector<float> repeat(grid.GetVertices().size(), 0.0F);
+        tool.Apply(grid, {0, 0, 1}, repeat, brushSettings, 0.0);
+          check(repeat == multiOctaveWarped, "Domain-warped noise was not deterministic.");
+    };
+    SimplexNoiseBrushTool simplex;
+    ValueNoiseBrushTool modifiedValue;
+    RidgeNoiseBrushTool modifiedRidge;
+    PowerLawNoiseBrushTool modifiedSpectral;
+    modifiedSpectral.GetSettings().gridResolution = 8;
+    checkModifiers(simplex, simplex.GetSettings());
+    checkModifiers(modifiedValue, modifiedValue.GetSettings());
+    checkModifiers(modifiedRidge, modifiedRidge.GetSettings());
+    checkModifiers(modifiedSpectral, modifiedSpectral.GetSettings());
+}
+
 void testGaussianBlurBrush() {
     SphericalGrid model({1000, 0.0, 31});
     const auto& grid = *model.GetSnapshot();
@@ -516,7 +656,10 @@ void testToolManager() {
     BrushToolManager manager;
     check(manager.GetSelectedTool().GetName() == "Elevation Brush",
           "Manager did not select its default elevation brush.");
-    check(manager.GetTools().size() == 5, "Manager did not register all built-in brush tools.");
+        check(manager.GetTools().size() == 8, "Manager did not register all built-in brush tools.");
+        check(manager.SelectTool("Value Noise") && manager.SelectTool("Ridge Noise") &&
+            manager.SelectTool("Power-Law Spectral Noise"),
+            "Manager could not select the Phase 18 noise tools.");
     manager.GetSettings().value = 1234.0F;
     manager.GetSettings().operation = BrushOperation::Maximum;
     check(manager.SelectTool("Raise/Lower Brush") &&
@@ -553,6 +696,7 @@ int main() {
         testSimplexNoiseSeed();
         testSimplexNoiseOperations();
         testSimplexNoiseValueRange();
+        testPhase18NoiseTools();
         testGaussianBlurBrush();
         testClampBrush();
         testAdditionalBrushSelectionWeights();

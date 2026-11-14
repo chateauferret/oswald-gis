@@ -14,6 +14,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <numbers>
 #include <random>
 #include <stdexcept>
@@ -44,12 +45,20 @@ void showRangeTooltip(int minimum, int maximum) {
     }
 }
 
-glm::mat4 brushMvp(const ImVec2& displaySize, const glm::mat4& modelMatrix, float zoom) {
+glm::mat4 brushMvp(const ImVec2& displaySize, const glm::mat4& modelMatrix, float zoom,
+                   ViewProjection viewProjection) {
     const float aspect = displaySize.x > 0.0F && displaySize.y > 0.0F
                              ? displaySize.x / displaySize.y : 1.0F;
-    const float horizontal = 1.15F * std::max(aspect, 1.0F) / zoom;
-    const float vertical = 1.15F * std::max(1.0F / aspect, 1.0F) / zoom;
+    const float horizontal = viewProjection == ViewProjection::Equirectangular
+        ? std::max(glm::pi<float>(), glm::pi<float>() * aspect / 2.0F) / zoom
+        : 1.15F * std::max(aspect, 1.0F) / zoom;
+    const float vertical = viewProjection == ViewProjection::Equirectangular
+        ? horizontal / aspect
+        : 1.15F * std::max(1.0F / aspect, 1.0F) / zoom;
     const auto projection = glm::ortho(-horizontal, horizontal, -vertical, vertical, 0.1F, 10.0F);
+    if (viewProjection == ViewProjection::Equirectangular) {
+        return projection * modelMatrix;
+    }
     const auto view = glm::lookAt(glm::vec3(0.0F, -3.0F, 0.0F), glm::vec3(0.0F),
                                   glm::vec3(0.0F, 0.0F, 1.0F));
     return projection * view * modelMatrix;
@@ -96,16 +105,54 @@ std::optional<glm::dvec3> pickSphere(const ImVec2& mouse, const ImVec2& displayS
     return glm::normalize(origin + t * direction);
 }
 
+std::optional<glm::dvec3> pickView(const ImVec2& mouse, const ImVec2& displaySize,
+                                  const glm::mat4& mvp, ViewProjection projection) {
+    if (projection == ViewProjection::Orthographic) {
+        return pickSphere(mouse, displaySize, mvp);
+    }
+    if (!isInsideViewport(mouse, displaySize)) {
+        return std::nullopt;
+    }
+    const float ndcX = 2.0F * mouse.x / displaySize.x - 1.0F;
+    const float ndcY = 1.0F - 2.0F * mouse.y / displaySize.y;
+    glm::vec4 point = glm::inverse(mvp) * glm::vec4(ndcX, ndcY, 0.0F, 1.0F);
+    if (std::abs(point.w) <= std::numeric_limits<float>::epsilon()) {
+        return std::nullopt;
+    }
+    point /= point.w;
+    const double longitude = std::remainder(static_cast<double>(point.x), 2.0 * std::numbers::pi);
+    const double latitude = static_cast<double>(point.y);
+    if (latitude < -std::numbers::pi / 2.0 || latitude > std::numbers::pi / 2.0) {
+        return std::nullopt;
+    }
+    const double radius = std::cos(latitude);
+    return glm::dvec3(radius * std::sin(longitude), -radius * std::cos(longitude),
+                      std::sin(latitude));
+}
+
 bool projectPoint(glm::dvec3 point, const glm::mat4& modelMatrix, const glm::mat4& mvp,
-                  const ImVec2& displaySize, ImVec2& screenPoint, bool& visible) {
-    const glm::vec4 clip = mvp * glm::vec4(glm::vec3(point), 1.0F);
+                  const ImVec2& displaySize, ImVec2& screenPoint, bool& visible,
+                  ViewProjection projection, double mapCenterLongitude) {
+    glm::vec3 position(point);
+    if (projection == ViewProjection::Equirectangular) {
+        double longitude = std::atan2(point.x, -point.y);
+        longitude += 2.0 * std::numbers::pi *
+                     std::round((mapCenterLongitude - longitude) / (2.0 * std::numbers::pi));
+        position = glm::vec3(static_cast<float>(longitude),
+                             static_cast<float>(std::asin(std::clamp(point.z, -1.0, 1.0))), 0.0F);
+    }
+    const glm::vec4 clip = mvp * glm::vec4(position, 1.0F);
     if (clip.w <= 0.0F) {
         return false;
     }
-    const glm::vec3 worldNormal = glm::normalize(glm::vec3(modelMatrix *
-                                                glm::vec4(glm::vec3(point), 0.0F)));
-    const glm::vec3 worldPoint = glm::vec3(modelMatrix * glm::vec4(glm::vec3(point), 1.0F));
-    visible = glm::dot(worldNormal, glm::vec3(0.0F, -3.0F, 0.0F) - worldPoint) > 0.0F;
+    if (projection == ViewProjection::Equirectangular) {
+        visible = true;
+    } else {
+        const glm::vec3 worldNormal = glm::normalize(glm::vec3(modelMatrix *
+                                                    glm::vec4(glm::vec3(point), 0.0F)));
+        const glm::vec3 worldPoint = glm::vec3(modelMatrix * glm::vec4(glm::vec3(point), 1.0F));
+        visible = glm::dot(worldNormal, glm::vec3(0.0F, -3.0F, 0.0F) - worldPoint) > 0.0F;
+    }
     const glm::vec3 ndc = glm::vec3(clip) / clip.w;
     screenPoint = ImVec2((ndc.x + 1.0F) * 0.5F * displaySize.x,
                          (1.0F - ndc.y) * 0.5F * displaySize.y);
@@ -114,7 +161,8 @@ bool projectPoint(glm::dvec3 point, const glm::mat4& modelMatrix, const glm::mat
 
 void drawBrushRing(glm::dvec3 center, double radius, double planetRadius,
                    const glm::mat4& modelMatrix, const glm::mat4& mvp,
-                   const ImVec2& displaySize, ImU32 color) {
+                   const ImVec2& displaySize, ImU32 color, ViewProjection projection,
+                   double mapCenterLongitude) {
     const double angle = std::min(radius / planetRadius, std::numbers::pi);
     const glm::dvec3 reference = std::abs(center.z) < 0.8 ? glm::dvec3(0.0, 0.0, 1.0)
                                                             : glm::dvec3(0.0, 1.0, 0.0);
@@ -130,7 +178,7 @@ void drawBrushRing(glm::dvec3 center, double radius, double planetRadius,
         const glm::dvec3 point = std::cos(angle) * center + std::sin(angle) * direction;
         projected[static_cast<std::size_t>(i)] = projectPoint(
             point, modelMatrix, mvp, displaySize, points[static_cast<std::size_t>(i)],
-            onVisibleHemisphere[static_cast<std::size_t>(i)]);
+            onVisibleHemisphere[static_cast<std::size_t>(i)], projection, mapCenterLongitude);
     }
     auto* drawList = ImGui::GetForegroundDrawList();
     for (int i = 0; i < segments; ++i) {
@@ -145,9 +193,9 @@ void drawBrushRing(glm::dvec3 center, double radius, double planetRadius,
 std::optional<glm::dvec3> inspectHoverPoint(const ImVec2& mouse,
                                           const ImVec2& displaySize,
                                           const glm::mat4& modelMatrix,
-                                          float zoom) {
-    const auto mvp = brushMvp(displaySize, modelMatrix, zoom);
-    return pickSphere(mouse, displaySize, mvp);
+                                          float zoom, ViewProjection projection) {
+    const auto mvp = brushMvp(displaySize, modelMatrix, zoom, projection);
+    return pickView(mouse, displaySize, mvp, projection);
 }
 
 } // namespace
@@ -423,6 +471,9 @@ void UIManager::RenderBrushPanel() {
     const bool raiseLower = dynamic_cast<const RaiseLowerBrushTool*>(&tool) != nullptr;
     const bool elevation = dynamic_cast<const ElevationBrushTool*>(&tool) != nullptr;
     auto* noise = dynamic_cast<SimplexNoiseBrushTool*>(&tool);
+    auto* valueNoise = dynamic_cast<ValueNoiseBrushTool*>(&tool);
+    auto* ridgeNoise = dynamic_cast<RidgeNoiseBrushTool*>(&tool);
+    auto* spectralNoise = dynamic_cast<PowerLawNoiseBrushTool*>(&tool);
     auto* blur = dynamic_cast<GaussianBlurBrushTool*>(&tool);
     auto* clamp = dynamic_cast<ClampBrushTool*>(&tool);
     const std::string title = std::string(tool.GetName()) + "###BrushParameters";
@@ -442,14 +493,18 @@ void UIManager::RenderBrushPanel() {
                              static_cast<int>(operationNames.size()))) {
                 settings.operation = static_cast<BrushOperation>(operation);
             }
-        } else if (noise != nullptr) {
+        } else if (noise != nullptr || valueNoise != nullptr || ridgeNoise != nullptr ||
+                   spectralNoise != nullptr) {
             constexpr std::array operationNames{"Replace", "Add", "Subtract",
                                                 "Minimum", "Maximum"};
-            auto& operation = noise->GetSettings().operation;
+            auto& operation = noise != nullptr ? noise->GetSettings().operation :
+                valueNoise != nullptr ? valueNoise->GetSettings().operation :
+                ridgeNoise != nullptr ? ridgeNoise->GetSettings().operation :
+                                        spectralNoise->GetSettings().operation;
             int selectedOperation = static_cast<int>(operation);
             if (ImGui::Combo("Operation", &selectedOperation, operationNames.data(),
                              static_cast<int>(operationNames.size()))) {
-                operation = static_cast<SimplexNoiseSettings::Operation>(selectedOperation);
+                operation = static_cast<NoiseSettings::Operation>(selectedOperation);
             }
         }
 
@@ -471,6 +526,25 @@ void UIManager::RenderBrushPanel() {
         radius = clipUiValue(radius, 0.1F, maximumRadius, 500.0F);
         settings.radius = radius;
         showRangeTooltip(0.1F, maximumRadius);
+        const bool noiseTool = noise != nullptr || valueNoise != nullptr ||
+                               ridgeNoise != nullptr || spectralNoise != nullptr;
+        if (noiseTool) {
+            const double planetRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
+                                            ? earthRadiusKilometres : earthRadiusMiles;
+            const double angularRadius = std::min(settings.radius / planetRadius,
+                                                  std::numbers::pi);
+            const double expectedVertices = static_cast<double>(options_.pointCount) *
+                (1.0 - std::cos(angularRadius)) * 0.5;
+            if (expectedVertices < 32.0) {
+                ImGui::TextColored(ImVec4(1.0F, 0.72F, 0.32F, 1.0F),
+                    "Only about %.0f mesh points fall inside this brush. Increase the radius "
+                    "or grid density to see a noise pattern.", expectedVertices);
+            } else {
+                ImGui::TextDisabled("About %.0f mesh points are affected at this radius.",
+                                    expectedVertices);
+            }
+            ImGui::TextDisabled("Noise settings affect new strokes.");
+        }
         float falloff = static_cast<float>(settings.falloffPercent);
         ImGui::SliderFloat("Falloff (%)", &falloff, 0.0F, 100.0F, "%.0f%%",
                            ImGuiSliderFlags_AlwaysClamp);
@@ -488,18 +562,22 @@ void UIManager::RenderBrushPanel() {
                                "%.0f", ImGuiSliderFlags_AlwaysClamp);
             settings.value = clipUiValue(settings.value, -32767.0F, 32767.0F, 0.0F);
             showRangeTooltip(-32767.0F, 32767.0F);
-        } else if (noise != nullptr) {
-            auto& parameters = noise->GetSettings();
-            ImGui::InputScalar("Seed", ImGuiDataType_U64, &parameters.seed);
+        } else if (noise != nullptr || valueNoise != nullptr || ridgeNoise != nullptr ||
+                   spectralNoise != nullptr) {
+            NoiseSettings& common = noise != nullptr ?
+                static_cast<NoiseSettings&>(noise->GetSettings()) : valueNoise != nullptr ?
+                static_cast<NoiseSettings&>(valueNoise->GetSettings()) : ridgeNoise != nullptr ?
+                static_cast<NoiseSettings&>(ridgeNoise->GetSettings()) :
+                static_cast<NoiseSettings&>(spectralNoise->GetSettings());
+            ImGui::InputScalar("Seed", ImGuiDataType_U64, &common.seed);
             ImGui::SameLine();
-            if (ImGui::Button("Randomise")) {
+            if (ImGui::Button("Randomise Seed")) {
                 try {
                     std::random_device device;
-                    std::seed_seq seedSequence{
-                        device(), device(), device(), device(),
-                        device(), device(), device(), device()};
+                    std::seed_seq seedSequence{device(), device(), device(), device(),
+                                               device(), device(), device(), device()};
                     std::mt19937_64 generator(seedSequence);
-                    parameters.seed = generator();
+                    common.seed = generator();
                     simplexSeedError_.clear();
                 } catch (const std::exception& error) {
                     simplexSeedError_ = error.what();
@@ -508,34 +586,111 @@ void UIManager::RenderBrushPanel() {
             if (!simplexSeedError_.empty()) {
                 ImGui::TextWrapped("Could not randomise seed: %s", simplexSeedError_.c_str());
             }
-            ImGui::SliderFloat("Between", &parameters.rangeBetween, -32767.0F, 32767.0F,
+            ImGui::SliderFloat("Between", &common.rangeBetween, -32767.0F, 32767.0F,
                                "%.0f", ImGuiSliderFlags_AlwaysClamp);
-            parameters.rangeBetween = clipUiValue(
-                parameters.rangeBetween, -32767.0F, 32767.0F, -32767.0F);
+            common.rangeBetween = clipUiValue(common.rangeBetween, -32767.0F, 32767.0F,
+                                              -32767.0F);
             showRangeTooltip(-32767.0F, 32767.0F);
-            ImGui::SliderFloat("And", &parameters.rangeAnd, -32767.0F, 32767.0F,
+            ImGui::SliderFloat("And", &common.rangeAnd, -32767.0F, 32767.0F,
                                "%.0f", ImGuiSliderFlags_AlwaysClamp);
-            parameters.rangeAnd = clipUiValue(
-                parameters.rangeAnd, -32767.0F, 32767.0F, 32767.0F);
+            common.rangeAnd = clipUiValue(common.rangeAnd, -32767.0F, 32767.0F, 32767.0F);
             showRangeTooltip(-32767.0F, 32767.0F);
-            ImGui::SliderFloat("Frequency", &parameters.frequency, 0.01F, 1.0e6F,
-                               "%.2f", ImGuiSliderFlags_Logarithmic |
-                                           ImGuiSliderFlags_AlwaysClamp);
-            parameters.frequency = clipUiValue(parameters.frequency, 0.01F, 1.0e6F, 4.0F);
-            showRangeTooltip(0.01F, 1.0e6F);
-            ImGui::SliderFloat("Lacunarity", &parameters.lacunarity, 1.0F, 4.0F,
-                               "%.2f", ImGuiSliderFlags_AlwaysClamp);
-            parameters.lacunarity = clipUiValue(parameters.lacunarity, 1.0F, 4.0F, 2.0F);
-            showRangeTooltip(1.0F, 4.0F);
-            ImGui::SliderFloat("Persistence", &parameters.persistence, 0.0F, 1.0F,
-                               "%.2f", ImGuiSliderFlags_AlwaysClamp);
-            parameters.persistence = clipUiValue(parameters.persistence, 0.0F, 1.0F, 0.5F);
-            showRangeTooltip(0.0F, 1.0F);
-            ImGui::SliderInt("Octaves", &parameters.octaves, 1, 16,
-                             "%d", ImGuiSliderFlags_AlwaysClamp);
-            parameters.octaves = std::clamp(parameters.octaves, 1, 16);
-            showRangeTooltip(1, 16);
-            ImGui::Checkbox("Billowed", &parameters.billowed);
+
+            ImGui::Checkbox("Domain warp", &common.domainWarpEnabled);
+            if (common.domainWarpEnabled) {
+                ImGui::SliderFloat("Warp frequency", &common.warpFrequency, 0.01F, 64.0F,
+                                   "%.2f", ImGuiSliderFlags_Logarithmic |
+                                               ImGuiSliderFlags_AlwaysClamp);
+                common.warpFrequency = clipUiValue(common.warpFrequency, 0.01F, 64.0F, 4.0F);
+                showRangeTooltip(0.01F, 64.0F);
+                ImGui::SliderFloat("Warp strength", &common.warpStrength, 0.0F, 5.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                common.warpStrength = clipUiValue(common.warpStrength, 0.0F, 5.0F, 1.25F);
+                showRangeTooltip(0.0F, 5.0F);
+                ImGui::SliderInt("Warp octaves", &common.warpOctaves, 1, 16,
+                                 "%d", ImGuiSliderFlags_AlwaysClamp);
+                common.warpOctaves = std::clamp(common.warpOctaves, 1, 16);
+                showRangeTooltip(1, 16);
+                ImGui::SliderFloat("Warp lacunarity", &common.warpLacunarity, 1.0F, 4.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                common.warpLacunarity = clipUiValue(common.warpLacunarity, 1.0F, 4.0F, 2.0F);
+                showRangeTooltip(1.0F, 4.0F);
+                ImGui::SliderFloat("Warp persistence", &common.warpPersistence, 0.0F, 1.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                common.warpPersistence = clipUiValue(common.warpPersistence, 0.0F, 1.0F, 0.5F);
+                showRangeTooltip(0.0F, 1.0F);
+                ImGui::TextDisabled("Higher strength folds the noise field more dramatically.");
+            }
+            if (noise != nullptr || valueNoise != nullptr || ridgeNoise != nullptr) {
+                FractalNoiseSettings& fractal = noise != nullptr ?
+                    static_cast<FractalNoiseSettings&>(noise->GetSettings()) :
+                    valueNoise != nullptr ?
+                    static_cast<FractalNoiseSettings&>(valueNoise->GetSettings()) :
+                    static_cast<FractalNoiseSettings&>(ridgeNoise->GetSettings());
+                ImGui::SliderFloat("Frequency", &fractal.frequency, 0.01F, 1.0e6F,
+                                   "%.2f", ImGuiSliderFlags_Logarithmic |
+                                               ImGuiSliderFlags_AlwaysClamp);
+                fractal.frequency = clipUiValue(fractal.frequency, 0.01F, 1.0e6F, 4.0F);
+                showRangeTooltip(0.01F, 1.0e6F);
+                ImGui::SliderFloat("Lacunarity", &fractal.lacunarity, 1.0F, 4.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                fractal.lacunarity = clipUiValue(fractal.lacunarity, 1.0F, 4.0F, 2.0F);
+                showRangeTooltip(1.0F, 4.0F);
+                ImGui::SliderFloat("Persistence", &fractal.persistence, 0.0F, 1.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                fractal.persistence = clipUiValue(fractal.persistence, 0.0F, 1.0F, 0.5F);
+                showRangeTooltip(0.0F, 1.0F);
+                ImGui::SliderInt("Octaves", &fractal.octaves, 1, 16,
+                                 "%d", ImGuiSliderFlags_AlwaysClamp);
+                fractal.octaves = std::clamp(fractal.octaves, 1, 16);
+                showRangeTooltip(1, 16);
+            }
+            if (noise != nullptr) {
+                ImGui::Checkbox("Billowed", &noise->GetSettings().billowed);
+            } else if (valueNoise != nullptr) {
+                auto& parameters = valueNoise->GetSettings();
+                ImGui::SliderFloat("Amplitude", &parameters.amplitude, 0.0F, 2.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                parameters.amplitude = clipUiValue(parameters.amplitude, 0.0F, 2.0F, 1.0F);
+                showRangeTooltip(0.0F, 2.0F);
+                constexpr std::array interpolationNames{"Linear", "Cubic", "Quintic"};
+                int interpolation = static_cast<int>(parameters.interpolation);
+                if (ImGui::Combo("Interpolation", &interpolation, interpolationNames.data(),
+                                 static_cast<int>(interpolationNames.size()))) {
+                    parameters.interpolation = static_cast<ValueNoiseSettings::Interpolation>(
+                        interpolation);
+                }
+            } else if (ridgeNoise != nullptr) {
+                auto& parameters = ridgeNoise->GetSettings();
+                ImGui::SliderFloat("Ridge offset", &parameters.ridgeOffset, 0.0F, 2.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                parameters.ridgeOffset = clipUiValue(parameters.ridgeOffset, 0.0F, 2.0F, 1.0F);
+                showRangeTooltip(0.0F, 2.0F);
+                ImGui::SliderFloat("Gain exponent", &parameters.gainExponent, 0.1F, 8.0F,
+                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                parameters.gainExponent = clipUiValue(parameters.gainExponent, 0.1F, 8.0F, 1.0F);
+                showRangeTooltip(0.1F, 8.0F);
+            } else if (spectralNoise != nullptr) {
+                auto& parameters = spectralNoise->GetSettings();
+                ImGui::SliderFloat("Spectral exponent", &parameters.spectralExponent,
+                                   -4.0F, 8.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                parameters.spectralExponent = clipUiValue(parameters.spectralExponent,
+                                                          -4.0F, 8.0F, 2.0F);
+                showRangeTooltip(-4.0F, 8.0F);
+                constexpr std::array resolutions{"8", "16", "32", "64", "128"};
+                int resolution = parameters.gridResolution == 8 ? 0 :
+                    parameters.gridResolution == 16 ? 1 : parameters.gridResolution == 32 ? 2 :
+                    parameters.gridResolution == 64 ? 3 : 4;
+                if (ImGui::Combo("Grid resolution", &resolution, resolutions.data(),
+                                 static_cast<int>(resolutions.size()))) {
+                    parameters.gridResolution = 8 << resolution;
+                }
+                ImGui::SliderFloat("Frequency", &parameters.frequency, 0.01F, 1.0e6F,
+                                   "%.2f", ImGuiSliderFlags_Logarithmic |
+                                               ImGuiSliderFlags_AlwaysClamp);
+                parameters.frequency = clipUiValue(parameters.frequency, 0.01F, 1.0e6F, 4.0F);
+                showRangeTooltip(0.01F, 1.0e6F);
+            }
         } else if (blur != nullptr) {
             auto& parameters = blur->GetSettings();
             int blurUnit = static_cast<int>(parameters.distanceUnit);
@@ -1157,7 +1312,10 @@ void UIManager::FinishPolygonSelection(SphericalGrid& grid, GlobeRenderer& rende
 void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
                                   const glm::mat4& modelMatrix, float zoom) {
     auto& io = ImGui::GetIO();
-    const auto mvp = brushMvp(io.DisplaySize, modelMatrix, zoom);
+    const auto projection = camera_ == nullptr ? ViewProjection::Orthographic
+                                               : camera_->GetProjection();
+    const double mapCenterLongitude = camera_ == nullptr ? 0.0 : camera_->GetMapCenterLongitude();
+    const auto mvp = brushMvp(io.DisplaySize, modelMatrix, zoom, projection);
     const bool captured = io.WantCaptureMouse;
     if (stroke_ && (ImGui::IsMouseReleased(ImGuiMouseButton_Left) || !brushTools_.IsActive())) {
         auto before = std::move(stroke_->original);
@@ -1171,7 +1329,7 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
 
     std::optional<glm::dvec3> cursorCenter;
     if (brushTools_.IsActive() && !captured) {
-        cursorCenter = pickSphere(io.MousePos, io.DisplaySize, mvp);
+        cursorCenter = pickView(io.MousePos, io.DisplaySize, mvp, projection);
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && cursorCenter) {
             Stroke stroke;
             const auto snapshot = grid.GetSnapshot();
@@ -1223,16 +1381,19 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
         const double innerRadius = outerRadius * (1.0 - settings.falloffPercent / 100.0);
         constexpr ImU32 white = IM_COL32(255, 255, 255, 230);
         drawBrushRing(*cursorCenter, outerRadius, planetRadius, modelMatrix, mvp,
-                      io.DisplaySize, white);
+                      io.DisplaySize, white, projection, mapCenterLongitude);
         drawBrushRing(*cursorCenter, innerRadius, planetRadius, modelMatrix, mvp,
-                      io.DisplaySize, white);
+                      io.DisplaySize, white, projection, mapCenterLongitude);
     }
 }
 
 void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& renderer,
                                       const glm::mat4& modelMatrix, float zoom) {
     auto& io = ImGui::GetIO();
-    const auto mvp = brushMvp(io.DisplaySize, modelMatrix, zoom);
+    const auto projection = camera_ == nullptr ? ViewProjection::Orthographic
+                                               : camera_->GetProjection();
+    const double mapCenterLongitude = camera_ == nullptr ? 0.0 : camera_->GetMapCenterLongitude();
+    const auto mvp = brushMvp(io.DisplaySize, modelMatrix, zoom, projection);
     const bool captured = io.WantCaptureMouse;
     const bool radiusMode = selectionMode_ == SelectionMode::Radius;
     const bool polygonMode = selectionMode_ == SelectionMode::Polygon;
@@ -1250,7 +1411,7 @@ void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& render
 
     std::optional<glm::dvec3> cursorCenter;
     if (radiusMode || polygonMode) {
-        cursorCenter = pickSphere(io.MousePos, io.DisplaySize, mvp);
+        cursorCenter = pickView(io.MousePos, io.DisplaySize, mvp, projection);
         if (!captured && isInsideViewport(io.MousePos, io.DisplaySize) &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !cursorCenter) {
             if (io.KeyShift) {
@@ -1332,9 +1493,9 @@ void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& render
                                    (1.0 - selectionSettings_.falloffPercent / 100.0);
         constexpr ImU32 selectionRing = IM_COL32(255, 190, 40, 240);
         drawBrushRing(*cursorCenter, outerRadius, planetRadius, modelMatrix, mvp,
-                      io.DisplaySize, selectionRing);
+                      io.DisplaySize, selectionRing, projection, mapCenterLongitude);
         drawBrushRing(*cursorCenter, innerRadius, planetRadius, modelMatrix, mvp,
-                      io.DisplaySize, selectionRing);
+                      io.DisplaySize, selectionRing, projection, mapCenterLongitude);
     }
 
     if (polygonMode && !polygonPoints_.empty()) {
@@ -1344,7 +1505,8 @@ void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& render
         for (const auto point : polygonPoints_) {
             ImVec2 projected{};
             bool visible = false;
-            if (projectPoint(point, modelMatrix, mvp, io.DisplaySize, projected, visible) &&
+            if (projectPoint(point, modelMatrix, mvp, io.DisplaySize, projected, visible,
+                             projection, mapCenterLongitude) &&
                 visible && previousVisible) {
                 drawList->AddLine(previous, projected, IM_COL32(255, 190, 40, 240), 2.0F);
             }
@@ -1354,7 +1516,8 @@ void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& render
         if (cursorCenter && previousVisible) {
             ImVec2 projected{};
             bool visible = false;
-            if (projectPoint(*cursorCenter, modelMatrix, mvp, io.DisplaySize, projected, visible) &&
+            if (projectPoint(*cursorCenter, modelMatrix, mvp, io.DisplaySize, projected, visible,
+                             projection, mapCenterLongitude) &&
                 visible) {
                 drawList->AddLine(previous, projected, IM_COL32(255, 190, 40, 180), 1.5F);
             }
@@ -1667,6 +1830,8 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                        const glm::mat4& modelMatrix, float zoom) {
     renderer.SetWireframeEnabled(viewportWireframe_);
     renderer.SetGraticuleEnabled(viewportGraticule_);
+    renderer.SetEquirectangular(camera_ != nullptr &&
+                                camera_->GetProjection() == ViewProjection::Equirectangular);
 
     PollGridGeneration(grid, renderer);
     const bool generating = gridFuture_.valid() || gridProgressOpen_;
@@ -1880,6 +2045,19 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
+            const auto projection = camera_ == nullptr ? ViewProjection::Orthographic
+                                                       : camera_->GetProjection();
+            if (ImGui::BeginMenu("Projection")) {
+                if (ImGui::MenuItem("Orthographic", nullptr,
+                                    projection == ViewProjection::Orthographic) && camera_ != nullptr) {
+                    camera_->SetProjection(ViewProjection::Orthographic);
+                }
+                if (ImGui::MenuItem("Equirectangular", nullptr,
+                                    projection == ViewProjection::Equirectangular) && camera_ != nullptr) {
+                    camera_->SetProjection(ViewProjection::Equirectangular);
+                }
+                ImGui::EndMenu();
+            }
             ImGui::BeginDisabled(!grid.HasActiveLayer());
             if (ImGui::BeginMenu("Legend")) {
                 const auto renderColorMapChoices = [&](const char* label, bool selected) {
@@ -2180,7 +2358,10 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     const auto& io = ImGui::GetIO();
     if (grid.HasActiveLayer() && !io.WantCaptureMouse &&
         isInsideViewport(io.MousePos, io.DisplaySize)) {
-        const auto point = inspectHoverPoint(io.MousePos, io.DisplaySize, modelMatrix, zoom);
+        const auto projection = camera_ == nullptr ? ViewProjection::Orthographic
+                               : camera_->GetProjection();
+        const auto point = inspectHoverPoint(io.MousePos, io.DisplaySize, modelMatrix, zoom,
+                             projection);
         if (point) {
             const auto normalized = glm::normalize(*point);
             const double latitude = glm::degrees(std::atan2(normalized.z,

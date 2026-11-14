@@ -69,17 +69,25 @@ GLsizeiptr bufferSize(std::span<const T> data) {
 }
 
 GLuint linkProgram(const std::filesystem::path& vertexPath,
-                   const std::filesystem::path& fragmentPath = {}) {
+                   const std::filesystem::path& fragmentPath = {},
+                   const std::filesystem::path& geometryPath = {}) {
     Shader vertex(fragmentPath.empty() ? GL_COMPUTE_SHADER : GL_VERTEX_SHADER);
     Shader fragment(GL_FRAGMENT_SHADER);
+    Shader geometry(GL_GEOMETRY_SHADER);
     compileShader(vertex, vertexPath);
     if (!fragmentPath.empty()) {
         compileShader(fragment, fragmentPath);
+    }
+    if (!geometryPath.empty()) {
+        compileShader(geometry, geometryPath);
     }
     const GLuint program = glCreateProgram();
     glAttachShader(program, vertex.id);
     if (!fragmentPath.empty()) {
         glAttachShader(program, fragment.id);
+    }
+    if (!geometryPath.empty()) {
+        glAttachShader(program, geometry.id);
     }
     glLinkProgram(program);
     GLint linked = GL_FALSE;
@@ -95,6 +103,9 @@ GLuint linkProgram(const std::filesystem::path& vertexPath,
     glDetachShader(program, vertex.id);
     if (!fragmentPath.empty()) {
         glDetachShader(program, fragment.id);
+    }
+    if (!geometryPath.empty()) {
+        glDetachShader(program, geometry.id);
     }
     return program;
 }
@@ -147,11 +158,14 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
         throw std::runtime_error("Globe rendering requires OpenGL 4.5.");
     }
     Shader vertex(GL_VERTEX_SHADER);
+    Shader geometry(GL_GEOMETRY_SHADER);
     Shader fragment(GL_FRAGMENT_SHADER);
     compileShader(vertex, shaderDirectory / "globe.vert");
+    compileShader(geometry, shaderDirectory / "globe.geom");
     compileShader(fragment, shaderDirectory / "globe.frag");
     resources_.program = glCreateProgram();
     glAttachShader(resources_.program, vertex.id);
+    glAttachShader(resources_.program, geometry.id);
     glAttachShader(resources_.program, fragment.id);
     glLinkProgram(resources_.program);
     GLint linked = GL_FALSE;
@@ -164,6 +178,7 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
         throw std::runtime_error("Globe shader linking failed:\n" + log);
     }
     glDetachShader(resources_.program, vertex.id);
+    glDetachShader(resources_.program, geometry.id);
     glDetachShader(resources_.program, fragment.id);
     matrixLocation_ = uniform(resources_.program, "uModelViewProjection");
     viewDirectionLocation_ = uniform(resources_.program, "uViewDirectionObject");
@@ -173,6 +188,7 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
         uniform(resources_.program, "uHighlightedGraticuleColor");
     selectionActiveLocation_ = uniform(resources_.program, "uSelectionActive");
     graticuleEnabledLocation_ = uniform(resources_.program, "uGraticuleEnabled");
+    equirectangularLocation_ = uniform(resources_.program, "uEquirectangular");
     glProgramUniform1i(resources_.program, uniform(resources_.program, "uColorLut"), 1);
     glProgramUniform1i(resources_.program,
                        uniform(resources_.program, "uSelectionColorLut"), 2);
@@ -204,9 +220,11 @@ GlobeRenderer::GlobeRenderer(const std::filesystem::path& shaderDirectory) {
     glVertexArrayVertexBuffer(resources_.vao, 2, resources_.selectionBuffer, 0, sizeof(float));
     glVertexArrayElementBuffer(resources_.vao, resources_.indexBuffer);
 
-    resources_.wireProgram = linkProgram(shaderDirectory / "wire.vert", shaderDirectory / "wire.frag");
+    resources_.wireProgram = linkProgram(shaderDirectory / "wire.vert", shaderDirectory / "wire.frag",
+                                         shaderDirectory / "wire.geom");
     wireMatrixLocation_ = uniform(resources_.wireProgram, "uModelViewProjection");
     wireDepthBiasLocation_ = uniform(resources_.wireProgram, "uDepthBias");
+    wireEquirectangularLocation_ = uniform(resources_.wireProgram, "uEquirectangular");
     wireSelectionActiveLocation_ = uniform(resources_.wireProgram, "uSelectionActive");
     wireUnselectedColorLocation_ = uniform(resources_.wireProgram, "uUnselectedColor");
     wireSelectedColorLocation_ = uniform(resources_.wireProgram, "uSelectedColor");
@@ -588,18 +606,30 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
         throw std::logic_error("Upload a selection colour map before drawing an active selection.");
     }
     const float aspect = static_cast<float>(framebufferWidth) / framebufferHeight;
-    const float horizontal = 1.15F * std::max(aspect, 1.0F) / zoom;
-    const float vertical = 1.15F * std::max(1.0F / aspect, 1.0F) / zoom;
-    const auto projection = glm::ortho(-horizontal, horizontal, -vertical, vertical, 0.1F, 10.0F);
-    const auto view = glm::lookAt(glm::vec3(0.0F, -3.0F, 0.0F),
-                                  glm::vec3(0.0F), glm::vec3(0.0F, 0.0F, 1.0F));
+    const float horizontal = equirectangular_
+        ? std::max(glm::pi<float>(), glm::pi<float>() * aspect / 2.0F) / zoom
+        : 1.15F * std::max(aspect, 1.0F) / zoom;
+    const float vertical = equirectangular_
+        ? horizontal / aspect
+        : 1.15F * std::max(1.0F / aspect, 1.0F) / zoom;
+    const auto projection = equirectangular_
+        ? glm::ortho(-horizontal, horizontal, -vertical, vertical, -1.0F, 1.0F)
+        : glm::ortho(-horizontal, horizontal, -vertical, vertical, 0.1F, 10.0F);
+    const auto view = equirectangular_
+        ? glm::mat4(1.0F)
+        : glm::lookAt(glm::vec3(0.0F, -3.0F, 0.0F),
+                      glm::vec3(0.0F), glm::vec3(0.0F, 0.0F, 1.0F));
     const auto matrix = projection * view * modelMatrix;
     const auto viewDirection = glm::normalize(glm::vec3(glm::inverse(modelMatrix) *
                                                          glm::vec4(0.0F, -1.0F, 0.0F, 0.0F)));
     glViewport(0, 0, framebufferWidth, framebufferHeight);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
-    glEnable(GL_CULL_FACE);
+    if (equirectangular_) {
+        glDisable(GL_CULL_FACE);
+    } else {
+        glEnable(GL_CULL_FACE);
+    }
     glCullFace(GL_BACK);
     glFrontFace(GL_CCW);
     glUseProgram(resources_.program);
@@ -613,6 +643,7 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
     glProgramUniform3fv(resources_.program, highlightedGraticuleColorLocation_, 1,
                         glm::value_ptr(highlightedGraticuleColor_));
     glProgramUniform1i(resources_.program, graticuleEnabledLocation_, graticuleEnabled_ ? 1 : 0);
+    glProgramUniform1i(resources_.program, equirectangularLocation_, equirectangular_ ? 1 : 0);
     glBindVertexArray(resources_.vao);
     bool renderedLayer = false;
     if (layerStackEnabled_) {
@@ -678,6 +709,8 @@ void GlobeRenderer::Draw(int framebufferWidth, int framebufferHeight,
         glProgramUniform1f(resources_.wireProgram, wireDepthBiasLocation_, 0.006F);
         glProgramUniform1i(resources_.wireProgram, wireSelectionActiveLocation_,
                            selectionActive_ ? 1 : 0);
+        glProgramUniform1i(resources_.wireProgram, wireEquirectangularLocation_,
+                   equirectangular_ ? 1 : 0);
         glProgramUniform3fv(resources_.wireProgram, wireUnselectedColorLocation_, 1,
                             glm::value_ptr(wireframeColor_));
         glProgramUniform3fv(resources_.wireProgram, wireSelectedColorLocation_, 1,

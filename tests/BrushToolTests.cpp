@@ -198,6 +198,256 @@ void testOuterRadiusProfiles() {
     }
 }
 
+void testSimplexNoiseBrush() {
+    SphericalGrid model({1000, 0.0, 29});
+    const auto& grid = *model.GetSnapshot();
+    SimplexNoiseBrushTool brush;
+    BrushSettings settings;
+    settings.radius = 20020.0;
+    settings.falloffPercent = 0.0;
+    auto values = elevationsOf(grid);
+    auto changed = brush.Apply(grid, {0, 0, 1}, values, settings, 0.0);
+    check(changed.size() == values.size(), "Simplex noise did not cover the brush area.");
+    check(std::any_of(values.begin(), values.end(),
+                      [](float value) { return std::abs(value) > 1.0F; }),
+          "Simplex noise produced no variation.");
+    auto repeatedValues = elevationsOf(grid);
+    const auto repeat = brush.Apply(grid, {0, 0, 1}, repeatedValues, settings, 0.0);
+    check(repeat == changed, "Simplex noise output changed between identical applications.");
+
+    brush.GetSettings().billowed = true;
+    auto billowed = elevationsOf(grid);
+    brush.Apply(grid, {0, 0, 1}, billowed, settings, 0.0);
+    check(std::all_of(billowed.begin(), billowed.end(), [](float value) {
+              return value >= -32767.0F && value <= 32767.0F;
+          }), "Billowed noise exceeded the elevation range.");
+    check(billowed != values, "Billowed noise did not alter the noise profile.");
+
+    brush.GetSettings().octaves = 0;
+    bool invalidRejected = false;
+    try {
+        brush.Apply(grid, {0, 0, 1}, values, settings, 0.0);
+    } catch (const std::invalid_argument&) {
+        invalidRejected = true;
+    }
+    check(invalidRejected, "Simplex noise accepted an invalid octave count.");
+}
+
+void testSimplexNoiseSeed() {
+    SphericalGrid model({1000, 0.0, 39});
+    const auto& grid = *model.GetSnapshot();
+    SimplexNoiseBrushTool brush;
+    BrushSettings settings;
+    settings.radius = 20020.0;
+    settings.falloffPercent = 0.0;
+
+    std::vector<float> defaultSeedValues(grid.GetVertices().size(), 0.0F);
+    brush.Apply(grid, {0, 0, 1}, defaultSeedValues, settings, 0.0);
+    auto repeatedValues = std::vector<float>(grid.GetVertices().size(), 0.0F);
+    brush.Apply(grid, {0, 0, 1}, repeatedValues, settings, 0.0);
+    check(repeatedValues == defaultSeedValues,
+          "Simplex noise changed between applications with the same seed.");
+
+    brush.GetSettings().seed = std::numeric_limits<std::uint64_t>::max();
+    auto maxSeedValues = std::vector<float>(grid.GetVertices().size(), 0.0F);
+    brush.Apply(grid, {0, 0, 1}, maxSeedValues, settings, 0.0);
+    check(maxSeedValues != defaultSeedValues,
+          "Changing the full-width noise seed did not change the noise.");
+}
+
+void testSimplexNoiseOperations() {
+    SphericalGrid model({1000, 0.0, 43});
+    const auto& grid = *model.GetSnapshot();
+    SimplexNoiseBrushTool brush;
+    BrushSettings settings;
+    settings.radius = 20020.0;
+    settings.falloffPercent = 0.0;
+    const std::vector<float> initial(grid.GetVertices().size(), 0.0F);
+    auto noiseValues = initial;
+    brush.Apply(grid, {0, 0, 1}, noiseValues, settings, 0.0);
+
+    constexpr float startingValue = 3000.0F;
+    for (const auto operation : {
+             SimplexNoiseSettings::Operation::Replace,
+             SimplexNoiseSettings::Operation::Add,
+             SimplexNoiseSettings::Operation::Subtract,
+             SimplexNoiseSettings::Operation::Minimum,
+             SimplexNoiseSettings::Operation::Maximum}) {
+        brush.GetSettings().operation = operation;
+        std::vector<float> values(grid.GetVertices().size(), startingValue);
+        brush.Apply(grid, {0, 0, 1}, values, settings, 0.0);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            float expected = noiseValues[i];
+            switch (operation) {
+            case SimplexNoiseSettings::Operation::Replace:
+                break;
+            case SimplexNoiseSettings::Operation::Add:
+                expected = startingValue + noiseValues[i];
+                break;
+            case SimplexNoiseSettings::Operation::Subtract:
+                expected = startingValue - noiseValues[i];
+                break;
+            case SimplexNoiseSettings::Operation::Minimum:
+                expected = std::min(startingValue, noiseValues[i]);
+                break;
+            case SimplexNoiseSettings::Operation::Maximum:
+                expected = std::max(startingValue, noiseValues[i]);
+                break;
+            }
+            expected = std::clamp(expected, -32767.0F, 32767.0F);
+            check(std::abs(values[i] - expected) < 0.01F,
+                  "Simplex noise operation produced an unexpected elevation.");
+        }
+    }
+
+    brush.GetSettings().operation = static_cast<SimplexNoiseSettings::Operation>(99);
+    auto invalidValues = initial;
+    bool invalidRejected = false;
+    try {
+        brush.Apply(grid, {0, 0, 1}, invalidValues, settings, 0.0);
+    } catch (const std::invalid_argument&) {
+        invalidRejected = true;
+    }
+    check(invalidRejected, "Simplex noise accepted an invalid operation.");
+}
+
+void testSimplexNoiseValueRange() {
+    SphericalGrid model({1000, 0.0, 47});
+    const auto& grid = *model.GetSnapshot();
+    SimplexNoiseBrushTool brush;
+    BrushSettings settings;
+    settings.radius = 20020.0;
+    settings.falloffPercent = 0.0;
+
+    std::vector<float> defaultRange(grid.GetVertices().size(), 0.0F);
+    brush.Apply(grid, {0, 0, 1}, defaultRange, settings, 0.0);
+    brush.GetSettings().rangeBetween = 100.0F;
+    brush.GetSettings().rangeAnd = -300.0F;
+    std::vector<float> scaled(grid.GetVertices().size(), 0.0F);
+    brush.Apply(grid, {0, 0, 1}, scaled, settings, 0.0);
+    for (std::size_t i = 0; i < scaled.size(); ++i) {
+        const float normalized = (defaultRange[i] / 32767.0F + 1.0F) * 0.5F;
+        const float expected = -300.0F + normalized * 400.0F;
+        check(std::abs(scaled[i] - expected) < 0.01F,
+              "Simplex noise did not scale into the ordered Between/And range.");
+    }
+
+    brush.GetSettings().rangeBetween = 250.0F;
+    brush.GetSettings().rangeAnd = 250.0F;
+    std::vector<float> constantRange(grid.GetVertices().size(), 0.0F);
+    brush.Apply(grid, {0, 0, 1}, constantRange, settings, 0.0);
+    check(std::all_of(constantRange.begin(), constantRange.end(),
+                      [](float value) { return value == 250.0F; }),
+          "Equal Simplex noise range bounds did not produce a constant target.");
+
+    brush.GetSettings().rangeBetween = -32768.0F;
+    bool invalidRangeRejected = false;
+    try {
+        brush.Apply(grid, {0, 0, 1}, constantRange, settings, 0.0);
+    } catch (const std::invalid_argument&) {
+        invalidRangeRejected = true;
+    }
+    check(invalidRangeRejected, "Simplex noise accepted an out-of-range noise bound.");
+}
+
+void testGaussianBlurBrush() {
+    SphericalGrid model({1000, 0.0, 31});
+    const auto& grid = *model.GetSnapshot();
+    GaussianBlurBrushTool brush;
+    BrushSettings settings;
+    settings.radius = 20020.0;
+    settings.falloffPercent = 0.0;
+    brush.GetSettings().range = 20000.0;
+    brush.GetSettings().sigma = 5000.0F;
+    auto values = elevationsOf(grid);
+    values[0] = 1000.0F;
+    const auto changed = brush.Apply(grid, {0, 0, 1}, values, settings, 0.0);
+    check(!changed.empty() && values[0] < 1000.0F && values[0] > 0.0F,
+          "Gaussian blur did not reduce the isolated peak.");
+    check(std::any_of(values.begin() + 1, values.end(),
+                      [](float value) { return value > 0.0F; }),
+          "Gaussian blur did not spread the isolated peak.");
+
+    auto constant = elevationsOf(grid);
+    std::fill(constant.begin(), constant.end(), 123.5F);
+    check(brush.Apply(grid, {0, 0, 1}, constant, settings, 0.0).empty(),
+          "Gaussian blur changed a constant field.");
+    check(std::all_of(constant.begin(), constant.end(),
+                      [](float value) { return value == 123.5F; }),
+          "Gaussian blur did not preserve a constant field.");
+}
+
+void testClampBrush() {
+    SphericalGrid model({1000, 0.0, 37});
+    const auto& grid = *model.GetSnapshot();
+    ClampBrushTool brush;
+    BrushSettings settings;
+    settings.radius = 20020.0;
+    settings.falloffPercent = 0.0;
+    auto values = elevationsOf(grid);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        values[i] = i % 2 == 0 ? 500.0F : -500.0F;
+    }
+    brush.GetSettings().minimum = -100.0F;
+    brush.GetSettings().maximum = 100.0F;
+    const auto changed = brush.Apply(grid, {0, 0, 1}, values, settings, 0.0);
+    check(changed.size() == values.size(), "Clamp did not cover the brush area.");
+    check(std::all_of(values.begin(), values.end(), [](float value) {
+              return value == -100.0F || value == 100.0F;
+          }), "Clamp did not replace values outside its bounds.");
+
+    brush.GetSettings().minimum = 200.0F;
+    bool invalidRejected = false;
+    try {
+        brush.Apply(grid, {0, 0, 1}, values, settings, 0.0);
+    } catch (const std::invalid_argument&) {
+        invalidRejected = true;
+    }
+    check(invalidRejected, "Clamp accepted a minimum greater than its maximum.");
+}
+
+void testAdditionalBrushSelectionWeights() {
+    SphericalGrid model({1000, 0.0, 41});
+    const auto& base = *model.GetSnapshot();
+    const std::size_t selectedIndex = 0;
+    std::vector<float> selection(base.GetVertices().size(), 0.0F);
+    selection[selectedIndex] = 0.5F;
+    std::vector<float> source(base.GetVertices().size(), 500.0F);
+    SphericalGridSnapshot selectedGrid(base, source, selection, true);
+    BrushSettings settings;
+    settings.radius = 20020.0;
+    settings.falloffPercent = 0.0;
+
+    ClampBrushTool clamp;
+    clamp.GetSettings().maximum = 100.0F;
+    auto clamped = source;
+    clamp.Apply(selectedGrid, {0, 0, 1}, clamped, settings, 0.0);
+    check(clamped[selectedIndex] == 300.0F &&
+          std::all_of(clamped.begin() + 1, clamped.end(),
+                      [](float value) { return value == 500.0F; }),
+          "Clamp did not multiply its effect by the per-vertex selection weight.");
+
+    SimplexNoiseBrushTool noise;
+    auto noised = source;
+    noise.Apply(selectedGrid, {0, 0, 1}, noised, settings, 0.0);
+    check(noised[selectedIndex] != source[selectedIndex] &&
+          std::all_of(noised.begin() + 1, noised.end(),
+                      [](float value) { return value == 500.0F; }),
+          "Simplex noise did not multiply its effect by the per-vertex selection weight.");
+
+    std::fill(source.begin(), source.end(), 0.0F);
+    source[selectedIndex] = 1000.0F;
+    GaussianBlurBrushTool blur;
+    blur.GetSettings().range = 20000.0;
+    blur.GetSettings().sigma = 5000.0F;
+    auto blurred = source;
+    blur.Apply(selectedGrid, {0, 0, 1}, blurred, settings, 0.0);
+    check(blurred[selectedIndex] > 500.0F && blurred[selectedIndex] < 1000.0F &&
+          std::all_of(blurred.begin() + 1, blurred.end(),
+                      [](float value) { return value == 0.0F; }),
+          "Gaussian blur did not multiply its effect by the per-vertex selection weight.");
+}
+
 void testValidation() {
     SphericalGrid model({1000, 0.0, 23});
     const auto& grid = *model.GetSnapshot();
@@ -266,7 +516,7 @@ void testToolManager() {
     BrushToolManager manager;
     check(manager.GetSelectedTool().GetName() == "Elevation Brush",
           "Manager did not select its default elevation brush.");
-    check(manager.GetTools().size() == 2, "Manager did not register both built-in brushes.");
+    check(manager.GetTools().size() == 5, "Manager did not register all built-in brush tools.");
     manager.GetSettings().value = 1234.0F;
     manager.GetSettings().operation = BrushOperation::Maximum;
     check(manager.SelectTool("Raise/Lower Brush") &&
@@ -299,6 +549,13 @@ int main() {
         testIntensityAndGeodesicFalloff();
         testRaiseLowerBrush();
         testOuterRadiusProfiles();
+        testSimplexNoiseBrush();
+        testSimplexNoiseSeed();
+        testSimplexNoiseOperations();
+        testSimplexNoiseValueRange();
+        testGaussianBlurBrush();
+        testClampBrush();
+        testAdditionalBrushSelectionWeights();
         testValidation();
         testToolManager();
         std::cout << "Brush tool tests passed.\n";

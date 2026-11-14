@@ -4,6 +4,7 @@
 
 #include <glm/glm.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -33,6 +34,37 @@ struct BrushSettings {
     double intensityPercent = 100.0;
     double raiseLowerRate = 8192.0;
     float value = 0.0F;
+};
+
+struct SimplexNoiseSettings {
+    enum class Operation {
+        Replace,
+        Add,
+        Subtract,
+        Minimum,
+        Maximum
+    };
+
+    Operation operation = Operation::Replace;
+    float rangeBetween = -32767.0F;
+    float rangeAnd = 32767.0F;
+    std::uint64_t seed = 0;
+    float frequency = 4.0F;
+    float lacunarity = 2.0F;
+    float persistence = 0.5F;
+    int octaves = 4;
+    bool billowed = false;
+};
+
+struct GaussianBlurSettings {
+    BrushDistanceUnit distanceUnit = BrushDistanceUnit::Kilometres;
+    double range = 100.0;
+    float sigma = 25.0F;
+};
+
+struct ClampSettings {
+    float minimum = -32767.0F;
+    float maximum = 32767.0F;
 };
 
 class BrushTool {
@@ -65,6 +97,51 @@ public:
         const SphericalGridSnapshot& grid, glm::dvec3 center,
         std::vector<float>& elevations, const BrushSettings& settings,
         double elapsedSeconds) const override;
+};
+
+class SimplexNoiseBrushTool final : public BrushTool {
+public:
+    std::string_view GetName() const override { return "Simplex Noise"; }
+    bool IsContinuous() const override { return false; }
+    std::vector<std::size_t> Apply(
+        const SphericalGridSnapshot& grid, glm::dvec3 center,
+        std::vector<float>& elevations, const BrushSettings& settings,
+        double elapsedSeconds) const override;
+    SimplexNoiseSettings& GetSettings() { return settings_; }
+    const SimplexNoiseSettings& GetSettings() const { return settings_; }
+
+private:
+    SimplexNoiseSettings settings_;
+};
+
+class GaussianBlurBrushTool final : public BrushTool {
+public:
+    std::string_view GetName() const override { return "Gaussian Blur"; }
+    bool IsContinuous() const override { return false; }
+    std::vector<std::size_t> Apply(
+        const SphericalGridSnapshot& grid, glm::dvec3 center,
+        std::vector<float>& elevations, const BrushSettings& settings,
+        double elapsedSeconds) const override;
+    GaussianBlurSettings& GetSettings() { return settings_; }
+    const GaussianBlurSettings& GetSettings() const { return settings_; }
+
+private:
+    GaussianBlurSettings settings_;
+};
+
+class ClampBrushTool final : public BrushTool {
+public:
+    std::string_view GetName() const override { return "Clamp"; }
+    bool IsContinuous() const override { return false; }
+    std::vector<std::size_t> Apply(
+        const SphericalGridSnapshot& grid, glm::dvec3 center,
+        std::vector<float>& elevations, const BrushSettings& settings,
+        double elapsedSeconds) const override;
+    ClampSettings& GetSettings() { return settings_; }
+    const ClampSettings& GetSettings() const { return settings_; }
+
+private:
+    ClampSettings settings_;
 };
 
 class BrushToolManager {

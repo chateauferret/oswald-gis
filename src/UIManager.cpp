@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <memory>
 #include <numbers>
+#include <random>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -23,6 +24,25 @@ namespace {
 
 constexpr double earthRadiusKilometres = 6371.0;
 constexpr double earthRadiusMiles = 3958.7613;
+
+float clipUiValue(float value, float minimum, float maximum, float fallback) {
+    if (!std::isfinite(value)) {
+        value = fallback;
+    }
+    return std::clamp(value, minimum, maximum);
+}
+
+void showRangeTooltip(float minimum, float maximum) {
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Valid range: %.2f to %.2f", minimum, maximum);
+    }
+}
+
+void showRangeTooltip(int minimum, int maximum) {
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Valid range: %d to %d", minimum, maximum);
+    }
+}
 
 glm::mat4 brushMvp(const ImVec2& displaySize, const glm::mat4& modelMatrix, float zoom) {
     const float aspect = displaySize.x > 0.0F && displaySize.y > 0.0F
@@ -399,8 +419,12 @@ void UIManager::RenderBrushPanel() {
         return;
     }
     bool open = true;
-    const auto& tool = brushTools_.GetSelectedTool();
+    auto& tool = brushTools_.GetSelectedTool();
     const bool raiseLower = dynamic_cast<const RaiseLowerBrushTool*>(&tool) != nullptr;
+    const bool elevation = dynamic_cast<const ElevationBrushTool*>(&tool) != nullptr;
+    auto* noise = dynamic_cast<SimplexNoiseBrushTool*>(&tool);
+    auto* blur = dynamic_cast<GaussianBlurBrushTool*>(&tool);
+    auto* clamp = dynamic_cast<ClampBrushTool*>(&tool);
     const std::string title = std::string(tool.GetName()) + "###BrushParameters";
     if (ImGui::Begin(title.c_str(), &open)) {
         auto& settings = brushTools_.GetSettings();
@@ -411,12 +435,21 @@ void UIManager::RenderBrushPanel() {
                              static_cast<int>(operationNames.size()))) {
                 settings.raiseLowerOperation = static_cast<RaiseLowerOperation>(operation);
             }
-        } else {
+        } else if (elevation) {
             constexpr std::array operationNames{"Replace", "Minimum", "Maximum"};
             int operation = static_cast<int>(settings.operation);
             if (ImGui::Combo("Operation", &operation, operationNames.data(),
                              static_cast<int>(operationNames.size()))) {
                 settings.operation = static_cast<BrushOperation>(operation);
+            }
+        } else if (noise != nullptr) {
+            constexpr std::array operationNames{"Replace", "Add", "Subtract",
+                                                "Minimum", "Maximum"};
+            auto& operation = noise->GetSettings().operation;
+            int selectedOperation = static_cast<int>(operation);
+            if (ImGui::Combo("Operation", &selectedOperation, operationNames.data(),
+                             static_cast<int>(operationNames.size()))) {
+                operation = static_cast<SimplexNoiseSettings::Operation>(selectedOperation);
             }
         }
 
@@ -433,29 +466,127 @@ void UIManager::RenderBrushPanel() {
         float radius = static_cast<float>(settings.radius);
         const float maximumRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
                                         ? 20020.0F : 12500.0F;
-        if (ImGui::DragFloat("Outer radius", &radius, 10.0F, 0.1F,
-                             maximumRadius, "%.1f")) {
-            settings.radius = std::clamp(static_cast<double>(radius), 0.1,
-                                         static_cast<double>(maximumRadius));
-        }
+        ImGui::DragFloat("Outer radius", &radius, 10.0F, 0.1F,
+                         maximumRadius, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        radius = clipUiValue(radius, 0.1F, maximumRadius, 500.0F);
+        settings.radius = radius;
+        showRangeTooltip(0.1F, maximumRadius);
         float falloff = static_cast<float>(settings.falloffPercent);
-        if (ImGui::SliderFloat("Falloff (%)", &falloff, 0.0F, 100.0F, "%.0f%%")) {
-            settings.falloffPercent = falloff;
-        }
+        ImGui::SliderFloat("Falloff (%)", &falloff, 0.0F, 100.0F, "%.0f%%",
+                           ImGuiSliderFlags_AlwaysClamp);
+        falloff = clipUiValue(falloff, 0.0F, 100.0F, 25.0F);
+        settings.falloffPercent = falloff;
+        showRangeTooltip(0.0F, 100.0F);
         if (raiseLower) {
             float intensity = static_cast<float>(settings.intensityPercent);
-            if (ImGui::SliderFloat("Intensity (%)", &intensity, 0.0F, 100.0F, "%.0f%%")) {
-                settings.intensityPercent = intensity;
-            }
-        } else {
+            ImGui::SliderFloat("Intensity (%)", &intensity, 0.0F, 100.0F, "%.0f%%",
+                               ImGuiSliderFlags_AlwaysClamp);
+            settings.intensityPercent = clipUiValue(intensity, 0.0F, 100.0F, 100.0F);
+            showRangeTooltip(0.0F, 100.0F);
+        } else if (elevation) {
             ImGui::SliderFloat("Elevation", &settings.value, -32767.0F, 32767.0F,
-                               "%.0f");
+                               "%.0f", ImGuiSliderFlags_AlwaysClamp);
+            settings.value = clipUiValue(settings.value, -32767.0F, 32767.0F, 0.0F);
+            showRangeTooltip(-32767.0F, 32767.0F);
+        } else if (noise != nullptr) {
+            auto& parameters = noise->GetSettings();
+            ImGui::InputScalar("Seed", ImGuiDataType_U64, &parameters.seed);
+            ImGui::SameLine();
+            if (ImGui::Button("Randomise")) {
+                try {
+                    std::random_device device;
+                    std::seed_seq seedSequence{
+                        device(), device(), device(), device(),
+                        device(), device(), device(), device()};
+                    std::mt19937_64 generator(seedSequence);
+                    parameters.seed = generator();
+                    simplexSeedError_.clear();
+                } catch (const std::exception& error) {
+                    simplexSeedError_ = error.what();
+                }
+            }
+            if (!simplexSeedError_.empty()) {
+                ImGui::TextWrapped("Could not randomise seed: %s", simplexSeedError_.c_str());
+            }
+            ImGui::SliderFloat("Between", &parameters.rangeBetween, -32767.0F, 32767.0F,
+                               "%.0f", ImGuiSliderFlags_AlwaysClamp);
+            parameters.rangeBetween = clipUiValue(
+                parameters.rangeBetween, -32767.0F, 32767.0F, -32767.0F);
+            showRangeTooltip(-32767.0F, 32767.0F);
+            ImGui::SliderFloat("And", &parameters.rangeAnd, -32767.0F, 32767.0F,
+                               "%.0f", ImGuiSliderFlags_AlwaysClamp);
+            parameters.rangeAnd = clipUiValue(
+                parameters.rangeAnd, -32767.0F, 32767.0F, 32767.0F);
+            showRangeTooltip(-32767.0F, 32767.0F);
+            ImGui::SliderFloat("Frequency", &parameters.frequency, 0.01F, 1.0e6F,
+                               "%.2f", ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_AlwaysClamp);
+            parameters.frequency = clipUiValue(parameters.frequency, 0.01F, 1.0e6F, 4.0F);
+            showRangeTooltip(0.01F, 1.0e6F);
+            ImGui::SliderFloat("Lacunarity", &parameters.lacunarity, 1.0F, 4.0F,
+                               "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            parameters.lacunarity = clipUiValue(parameters.lacunarity, 1.0F, 4.0F, 2.0F);
+            showRangeTooltip(1.0F, 4.0F);
+            ImGui::SliderFloat("Persistence", &parameters.persistence, 0.0F, 1.0F,
+                               "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            parameters.persistence = clipUiValue(parameters.persistence, 0.0F, 1.0F, 0.5F);
+            showRangeTooltip(0.0F, 1.0F);
+            ImGui::SliderInt("Octaves", &parameters.octaves, 1, 16,
+                             "%d", ImGuiSliderFlags_AlwaysClamp);
+            parameters.octaves = std::clamp(parameters.octaves, 1, 16);
+            showRangeTooltip(1, 16);
+            ImGui::Checkbox("Billowed", &parameters.billowed);
+        } else if (blur != nullptr) {
+            auto& parameters = blur->GetSettings();
+            int blurUnit = static_cast<int>(parameters.distanceUnit);
+            constexpr std::array blurUnitNames{"Kilometres", "Miles"};
+            if (ImGui::Combo("Blur distance unit", &blurUnit, blurUnitNames.data(),
+                             static_cast<int>(blurUnitNames.size())) &&
+                blurUnit != static_cast<int>(parameters.distanceUnit)) {
+                const double factor = blurUnit ==
+                                              static_cast<int>(BrushDistanceUnit::Miles)
+                                          ? 0.621371192 : 1.609344;
+                parameters.range *= factor;
+                parameters.sigma = static_cast<float>(parameters.sigma * factor);
+                parameters.distanceUnit = static_cast<BrushDistanceUnit>(blurUnit);
+            }
+            const float maximumRange = static_cast<float>(
+                std::numbers::pi * (parameters.distanceUnit ==
+                                            BrushDistanceUnit::Kilometres
+                                        ? earthRadiusKilometres : earthRadiusMiles));
+            float range = static_cast<float>(parameters.range);
+            ImGui::SliderFloat("Blur range", &range, 0.1F, maximumRange,
+                               "%.1f", ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_AlwaysClamp);
+            range = clipUiValue(range, 0.1F, maximumRange, 100.0F);
+            parameters.range = range;
+            showRangeTooltip(0.1F, maximumRange);
+            float sigma = parameters.sigma;
+            ImGui::SliderFloat("Sigma", &sigma, 0.01F, maximumRange,
+                               "%.2f", ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_AlwaysClamp);
+            parameters.sigma = clipUiValue(sigma, 0.01F, maximumRange, 25.0F);
+            showRangeTooltip(0.01F, maximumRange);
+        } else if (clamp != nullptr) {
+            auto& parameters = clamp->GetSettings();
+            float minimum = parameters.minimum;
+            ImGui::DragFloat("Minimum", &minimum, 1.0F, -32767.0F,
+                             parameters.maximum, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            parameters.minimum = clipUiValue(minimum, -32767.0F, parameters.maximum,
+                                             -32767.0F);
+            showRangeTooltip(-32767.0F, parameters.maximum);
+            float maximum = parameters.maximum;
+            ImGui::DragFloat("Maximum", &maximum, 1.0F, parameters.minimum,
+                             32767.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            parameters.maximum = clipUiValue(maximum, parameters.minimum, 32767.0F,
+                                             32767.0F);
+            showRangeTooltip(parameters.minimum, 32767.0F);
         }
-        ImGui::TextWrapped("Left-drag over the globe to paint. Falloff sets the tapered portion of the outer radius: 0%% is a cylinder, 100%% is a cone.");
+        ImGui::TextWrapped("Left-drag over the globe to apply this tool. Falloff sets the tapered portion of the outer radius: 0%% is a cylinder, 100%% is a cone.");
         if (raiseLower) {
             ImGui::TextWrapped("At 100%% intensity, raise/lower by %.0f units per second. Configure this speed in File > Settings.",
                               settings.raiseLowerRate);
-        } else {
+        } else if (elevation) {
             ImGui::TextWrapped("Each click or drag applies the operation once; holding the button or retracing the stroke does not build it up further.");
         }
     }
@@ -584,7 +715,10 @@ void UIManager::RenderFillFilterDialog(SphericalGrid& grid,
         pendingFillSettings_.operation = static_cast<FillOperation>(operation);
     }
     ImGui::SliderFloat("Fill value", &pendingFillSettings_.value,
-                       -32767.0F, 32767.0F, "%.0f");
+                       -32767.0F, 32767.0F, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+    pendingFillSettings_.value = clipUiValue(
+        pendingFillSettings_.value, -32767.0F, 32767.0F, 0.0F);
+    showRangeTooltip(-32767.0F, 32767.0F);
     ImGui::TextWrapped("Raise adds the fill value; Lower subtracts it. Selection weights blend each operation, and no active selection affects the entire terrain.");
     if (!fillFilterError_.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));

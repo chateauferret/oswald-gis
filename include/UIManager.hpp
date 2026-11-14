@@ -125,6 +125,7 @@ private:
     bool fillFilterOpen_ = false;
     FillFilterSettings pendingFillSettings_;
     std::string fillFilterError_;
+    std::string simplexSeedError_;
     bool settingsOpen_ = false;
     double pendingRaiseLowerRate_ = BrushSettings{}.raiseLowerRate;
     CameraController* camera_ = nullptr;

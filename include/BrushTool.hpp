@@ -1,10 +1,12 @@
 #pragma once
 
+#include "Noise.hpp"
 #include "SphericalGrid.hpp"
 
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -71,7 +73,7 @@ struct SimplexNoiseSettings : FractalNoiseSettings {
 };
 
 struct ValueNoiseSettings : FractalNoiseSettings {
-    enum class Interpolation { Linear, Cubic, Quintic };
+    using Interpolation = noise::Interpolation;
     float amplitude = 1.0F;
     Interpolation interpolation = Interpolation::Quintic;
 };
@@ -97,6 +99,26 @@ struct ClampSettings {
     float minimum = -32767.0F;
     float maximum = 32767.0F;
 };
+
+// Per-vertex input passed to a noise sampler.
+struct NoiseSample {
+    glm::dvec3 position{0.0}; // Unit position after optional domain warping.
+    glm::dvec3 location{0.0}; // Unwarped unit vertex position.
+    std::size_t index = 0;
+    float elevation = 0.0F; // Value before this dab.
+    double weight = 0.0; // Falloff multiplied by selection weight, in (0, 1].
+    double distance = 0.0; // Geodesic distance from the brush centre, in brush units.
+};
+
+// Returns noise in [-1, 1]; values outside it are clamped.
+using NoiseSampler = std::function<double(const NoiseSample&)>;
+
+// Applies a sampler with the noise brushes' operation, output range, domain warp,
+// falloff, and selection weighting. If sampling throws, elevations are unchanged.
+std::vector<std::size_t> ApplyNoiseSampler(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
+    const NoiseSampler& sample);
 
 class BrushTool {
 public:

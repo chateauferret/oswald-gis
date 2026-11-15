@@ -73,3 +73,13 @@
    18.2. **Ridge Noise.** Generates ridged multifractal terrain from multi-octave coherent noise, with configurable octaves, lacunarity, persistence, ridge offset, and gain exponent.
 
    18.3. **Power-Law Spectral Noise.** Generates a seeded 3D white-noise field, filters its Fourier coefficients by a power-law spectral exponent, and samples the inverse-transformed periodic field. Grid resolution, frequency, and spectral exponent are configurable; the expensive field is cached until its seed, resolution, or exponent changes.
+   
+19. **Phase 19: Scripted Brushes**
+
+   Integrated the exprtk expression library behind a `ScriptEngine` manager. The manager binds variables, constants, and C++ functions into a shared symbol table, and compiles scripts with line and column diagnostics. It provides seeded `simplex`, `valuenoise`, `fbm`, `billow`, `valuefbm`, and `ridged` noise functions, and guards against runaway loops.
+
+   19.1. **Scripted Brush.** A one-shot brush evaluates a user script for each affected vertex. Scripts can read the vertex's position, latitude/longitude, current elevation, weight, distance from the brush centre, brush radius, and output range.
+   - The script's result is either normalised, so [-1, 1] maps to the Between/And range, or treated as an elevation and clamped to that range.
+   - The brush shares the noise brushes' operation, seed, range, and domain-warp controls.
+   - The dockable panel has a multiline script editor with Compile, Revert, and Default buttons, plus a script reference.
+   - Compile errors keep the previous script active. Runtime errors leave the layer unchanged and are reported in the panel.

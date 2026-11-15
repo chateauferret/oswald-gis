@@ -9,6 +9,7 @@
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <imgui_internal.h>
 
 #include <algorithm>
 #include <exception>
@@ -170,8 +171,15 @@ int runApplication() {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-        if (ui.Render(grid, renderer, camera.GetModelMatrix(), camera.GetZoom())) {
-            glfwSetWindowShouldClose(window.get(), GLFW_TRUE);
+        try {
+            if (ui.Render(grid, renderer, camera.GetModelMatrix(), camera.GetZoom())) {
+                glfwSetWindowShouldClose(window.get(), GLFW_TRUE);
+            }
+        } catch (const std::exception& error) {
+            // Keep the application alive: report the error, then unwind any ImGui windows and
+            // stacks the interrupted frame left open so the frame can still be rendered.
+            std::cerr << "Oswald GIS error: " << error.what() << '\n';
+            ImGui::ErrorCheckEndFrameRecover(nullptr);
         }
 
         glfwGetFramebufferSize(window.get(), &framebufferWidth, &framebufferHeight);
@@ -193,7 +201,7 @@ int main() {
     try {
         return runApplication();
     } catch (const std::exception& error) {
-        std::cerr << "Oswald GIS startup failed: " << error.what() << '\n';
+        std::cerr << "Oswald GIS failed: " << error.what() << '\n';
         return 1;
     }
 }

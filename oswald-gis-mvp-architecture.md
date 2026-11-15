@@ -41,6 +41,7 @@ The software stack integrates industry-standard libraries managed directly via C
 | **Spatial Indexing** | `nanoflann 1.5.5` | Header-only 3D k-d tree spatial index over vertex arrays for $O(\log N)$ queries. |
 | **Spherical Triangulation** | Qhull `8.0.2` | Reentrant 3D convex hull, yielding spherical Delaunay triangles for the half-edge graph. |
 | **Raster Decoding** | `stb_image` | Single-header decoding of common equirectangular image formats. |
+| **Scripting** | exprtk `0.0.3` | Header-only expression parser/evaluator for user scripts that generate brush values. |
 
 ### 2.2 VS Code & Copilot Workflow Integration
 
@@ -89,6 +90,33 @@ The software is structured strictly around a Model-View-Controller design patter
 * **Model (`SphericalGrid`)**: Owns the CPU-side vertex buffers, topological edge connectivities, its data-layer collection, and the `nanoflann` 3D k-d tree index. `Layer` defines shared metadata, `RasterLayer` stores raster values, and each `ElevationLayer` has independent values synchronized with immutable mesh snapshots when active. Elevation- and selection-only snapshots share the geometry's immutable spatial index; it is rebuilt only when mesh geometry changes. The per-vertex selection channel remains separate from the layer collection. The model exposes cancellable grid generation, immutable snapshots, and spatial point sampling.
 * **View (`GlobeRenderer`)**: Manages GPU-side OpenGL resources (Vertex Array Objects, Vertex Buffer Objects, Element Buffer Objects). Each layer has a persistent elevation buffer, and brush previews update changed vertex ranges in the active layer. A compute shader combines visible elevations bottom-to-top before a single globe draw, using the topmost visible layer's selected/unselected colour maps. Overlay replaces the accumulated value; Add, Subtract (lower minus upper), Multiply, Minimum, and Maximum operate on elevations, not RGB colours. Each operation clamps to the supported elevation range [-32767, 32767]; the bottommost visible layer seeds the result regardless of its blend mode. Composition is cached until values, order, visibility, or blend modes change. Selection, graticules, and rim shading are applied once, after composition.
 * **Controller (`CameraController` & `UIManager`)**: Processes window input events. It translates 2D mouse drags into 3D camera rotations, handles double-click raycasts for globe re-centering, and renders Dear ImGui interface overlays.
+* **Scripting (`ScriptEngine`)**: Wraps exprtk so user scripts can combine maths, control flow, and noise to generate values. The engine owns one symbol table shared by all scripts it compiles. It stores engine-owned variables at stable addresses, binds caller-owned variables, constants, and C++ functions (fixed arity 0–4 or variadic), and compiles source into a `CompiledScript`. Compiled scripts keep the engine state alive and can be evaluated repeatedly. Built-in `simplex`, `valuenoise`, `fbm`, `billow`, `valuefbm`, and `ridged` functions use the same `Noise` primitives as the noise brushes. These functions use an engine-level uint64 seed, which is set from C++ because a double cannot represent every seed.
+  * Compile failures raise `ScriptError` with 1-based line and column diagnostics. Unknown symbols, strings, I/O, and `return` statements are rejected.
+  * Symbol names are case-sensitive.
+  * Each loop entry is limited to a configurable iteration count, which defaults to 1,000,000.
+  * exprtk evaluates an optimized expression tree; it does not generate machine code.
+  * The engine is not thread-safe.
+  * Infinite loops with literal true conditions are rejected at compile time.
+* **Elevation safety**: Brushes blend falloff in double precision and clamp the result to [-32767, 32767].
+  * Before committing a stroke, the UI restores non-finite values and clamps all values.
+  * Failures when committing a stroke, or during undo or redo, are reported in the UI and the grid stays unchanged.
+  * The frame loop catches per-frame exceptions, logs them, and recovers ImGui state, so a runtime error does not terminate the application.
+* **Scripted brush (`ScriptedBrushTool`)**: A one-shot brush that owns a `ScriptEngine` and evaluates one compiled script per affected vertex.
+  * Read-only inputs:
+    * `x`, `y`, `z`: unit position, domain-warped when warping is enabled.
+    * `lat`, `lon`: unwarped position in degrees.
+    * `elevation`: the value before the dab.
+    * `weight`: falloff multiplied by the selection weight.
+    * `distance`, `radius`: brush distance units.
+    * `lower`, `upper`: the ordered Between/And range.
+  * Inputs are reset for every vertex, so script assignments do not leak to the next vertex.
+  * The result is either normalised, so [-1, 1] maps to the range, or treated as an elevation clamped to the range.
+  * The result is then combined using the same operation, domain warp, falloff, and selection pipeline as the noise brushes, through `ApplyNoiseSampler`.
+  * That pipeline samples all vertices before writing. A failing script, a non-finite result, or a loop-limit violation therefore leaves the layer unchanged.
+  * The UI catches the error and shows it in the brush panel.
+  * `UIManager` registers the tool, so `oswald_model` does not depend on exprtk.
+  * The panel edits a draft script. The draft is compiled only when Compile is pressed.
+  * Compile diagnostics show the line and column. A failed compile keeps the previous script active.
 
 The single hover readout reports the cumulative elevation through the active layer,
 including visible layers below it and any in-progress brush preview, but excluding
@@ -531,6 +559,12 @@ Homebrew). CMake discovers it with `find_package(TIFF REQUIRED)` and links
 
 `oswald_view` builds the renderer; the OpenGL-independent colour-map loader and
 stop interpolator live in `oswald_model` for use by both rendering and RGB export.
+exprtk is fetched as a header-only `exprtk` INTERFACE target and is included
+only by `src/ScriptEngine.cpp` in the `oswald_scripting` library, keeping its
+large compile cost in one translation unit. The scripting library links
+`oswald_model` for the shared noise primitives and also contains the
+`ScriptedBrushTool`. `script_engine_tests` and `scripted_brush_tool_tests` cover
+the engine and brush without a display.
 Shaders and all `.map`
 files in `assets/colormaps` are copied at configuration time into the build's
 `resources` directory. Editing a source shader/map triggers CMake regeneration

@@ -490,6 +490,30 @@ void testPhase18NoiseTools() {
     checkModifiers(modifiedSpectral, modifiedSpectral.GetSettings());
 }
 
+void testFullRangeBlendStaysInRange() {
+    SphericalGrid model({2000, 0.0, 29});
+    const auto& grid = *model.GetSnapshot();
+    BrushSettings brushSettings;
+    brushSettings.radius = 20020.0;
+    brushSettings.falloffPercent = 100.0;
+    NoiseSettings parameters;
+    parameters.rangeBetween = -32767.0F;
+    parameters.rangeAnd = 32767.0F;
+    for (const double sample : {0.0, 1.0, 0.999999, 1e-7}) {
+        for (const float start : {-32767.0F, 32767.0F, -32766.99F, 1.0e-3F}) {
+            std::vector<float> elevations(grid.GetVertices().size(), start);
+            ApplyNoiseSampler(grid, {0, 0, 1}, elevations, brushSettings, 0.0, parameters,
+                              [sample](const NoiseSample&) { return sample; });
+            check(std::all_of(elevations.begin(), elevations.end(), [](float height) {
+                      return std::isfinite(height) && height >= -32767.0F &&
+                             height <= 32767.0F;
+                  }), "Full-range noise blending escaped the valid elevation range.");
+            SphericalGrid target({2000, 0.0, 29});
+            target.SetElevations(elevations);
+        }
+    }
+}
+
 void testGaussianBlurBrush() {
     SphericalGrid model({1000, 0.0, 31});
     const auto& grid = *model.GetSnapshot();
@@ -697,6 +721,7 @@ int main() {
         testSimplexNoiseOperations();
         testSimplexNoiseValueRange();
         testPhase18NoiseTools();
+        testFullRangeBlendStaysInRange();
         testGaussianBlurBrush();
         testClampBrush();
         testAdditionalBrushSelectionWeights();

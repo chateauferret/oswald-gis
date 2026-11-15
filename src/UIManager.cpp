@@ -341,7 +341,9 @@ std::vector<float> selectionWeightsOf(const SphericalGridSnapshot& snapshot) {
 
 UIManager::UIManager(const GridOptions& options, std::filesystem::path colorMapDirectory)
     : options_(options), previousOptions_(options),
-      colorMapDirectory_(std::move(colorMapDirectory)) {}
+      colorMapDirectory_(std::move(colorMapDirectory)) {
+    brushTools_.RegisterTool(std::make_unique<ScriptedBrushTool>());
+}
 
 UIManager::~UIManager() {
     if (gridControl_) {
@@ -462,6 +464,80 @@ void UIManager::NavigateRasterDirectory(const std::filesystem::path& directory) 
     }
 }
 
+void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
+    auto& parameters = tool.GetSettings();
+    constexpr std::array outputNames{"Normalised (-1 to 1 mapped to range)",
+                                     "Elevation (clamped to range)"};
+    int output = static_cast<int>(parameters.output);
+    if (ImGui::Combo("Script output", &output, outputNames.data(),
+                     static_cast<int>(outputNames.size()))) {
+        parameters.output = static_cast<ScriptedBrushSettings::Output>(output);
+    }
+
+    const std::string compiled = tool.GetScript();
+    if (!scriptDraft_) {
+        scriptDraft_ = compiled;
+    }
+    ImGui::TextUnformatted("Script");
+    ImGui::InputTextMultiline("##BrushScript", &*scriptDraft_,
+                              ImVec2(-1.0F, ImGui::GetTextLineHeight() * 10.0F),
+                              ImGuiInputTextFlags_AllowTabInput);
+    const bool modified = *scriptDraft_ != compiled;
+    ImGui::BeginDisabled(!modified);
+    if (ImGui::Button("Compile")) {
+        try {
+            tool.SetScript(*scriptDraft_);
+            scriptErrors_.clear();
+            brushError_.clear();
+        } catch (const ScriptError& error) {
+            scriptErrors_.clear();
+            for (const auto& diagnostic : error.Diagnostics()) {
+                scriptErrors_.push_back(
+                    diagnostic.line == 0 ? diagnostic.message
+                        : "Line " + std::to_string(diagnostic.line) + ", column " +
+                              std::to_string(diagnostic.column) + ": " + diagnostic.message);
+            }
+            if (scriptErrors_.empty()) {
+                scriptErrors_.emplace_back(error.what());
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Revert")) {
+        scriptDraft_ = compiled;
+        scriptErrors_.clear();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Default")) {
+        scriptDraft_ = std::string(ScriptedBrushTool::DefaultScript);
+    }
+    if (modified) {
+        ImGui::TextColored(ImVec4(1.0F, 0.72F, 0.32F, 1.0F),
+                           "Uncompiled changes. Strokes use the last compiled script.");
+    }
+    for (const auto& message : scriptErrors_) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.4F, 0.4F, 1.0F));
+        ImGui::TextWrapped("%s", message.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (ImGui::CollapsingHeader("Script reference")) {
+        ImGui::TextWrapped(
+            "The value of the final statement is the brush output. Inputs: x, y, z "
+            "(unit position, domain-warped when enabled), lat, lon (degrees), elevation "
+            "(current value), weight (falloff x selection), distance and radius (brush "
+            "units), lower and upper (ordered range).");
+        ImGui::TextWrapped(
+            "Noise (uses the seed, returns -1 to 1): simplex(x,y,z), valuenoise(x,y,z), "
+            "fbm(x,y,z,freq,lacunarity,persistence,octaves), billow(...same...), "
+            "valuefbm(...same...), ridged(...same..., offset, gain).");
+        ImGui::TextWrapped(
+            "Also available: + - * / %% ^, comparisons, if/else, for/while loops, "
+            "var locals, abs, min, max, clamp(lo,x,hi), sqrt, exp, log, pow, sin, cos, "
+            "floor, round, pi. Names are case-sensitive; strings and return are not allowed.");
+    }
+}
+
 void UIManager::RenderBrushPanel() {
     if (!brushTools_.IsActive()) {
         return;
@@ -476,8 +552,19 @@ void UIManager::RenderBrushPanel() {
     auto* spectralNoise = dynamic_cast<PowerLawNoiseBrushTool*>(&tool);
     auto* blur = dynamic_cast<GaussianBlurBrushTool*>(&tool);
     auto* clamp = dynamic_cast<ClampBrushTool*>(&tool);
+    auto* scripted = dynamic_cast<ScriptedBrushTool*>(&tool);
+    NoiseSettings* noiseCommon = noise != nullptr ? &noise->GetSettings() :
+        valueNoise != nullptr ? &valueNoise->GetSettings() :
+        ridgeNoise != nullptr ? &ridgeNoise->GetSettings() :
+        spectralNoise != nullptr ? &spectralNoise->GetSettings() :
+        scripted != nullptr ? static_cast<NoiseSettings*>(&scripted->GetSettings()) : nullptr;
     const std::string title = std::string(tool.GetName()) + "###BrushParameters";
     if (ImGui::Begin(title.c_str(), &open)) {
+        if (!brushError_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.4F, 0.4F, 1.0F));
+            ImGui::TextWrapped("Brush failed: %s", brushError_.c_str());
+            ImGui::PopStyleColor();
+        }
         auto& settings = brushTools_.GetSettings();
         if (raiseLower) {
             constexpr std::array operationNames{"Raise", "Lower"};
@@ -493,14 +580,10 @@ void UIManager::RenderBrushPanel() {
                              static_cast<int>(operationNames.size()))) {
                 settings.operation = static_cast<BrushOperation>(operation);
             }
-        } else if (noise != nullptr || valueNoise != nullptr || ridgeNoise != nullptr ||
-                   spectralNoise != nullptr) {
+        } else if (noiseCommon != nullptr) {
             constexpr std::array operationNames{"Replace", "Add", "Subtract",
                                                 "Minimum", "Maximum"};
-            auto& operation = noise != nullptr ? noise->GetSettings().operation :
-                valueNoise != nullptr ? valueNoise->GetSettings().operation :
-                ridgeNoise != nullptr ? ridgeNoise->GetSettings().operation :
-                                        spectralNoise->GetSettings().operation;
+            auto& operation = noiseCommon->operation;
             int selectedOperation = static_cast<int>(operation);
             if (ImGui::Combo("Operation", &selectedOperation, operationNames.data(),
                              static_cast<int>(operationNames.size()))) {
@@ -526,9 +609,7 @@ void UIManager::RenderBrushPanel() {
         radius = clipUiValue(radius, 0.1F, maximumRadius, 500.0F);
         settings.radius = radius;
         showRangeTooltip(0.1F, maximumRadius);
-        const bool noiseTool = noise != nullptr || valueNoise != nullptr ||
-                               ridgeNoise != nullptr || spectralNoise != nullptr;
-        if (noiseTool) {
+        if (noiseCommon != nullptr) {
             const double planetRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
                                             ? earthRadiusKilometres : earthRadiusMiles;
             const double angularRadius = std::min(settings.radius / planetRadius,
@@ -562,13 +643,8 @@ void UIManager::RenderBrushPanel() {
                                "%.0f", ImGuiSliderFlags_AlwaysClamp);
             settings.value = clipUiValue(settings.value, -32767.0F, 32767.0F, 0.0F);
             showRangeTooltip(-32767.0F, 32767.0F);
-        } else if (noise != nullptr || valueNoise != nullptr || ridgeNoise != nullptr ||
-                   spectralNoise != nullptr) {
-            NoiseSettings& common = noise != nullptr ?
-                static_cast<NoiseSettings&>(noise->GetSettings()) : valueNoise != nullptr ?
-                static_cast<NoiseSettings&>(valueNoise->GetSettings()) : ridgeNoise != nullptr ?
-                static_cast<NoiseSettings&>(ridgeNoise->GetSettings()) :
-                static_cast<NoiseSettings&>(spectralNoise->GetSettings());
+        } else if (noiseCommon != nullptr) {
+            NoiseSettings& common = *noiseCommon;
             ImGui::InputScalar("Seed", ImGuiDataType_U64, &common.seed);
             ImGui::SameLine();
             if (ImGui::Button("Randomise Seed")) {
@@ -690,6 +766,8 @@ void UIManager::RenderBrushPanel() {
                                                ImGuiSliderFlags_AlwaysClamp);
                 parameters.frequency = clipUiValue(parameters.frequency, 0.01F, 1.0e6F, 4.0F);
                 showRangeTooltip(0.01F, 1.0e6F);
+            } else if (scripted != nullptr) {
+                RenderScriptEditor(*scripted);
             }
         } else if (blur != nullptr) {
             auto& parameters = blur->GetSettings();
@@ -1321,9 +1399,28 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
         auto before = std::move(stroke_->original);
         auto after = std::move(stroke_->working);
         stroke_.reset();
+        // Tools clamp their output, but never let a bad value reach the grid's validation:
+        // restore non-finite values and clamp the rest before committing the stroke.
+        for (std::size_t index = 0; index < after.size() && index < before.size(); ++index) {
+            if (!std::isfinite(after[index])) {
+                after[index] = before[index];
+            }
+            after[index] = std::clamp(after[index], -32767.0f, 32767.0f);
+        }
         if (before != after) {
-            undoStack_.Execute(std::make_unique<BrushStrokeCommand>(
-                grid, renderer, std::move(before), std::move(after)));
+            try {
+                undoStack_.Execute(std::make_unique<BrushStrokeCommand>(
+                    grid, renderer, std::move(before), std::move(after)));
+            } catch (const std::exception& error) {
+                brushError_ = std::string("Brush stroke discarded: ") + error.what();
+                std::vector<float> current;
+                const auto snapshot = grid.GetSnapshot();
+                current.reserve(snapshot->GetVertices().size());
+                for (const auto& vertex : snapshot->GetVertices()) {
+                    current.push_back(vertex.elevation);
+                }
+                renderer.UpdateLayerElevations(grid.GetElevationLayer(), current);
+            }
         }
     }
 
@@ -1347,17 +1444,27 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
         const auto snapshot = grid.GetSnapshot();
         const auto& tool = brushTools_.GetSelectedTool();
         std::vector<std::size_t> changed;
+        // Tools leave their output untouched when Apply throws, so a failed dab is skipped.
+        const auto applyTool = [&](std::vector<float>& values) {
+            try {
+                auto result = tool.Apply(*snapshot, *cursorCenter, values,
+                                         brushTools_.GetSettings(), io.DeltaTime);
+                brushError_.clear();
+                return result;
+            } catch (const std::exception& error) {
+                brushError_ = error.what();
+                return std::vector<std::size_t>{};
+            }
+        };
         if (tool.IsContinuous()) {
-            changed = tool.Apply(*snapshot, *cursorCenter, stroke_->working,
-                                 brushTools_.GetSettings(), io.DeltaTime);
+            changed = applyTool(stroke_->working);
         } else {
             // Evaluate each dab against the pre-stroke terrain and keep the strongest
             // effect per vertex, so overlapping or stationary dabs never compound.
             if (stroke_->scratch.empty()) {
                 stroke_->scratch = stroke_->original;
             }
-            const auto dabChanged = tool.Apply(*snapshot, *cursorCenter, stroke_->scratch,
-                                               brushTools_.GetSettings(), io.DeltaTime);
+            const auto dabChanged = applyTool(stroke_->scratch);
             for (const auto index : dabChanged) {
                 const float original = stroke_->original[index];
                 if (std::abs(stroke_->scratch[index] - original) >
@@ -1836,8 +1943,16 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     PollGridGeneration(grid, renderer);
     const bool generating = gridFuture_.valid() || gridProgressOpen_;
     bool requestExit = false;
-    const auto undo = [&] { undoStack_.Undo(); };
-    const auto redo = [&] { undoStack_.Redo(); };
+    const auto runHistory = [&](bool (UndoStack::*step)(), const char* name) {
+        try {
+            (undoStack_.*step)();
+        } catch (const std::exception& error) {
+            projectError_ = std::string(name) + " failed: " + error.what();
+            projectErrorOpen_ = true;
+        }
+    };
+    const auto undo = [&] { runHistory(&UndoStack::Undo, "Undo"); };
+    const auto redo = [&] { runHistory(&UndoStack::Redo, "Redo"); };
     const bool projectBusy = generating || stroke_.has_value() || selectionStroke_.has_value();
     if (!projectBusy && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
         ImGui::GetIO().KeyCtrl && !ImGui::GetIO().WantTextInput) {

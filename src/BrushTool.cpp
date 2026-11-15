@@ -1,11 +1,11 @@
 #include "BrushTool.hpp"
 
+#include "Noise.hpp"
+
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <complex>
 #include <cstdint>
-#include <limits>
 #include <numbers>
 #include <stdexcept>
 #include <utility>
@@ -18,6 +18,15 @@ constexpr float minimumElevation = -32767.0F;
 constexpr float maximumElevation = 32767.0F;
 
 bool validElevation(float value);
+
+// Blends in double precision and clamps, because float rounding of
+// (destination - current) can push the result just past the valid range.
+float blendElevation(float current, float destination, double weight) {
+    const double blended = static_cast<double>(current) +
+        (static_cast<double>(destination) - static_cast<double>(current)) * weight;
+    return static_cast<float>(std::clamp(blended, static_cast<double>(minimumElevation),
+                                         static_cast<double>(maximumElevation)));
+}
 
 void validate(const SphericalGridSnapshot& grid, const std::vector<float>& elevations,
               const BrushSettings& settings, double elapsedSeconds) {
@@ -108,124 +117,6 @@ std::vector<std::size_t> applyBrush(
     return changed;
 }
 
-std::uint32_t latticeHash(std::int64_t x, std::int64_t y, std::int64_t z,
-                          std::uint64_t seed) {
-    std::uint32_t hash = static_cast<std::uint32_t>(x) * 0x8da6b343U ^
-                         static_cast<std::uint32_t>(y) * 0xd8163841U ^
-                         static_cast<std::uint32_t>(z) * 0xcb1ab31fU;
-    hash ^= static_cast<std::uint32_t>(seed) * 0x9e3779b9U;
-    hash ^= static_cast<std::uint32_t>(seed >> 32) * 0x85ebca6bU;
-    hash ^= hash >> 16;
-    hash *= 0x7feb352dU;
-    hash ^= hash >> 15;
-    hash *= 0x846ca68bU;
-    hash ^= hash >> 16;
-    return hash;
-}
-
-double simplexCorner(std::int64_t i, std::int64_t j, std::int64_t k,
-                     const glm::dvec3& offset, std::uint64_t seed) {
-    static constexpr std::array<glm::ivec3, 12> gradients{{
-        {1, 1, 0}, {-1, 1, 0}, {1, -1, 0}, {-1, -1, 0},
-        {1, 0, 1}, {-1, 0, 1}, {1, 0, -1}, {-1, 0, -1},
-        {0, 1, 1}, {0, -1, 1}, {0, 1, -1}, {0, -1, -1}
-    }};
-    const double attenuation = 0.6 - glm::dot(offset, offset);
-    if (attenuation <= 0.0) {
-        return 0.0;
-    }
-    const auto& gradient = gradients[latticeHash(i, j, k, seed) % gradients.size()];
-    const double squared = attenuation * attenuation;
-    return squared * squared *
-           (gradient.x * offset.x + gradient.y * offset.y + gradient.z * offset.z);
-}
-
-double simplexNoise(glm::dvec3 point, std::uint64_t seed) {
-    constexpr double skew = 1.0 / 3.0;
-    constexpr double unskew = 1.0 / 6.0;
-    const double skewed = (point.x + point.y + point.z) * skew;
-    const auto i = static_cast<std::int64_t>(std::floor(point.x + skewed));
-    const auto j = static_cast<std::int64_t>(std::floor(point.y + skewed));
-    const auto k = static_cast<std::int64_t>(std::floor(point.z + skewed));
-    const double unskewed = static_cast<double>(i + j + k) * unskew;
-    const glm::dvec3 first(point.x - (static_cast<double>(i) - unskewed),
-                           point.y - (static_cast<double>(j) - unskewed),
-                           point.z - (static_cast<double>(k) - unskewed));
-
-    glm::ivec3 firstOffset;
-    glm::ivec3 secondOffset;
-    if (first.x >= first.y) {
-        if (first.y >= first.z) {
-            firstOffset = {1, 0, 0};
-            secondOffset = {1, 1, 0};
-        } else if (first.x >= first.z) {
-            firstOffset = {1, 0, 0};
-            secondOffset = {1, 0, 1};
-        } else {
-            firstOffset = {0, 0, 1};
-            secondOffset = {1, 0, 1};
-        }
-    } else if (first.y < first.z) {
-        firstOffset = {0, 0, 1};
-        secondOffset = {0, 1, 1};
-    } else if (first.x < first.z) {
-        firstOffset = {0, 1, 0};
-        secondOffset = {0, 1, 1};
-    } else {
-        firstOffset = {1, 1, 0};
-        secondOffset = {0, 1, 1};
-    }
-    const glm::dvec3 second = first - glm::dvec3(firstOffset) + unskew;
-    const glm::dvec3 third = first - glm::dvec3(secondOffset) + 2.0 * unskew;
-    const glm::dvec3 fourth = first - 1.0 + 3.0 * unskew;
-    return 32.0 * (simplexCorner(i, j, k, first, seed) +
-                   simplexCorner(i + firstOffset.x, j + firstOffset.y,
-                                 k + firstOffset.z, second, seed) +
-                   simplexCorner(i + secondOffset.x, j + secondOffset.y,
-                                 k + secondOffset.z, third, seed) +
-                   simplexCorner(i + 1, j + 1, k + 1, fourth, seed));
-}
-
-double hashValue(std::int64_t x, std::int64_t y, std::int64_t z, std::uint64_t seed) {
-    return static_cast<double>(latticeHash(x, y, z, seed)) /
-               static_cast<double>(std::numeric_limits<std::uint32_t>::max()) * 2.0 - 1.0;
-}
-
-double interpolationCurve(double value, ValueNoiseSettings::Interpolation interpolation) {
-    switch (interpolation) {
-    case ValueNoiseSettings::Interpolation::Linear:
-        return value;
-    case ValueNoiseSettings::Interpolation::Cubic:
-        return value * value * (3.0 - 2.0 * value);
-    case ValueNoiseSettings::Interpolation::Quintic:
-        return value * value * value * (value * (value * 6.0 - 15.0) + 10.0);
-    }
-    throw std::invalid_argument("Value noise interpolation mode is invalid.");
-}
-
-double valueNoise(glm::dvec3 point, std::uint64_t seed,
-                  ValueNoiseSettings::Interpolation interpolation) {
-    const auto x0 = static_cast<std::int64_t>(std::floor(point.x));
-    const auto y0 = static_cast<std::int64_t>(std::floor(point.y));
-    const auto z0 = static_cast<std::int64_t>(std::floor(point.z));
-    const double x = interpolationCurve(point.x - x0, interpolation);
-    const double y = interpolationCurve(point.y - y0, interpolation);
-    const double z = interpolationCurve(point.z - z0, interpolation);
-    const double c000 = hashValue(x0, y0, z0, seed);
-    const double c100 = hashValue(x0 + 1, y0, z0, seed);
-    const double c010 = hashValue(x0, y0 + 1, z0, seed);
-    const double c110 = hashValue(x0 + 1, y0 + 1, z0, seed);
-    const double c001 = hashValue(x0, y0, z0 + 1, seed);
-    const double c101 = hashValue(x0 + 1, y0, z0 + 1, seed);
-    const double c011 = hashValue(x0, y0 + 1, z0 + 1, seed);
-    const double c111 = hashValue(x0 + 1, y0 + 1, z0 + 1, seed);
-    const double z0Blend = std::lerp(std::lerp(std::lerp(c000, c100, x),
-                                               std::lerp(c010, c110, x), y),
-                                     std::lerp(std::lerp(c001, c101, x),
-                                               std::lerp(c011, c111, x), y), z);
-    return z0Blend;
-}
-
 bool validNoiseOperation(NoiseSettings::Operation operation) {
     return operation == NoiseSettings::Operation::Replace ||
            operation == NoiseSettings::Operation::Add ||
@@ -259,6 +150,10 @@ void validateFractalSettings(const FractalNoiseSettings& settings) {
     }
 }
 
+noise::FractalParameters fractalOf(const FractalNoiseSettings& settings) {
+    return {settings.frequency, settings.lacunarity, settings.persistence, settings.octaves};
+}
+
 glm::dvec3 warpedPosition(glm::dvec3 position, const NoiseSettings& settings) {
     if (!settings.domainWarpEnabled || settings.warpStrength == 0.0F) {
         return position;
@@ -272,9 +167,9 @@ glm::dvec3 warpedPosition(glm::dvec3 position, const NoiseSettings& settings) {
         const auto octaveSeed = settings.seed +
             (0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(octave + 1));
         displacement += glm::dvec3(
-            simplexNoise(domain, octaveSeed ^ 0x9e3779b97f4a7c15ULL),
-            simplexNoise(domain, octaveSeed ^ 0xbf58476d1ce4e5b9ULL),
-            simplexNoise(domain, octaveSeed ^ 0x94d049bb133111ebULL)) * amplitude;
+            noise::Simplex(domain, octaveSeed ^ 0x9e3779b97f4a7c15ULL),
+            noise::Simplex(domain, octaveSeed ^ 0xbf58476d1ce4e5b9ULL),
+            noise::Simplex(domain, octaveSeed ^ 0x94d049bb133111ebULL)) * amplitude;
         totalAmplitude += amplitude;
         frequency *= settings.warpLacunarity;
         amplitude *= settings.warpPersistence;
@@ -299,32 +194,58 @@ float destinationForNoise(NoiseSettings::Operation operation, double noise,
 }
 
 template <typename Sampler>
-std::vector<std::size_t> applyNoise(
+std::vector<std::size_t> applyNoiseSamples(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
-    Sampler sample) {
+    Sampler&& sample) {
     validateNoiseSettings(parameters);
     const auto weights = brushWeights(grid, center, elevations, brushSettings, elapsedSeconds);
+    center = glm::normalize(center);
+    const double radius = planetRadius(brushSettings.distanceUnit);
     const float lower = std::min(parameters.rangeBetween, parameters.rangeAnd);
     const float upper = std::max(parameters.rangeBetween, parameters.rangeAnd);
-    std::vector<std::size_t> changed;
-    changed.reserve(weights.size());
+    // Sample every vertex before writing so a throwing sampler leaves elevations intact.
+    std::vector<std::pair<std::size_t, float>> updates;
+    updates.reserve(weights.size());
     for (const auto& [index, weight] : weights) {
         const float current = elevations[index];
         if (!validElevation(current)) {
             throw std::invalid_argument("Noise input elevations must be finite and in range.");
         }
-        const auto position = warpedPosition(
-            glm::normalize(glm::dvec3(grid.GetVertices()[index].position)), parameters);
-        const float result = destinationForNoise(parameters.operation,
-                                                 sample(position, index), current, lower, upper);
-        const float updated = current + (result - current) * static_cast<float>(weight);
+        NoiseSample noiseSample;
+        noiseSample.location = glm::normalize(glm::dvec3(grid.GetVertices()[index].position));
+        noiseSample.position = warpedPosition(noiseSample.location, parameters);
+        noiseSample.index = index;
+        noiseSample.elevation = current;
+        noiseSample.weight = weight;
+        noiseSample.distance = radius * std::atan2(
+            glm::length(glm::cross(center, noiseSample.location)),
+            glm::dot(center, noiseSample.location));
+        const float result = destinationForNoise(parameters.operation, sample(noiseSample),
+                                                 current, lower, upper);
+        const float updated = blendElevation(current, result, weight);
         if (updated != current) {
-            elevations[index] = updated;
-            changed.push_back(index);
+            updates.emplace_back(index, updated);
         }
     }
+    std::vector<std::size_t> changed;
+    changed.reserve(updates.size());
+    for (const auto& [index, updated] : updates) {
+        elevations[index] = updated;
+        changed.push_back(index);
+    }
     return changed;
+}
+
+template <typename Sampler>
+std::vector<std::size_t> applyNoise(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
+    Sampler sample) {
+    return applyNoiseSamples(grid, center, elevations, brushSettings, elapsedSeconds, parameters,
+                             [&](const NoiseSample& noiseSample) {
+                                 return sample(noiseSample.position, noiseSample.index);
+                             });
 }
 
 using Complex = std::complex<double>;
@@ -391,7 +312,7 @@ std::shared_ptr<const std::vector<float>> buildSpectralField(int resolution,
     for (int z = 0; z < resolution; ++z) {
         for (int y = 0; y < resolution; ++y) {
             for (int x = 0; x < resolution; ++x) {
-                field[index(x, y, z)] = Complex(hashValue(x, y, z, seed), 0.0);
+                field[index(x, y, z)] = Complex(noise::HashValue(x, y, z, seed), 0.0);
             }
         }
     }
@@ -459,6 +380,17 @@ bool validElevation(float value) {
 
 } // namespace
 
+std::vector<std::size_t> ApplyNoiseSampler(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
+    const NoiseSampler& sample) {
+    if (!sample) {
+        throw std::invalid_argument("Noise sampler is empty.");
+    }
+    return applyNoiseSamples(grid, center, elevations, brushSettings, elapsedSeconds, parameters,
+                             sample);
+}
+
 std::vector<std::size_t> ElevationBrushTool::Apply(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& settings, double elapsedSeconds) const {
@@ -474,7 +406,7 @@ std::vector<std::size_t> ElevationBrushTool::Apply(
     return applyBrush(grid, center, elevations, settings, elapsedSeconds,
                       [&](float current, double falloff) {
         const float result = applyOperation(settings.operation, current, settings.value);
-        return current + (result - current) * static_cast<float>(falloff);
+        return blendElevation(current, result, falloff);
     });
 }
 
@@ -517,17 +449,7 @@ std::vector<std::size_t> SimplexNoiseBrushTool::Apply(
     }
     return applyNoise(grid, center, elevations, settings, elapsedSeconds, parameters,
         [&](glm::dvec3 position, std::size_t) {
-        double frequency = parameters.frequency;
-        double amplitude = 1.0;
-        double totalAmplitude = 0.0;
-        double value = 0.0;
-        for (int octave = 0; octave < parameters.octaves; ++octave) {
-            value += simplexNoise(position * frequency, parameters.seed) * amplitude;
-            totalAmplitude += amplitude;
-            frequency *= parameters.lacunarity;
-            amplitude *= parameters.persistence;
-        }
-        value /= totalAmplitude;
+        double value = noise::SimplexFbm(position, parameters.seed, fractalOf(parameters));
         if (parameters.billowed) {
             value = 2.0 * std::abs(value) - 1.0;
         }
@@ -546,18 +468,9 @@ std::vector<std::size_t> ValueNoiseBrushTool::Apply(
     }
     return applyNoise(grid, center, elevations, settings, elapsedSeconds, parameters,
         [&](glm::dvec3 position, std::size_t) {
-            double frequency = parameters.frequency;
-            double amplitude = 1.0;
-            double totalAmplitude = 0.0;
-            double value = 0.0;
-            for (int octave = 0; octave < parameters.octaves; ++octave) {
-                value += valueNoise(position * frequency, parameters.seed, parameters.interpolation) *
-                         amplitude;
-                totalAmplitude += amplitude;
-                frequency *= parameters.lacunarity;
-                amplitude *= parameters.persistence;
-            }
-            return std::clamp(value / totalAmplitude * parameters.amplitude, -1.0, 1.0);
+            const double value = noise::ValueFbm(position, parameters.seed,
+                                                 parameters.interpolation, fractalOf(parameters));
+            return std::clamp(value * parameters.amplitude, -1.0, 1.0);
         });
 }
 
@@ -573,22 +486,8 @@ std::vector<std::size_t> RidgeNoiseBrushTool::Apply(
     }
     return applyNoise(grid, center, elevations, settings, elapsedSeconds, parameters,
         [&](glm::dvec3 position, std::size_t) {
-            double frequency = parameters.frequency;
-            double amplitude = 1.0;
-            double totalAmplitude = 0.0;
-            double result = 0.0;
-            double feedback = 1.0;
-            for (int octave = 0; octave < parameters.octaves; ++octave) {
-                const double base = simplexNoise(position * frequency, parameters.seed);
-                const double ridge = std::clamp(parameters.ridgeOffset - std::abs(base), 0.0, 1.0);
-                const double signal = std::pow(ridge, parameters.gainExponent) * feedback;
-                result += signal * amplitude;
-                totalAmplitude += amplitude;
-                feedback = std::clamp(signal * 2.0, 0.0, 1.0);
-                frequency *= parameters.lacunarity;
-                amplitude *= parameters.persistence;
-            }
-            return std::clamp(2.0 * result / totalAmplitude - 1.0, -1.0, 1.0);
+            return noise::Ridged(position, parameters.seed, fractalOf(parameters),
+                                 parameters.ridgeOffset, parameters.gainExponent);
         });
 }
 
@@ -659,9 +558,11 @@ std::vector<std::size_t> GaussianBlurBrushTool::Apply(
             weightedSum += static_cast<double>(source[neighbor]) * gaussianWeight;
             weightSum += gaussianWeight;
         }
+        if (!(weightSum > 0.0)) {
+            continue;
+        }
         const float destination = static_cast<float>(weightedSum / weightSum);
-        const float updated = source[index] +
-            (destination - source[index]) * static_cast<float>(brushWeight);
+        const float updated = blendElevation(source[index], destination, brushWeight);
         if (updated != source[index]) {
             elevations[index] = updated;
             changed.push_back(index);
@@ -684,7 +585,7 @@ std::vector<std::size_t> ClampBrushTool::Apply(
             throw std::invalid_argument("Clamp input elevations must be finite and in range.");
         }
         const float destination = std::clamp(current, settings_.minimum, settings_.maximum);
-        return current + (destination - current) * static_cast<float>(weight);
+        return blendElevation(current, destination, weight);
     });
 }
 

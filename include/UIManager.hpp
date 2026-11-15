@@ -4,6 +4,7 @@
 #include "ElevationRaster.hpp"
 #include "RasterFileBrowser.hpp"
 #include "BrushTool.hpp"
+#include "ScriptedBrushTool.hpp"
 #include "Filter.hpp"
 #include "SelectionTool.hpp"
 #include "UndoStack.hpp"
@@ -66,6 +67,7 @@ private:
     void RenderGridProgressDialog();
     void NavigateRasterDirectory(const std::filesystem::path& directory);
     void RenderBrushPanel();
+    void RenderScriptEditor(ScriptedBrushTool& tool);
     void RenderSelectionPanel();
     void RenderValueSelectionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderFillFilterDialog(SphericalGrid& grid, GlobeRenderer& renderer);
@@ -126,6 +128,9 @@ private:
     FillFilterSettings pendingFillSettings_;
     std::string fillFilterError_;
     std::string simplexSeedError_;
+    std::optional<std::string> scriptDraft_;
+    std::vector<std::string> scriptErrors_;
+    std::string brushError_;
     bool settingsOpen_ = false;
     double pendingRaiseLowerRate_ = BrushSettings{}.raiseLowerRate;
     CameraController* camera_ = nullptr;

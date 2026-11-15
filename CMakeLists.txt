@@ -99,15 +99,38 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(stb)
 
+# exprtk is a single header; SOURCE_SUBDIR points at a directory without a
+# CMakeLists.txt so only the sources are fetched.
+FetchContent_Declare(
+    exprtk
+    GIT_REPOSITORY https://github.com/ArashPartow/exprtk.git
+    GIT_TAG 0.0.3
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR no-cmake
+)
+FetchContent_MakeAvailable(exprtk)
+add_library(exprtk INTERFACE)
+target_include_directories(exprtk SYSTEM INTERFACE "${exprtk_SOURCE_DIR}")
+
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(TIFF REQUIRED)
 
 add_library(oswald_model STATIC src/Layer.cpp src/ColorMap.cpp src/SphericalGrid.cpp src/ProjectFile.cpp src/ElevationRaster.cpp src/BrushTool.cpp
-    src/SelectionTool.cpp src/Filter.cpp)
+    src/SelectionTool.cpp src/Filter.cpp src/Noise.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
 target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r TIFF::TIFF)
+
+# exprtk is only included by ScriptEngine.cpp, keeping its compile cost in one unit.
+add_library(oswald_scripting STATIC src/ScriptEngine.cpp src/ScriptedBrushTool.cpp)
+target_include_directories(oswald_scripting PUBLIC include)
+target_link_libraries(oswald_scripting PUBLIC oswald_model PRIVATE exprtk)
+if(MSVC)
+    target_compile_options(oswald_scripting PRIVATE /bigobj)
+elseif(MINGW)
+    target_compile_options(oswald_scripting PRIVATE -Wa,-mbig-obj)
+endif()
 
 add_library(oswald_controller STATIC src/CameraController.cpp)
 target_include_directories(oswald_controller PUBLIC include)
@@ -138,6 +161,7 @@ target_compile_definitions(oswald_gis PRIVATE
 target_link_libraries(oswald_gis PRIVATE
     oswald_view
     oswald_model
+    oswald_scripting
     oswald_controller
     glfw
     glad_gl_core_45
@@ -170,6 +194,14 @@ if(BUILD_TESTING)
     target_link_libraries(brush_tool_tests PRIVATE oswald_model)
     add_test(NAME brush_tool COMMAND brush_tool_tests)
 
+    add_executable(script_engine_tests tests/ScriptEngineTests.cpp)
+    target_link_libraries(script_engine_tests PRIVATE oswald_scripting)
+    add_test(NAME script_engine COMMAND script_engine_tests)
+
+    add_executable(scripted_brush_tool_tests tests/ScriptedBrushToolTests.cpp)
+    target_link_libraries(scripted_brush_tool_tests PRIVATE oswald_scripting)
+    add_test(NAME scripted_brush_tool COMMAND scripted_brush_tool_tests)
+
     add_executable(selection_tool_tests tests/SelectionToolTests.cpp)
     target_link_libraries(selection_tool_tests PRIVATE oswald_model)
     add_test(NAME selection_tool COMMAND selection_tool_tests)
@@ -195,7 +227,7 @@ if(BUILD_TESTING)
     add_test(NAME undo_stack COMMAND undo_stack_tests)
 
     add_executable(ui_manager_tests tests/UIManagerTests.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
-    target_link_libraries(ui_manager_tests PRIVATE oswald_view oswald_controller imgui_lib glfw Threads::Threads)
+    target_link_libraries(ui_manager_tests PRIVATE oswald_view oswald_scripting oswald_controller imgui_lib glfw Threads::Threads)
     target_compile_definitions(ui_manager_tests PRIVATE
         GLFW_INCLUDE_NONE
         OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"

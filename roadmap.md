@@ -83,3 +83,8 @@
    - The brush shares the noise brushes' operation, seed, range, and domain-warp controls.
    - The dockable panel has a multiline script editor with Compile, Revert, and Default buttons, plus a script reference.
    - Compile errors keep the previous script active. Runtime errors leave the layer unchanged and are reported in the panel.
+
+   19.2. **Saved Brush Scripts.** Scripts are saved and loaded as TOML files with a name, description, optional output mode (`normalized` or `elevation`) and script, like `brushes/fbm.toml`.
+   - The Scripted brush panel lists the `brushes/` library folder, showing each script's description. Save to library asks before replacing an existing file.
+   - Import... and Export... read and write script files anywhere through the file browser.
+   - Invalid library files are reported and skipped.

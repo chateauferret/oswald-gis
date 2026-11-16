@@ -160,6 +160,7 @@ int runApplication() {
     UIManager ui(snapshot->GetOptions(), resources / "assets/colormaps");
     activeUiManager = &ui;
     ui.SetCameraController(&camera);
+    ui.SetBrushScriptDirectory(OSWALD_BRUSH_SCRIPT_DIR);
     double previousTime = glfwGetTime();
 
     while (glfwWindowShouldClose(window.get()) == GLFW_FALSE) {

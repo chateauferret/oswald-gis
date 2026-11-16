@@ -18,6 +18,7 @@
 #include <numbers>
 #include <random>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -342,7 +343,14 @@ std::vector<float> selectionWeightsOf(const SphericalGridSnapshot& snapshot) {
 UIManager::UIManager(const GridOptions& options, std::filesystem::path colorMapDirectory)
     : options_(options), previousOptions_(options),
       colorMapDirectory_(std::move(colorMapDirectory)) {
-    brushTools_.RegisterTool(std::make_unique<ScriptedBrushTool>());
+    auto scripted = std::make_unique<ScriptedBrushTool>();
+    scriptedTool_ = scripted.get();
+    brushTools_.RegisterTool(std::move(scripted));
+}
+
+void UIManager::SetBrushScriptDirectory(std::filesystem::path directory) {
+    brushScriptDirectory_ = std::move(directory);
+    RescanScriptLibrary();
 }
 
 UIManager::~UIManager() {
@@ -464,7 +472,232 @@ void UIManager::NavigateRasterDirectory(const std::filesystem::path& directory) 
     }
 }
 
+namespace {
+
+std::vector<std::string> scriptDiagnostics(const ScriptError& error) {
+    std::vector<std::string> messages;
+    for (const auto& diagnostic : error.Diagnostics()) {
+        messages.push_back(
+            diagnostic.line == 0 ? diagnostic.message
+                : "Line " + std::to_string(diagnostic.line) + ", column " +
+                      std::to_string(diagnostic.column) + ": " + diagnostic.message);
+    }
+    if (messages.empty()) {
+        messages.emplace_back(error.what());
+    }
+    return messages;
+}
+
+} // namespace
+
+void UIManager::RescanScriptLibrary() {
+    const auto selectedPath = selectedLibraryScript_ >= 0 &&
+            selectedLibraryScript_ < static_cast<int>(scriptLibrary_.entries.size()) ?
+        scriptLibrary_.entries[static_cast<std::size_t>(selectedLibraryScript_)].path :
+        std::filesystem::path{};
+    scriptLibrary_ = brushScriptDirectory_.empty() ? BrushScriptLibrary{} :
+        BrushScriptLibrary::Scan(brushScriptDirectory_);
+    selectedLibraryScript_ = -1;
+    for (std::size_t index = 0; index < scriptLibrary_.entries.size(); ++index) {
+        if (scriptLibrary_.entries[index].path == selectedPath) {
+            selectedLibraryScript_ = static_cast<int>(index);
+        }
+    }
+}
+
+void UIManager::LoadScriptIntoEditor(const BrushScriptFile& file) {
+    scriptName_ = file.name;
+    scriptDescription_ = file.description;
+    scriptDraft_ = file.script;
+    scriptErrors_.clear();
+    if (scriptedTool_ == nullptr) {
+        return;
+    }
+    if (file.output) {
+        scriptedTool_->GetSettings().output = *file.output;
+    }
+    // A script that fails to compile stays in the editor with its diagnostics; strokes keep
+    // using the last compiled script.
+    try {
+        scriptedTool_->SetScript(file.script);
+        brushError_.clear();
+    } catch (const ScriptError& error) {
+        scriptErrors_ = scriptDiagnostics(error);
+    }
+}
+
+BrushScriptFile UIManager::CurrentScriptFile() const {
+    std::string script = scriptDraft_ ? *scriptDraft_ :
+        scriptedTool_ != nullptr ? scriptedTool_->GetScript() : std::string{};
+    std::optional<ScriptedBrushSettings::Output> output;
+    if (scriptedTool_ != nullptr) {
+        output = scriptedTool_->GetSettings().output;
+    }
+    return {scriptName_, scriptDescription_, std::move(script), output};
+}
+
+void UIManager::SaveScriptToLibrary(const std::filesystem::path& path) {
+    try {
+        std::filesystem::create_directories(path.parent_path());
+        CurrentScriptFile().Save(path);
+        RescanScriptLibrary();
+        for (std::size_t index = 0; index < scriptLibrary_.entries.size(); ++index) {
+            if (scriptLibrary_.entries[index].path == path) {
+                selectedLibraryScript_ = static_cast<int>(index);
+            }
+        }
+        scriptLibraryMessage_ = "Saved " + path.filename().string() + ".";
+        scriptLibraryMessageIsError_ = false;
+    } catch (const std::exception& error) {
+        scriptLibraryMessage_ = error.what();
+        scriptLibraryMessageIsError_ = true;
+    }
+}
+
+void UIManager::RenderScriptLibrary() {
+    ImGui::SeparatorText("Script library");
+    const bool hasLibrary = !brushScriptDirectory_.empty();
+    const auto& entries = scriptLibrary_.entries;
+    const bool validSelection = selectedLibraryScript_ >= 0 &&
+        selectedLibraryScript_ < static_cast<int>(entries.size());
+    const char* preview = validSelection ?
+        entries[static_cast<std::size_t>(selectedLibraryScript_)].file.name.c_str() :
+        entries.empty() ? "(no scripts)" : "(choose a script)";
+    ImGui::BeginDisabled(!hasLibrary || entries.empty());
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5F);
+    if (ImGui::BeginCombo("##ScriptLibrary", preview)) {
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const auto& entry = entries[index];
+            ImGui::PushID(static_cast<int>(index));
+            const bool selected = static_cast<int>(index) == selectedLibraryScript_;
+            if (ImGui::Selectable(entry.file.name.c_str(), selected,
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+                selectedLibraryScript_ = static_cast<int>(index);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    LoadScriptIntoEditor(entry.file);
+                    scriptLibraryMessage_ = "Loaded " + entry.file.name + ".";
+                    scriptLibraryMessageIsError_ = false;
+                }
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", entry.path.filename().string().c_str());
+            }
+            if (!entry.file.description.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", entry.file.description.c_str());
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (validSelection && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        const auto& entry = entries[static_cast<std::size_t>(selectedLibraryScript_)];
+        ImGui::SetTooltip("%s\n%s", entry.file.description.c_str(),
+                          entry.path.string().c_str());
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!validSelection);
+    if (ImGui::Button("Load")) {
+        const auto& entry = entries[static_cast<std::size_t>(selectedLibraryScript_)];
+        // Reload from disk so edits made outside the application are picked up.
+        try {
+            const auto file = BrushScriptFile::Load(entry.path);
+            LoadScriptIntoEditor(file);
+            scriptLibraryMessage_ = "Loaded " + file.name + ".";
+            scriptLibraryMessageIsError_ = false;
+        } catch (const std::exception& error) {
+            scriptLibraryMessage_ = error.what();
+            scriptLibraryMessageIsError_ = true;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!hasLibrary);
+    if (ImGui::Button("Refresh")) {
+        RescanScriptLibrary();
+        scriptLibraryMessage_.clear();
+    }
+    ImGui::EndDisabled();
+    if (hasLibrary && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Rescan %s", brushScriptDirectory_.string().c_str());
+    }
+
+    ImGui::InputText("Name", &scriptName_);
+    ImGui::InputTextMultiline("Description", &scriptDescription_,
+                              ImVec2(0.0F, ImGui::GetTextLineHeight() * 2.5F));
+    const bool named = !scriptName_.empty();
+    ImGui::BeginDisabled(!named || !hasLibrary);
+    if (ImGui::Button("Save to library")) {
+        const auto path = brushScriptDirectory_ / BrushScriptFileName(scriptName_);
+        std::error_code ignored;
+        if (std::filesystem::exists(path, ignored)) {
+            scriptOverwritePath_ = path;
+            ImGui::OpenPopup("Replace Brush Script?");
+        } else {
+            SaveScriptToLibrary(path);
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (!hasLibrary) {
+            ImGui::SetTooltip("No script library folder is configured.");
+        } else if (!named) {
+            ImGui::SetTooltip("Enter a name to save the script.");
+        } else {
+            ImGui::SetTooltip("Saves the editor's script as %s in %s.",
+                              BrushScriptFileName(scriptName_).string().c_str(),
+                              brushScriptDirectory_.string().c_str());
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Import...")) {
+        BeginProjectDialog(ProjectAction::ImportScript);
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!named);
+    if (ImGui::Button("Export...")) {
+        BeginProjectDialog(ProjectAction::ExportScript);
+    }
+    ImGui::EndDisabled();
+    if (!named && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Enter a name to export the script.");
+    }
+
+    if (ImGui::BeginPopupModal("Replace Brush Script?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("Replace %s?", scriptOverwritePath_.string().c_str());
+        if (ImGui::Button("Replace")) {
+            SaveScriptToLibrary(scriptOverwritePath_);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (!scriptLibraryMessage_.empty()) {
+        const auto colour = scriptLibraryMessageIsError_ ? ImVec4(1.0F, 0.4F, 0.4F, 1.0F) :
+                                                           ImVec4(0.6F, 0.9F, 0.6F, 1.0F);
+        ImGui::PushStyleColor(ImGuiCol_Text, colour);
+        ImGui::TextWrapped("%s", scriptLibraryMessage_.c_str());
+        ImGui::PopStyleColor();
+    }
+    for (const auto& message : scriptLibrary_.errors) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.72F, 0.32F, 1.0F));
+        ImGui::TextWrapped("Skipped: %s", message.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::Separator();
+}
+
 void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
+    RenderScriptLibrary();
     auto& parameters = tool.GetSettings();
     constexpr std::array outputNames{"Normalised (-1 to 1 mapped to range)",
                                      "Elevation (clamped to range)"};
@@ -490,16 +723,7 @@ void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
             scriptErrors_.clear();
             brushError_.clear();
         } catch (const ScriptError& error) {
-            scriptErrors_.clear();
-            for (const auto& diagnostic : error.Diagnostics()) {
-                scriptErrors_.push_back(
-                    diagnostic.line == 0 ? diagnostic.message
-                        : "Line " + std::to_string(diagnostic.line) + ", column " +
-                              std::to_string(diagnostic.column) + ": " + diagnostic.message);
-            }
-            if (scriptErrors_.empty()) {
-                scriptErrors_.emplace_back(error.what());
-            }
+            scriptErrors_ = scriptDiagnostics(error);
         }
     }
     ImGui::SameLine();
@@ -1637,7 +1861,8 @@ void UIManager::BeginProjectDialog(ProjectAction action) {
     projectDialogOpen_ = true;
     projectError_.clear();
     overwritePath_.clear();
-    projectFileName_ = action == ProjectAction::Open ? "" :
+    projectFileName_ = action == ProjectAction::Open || action == ProjectAction::ImportScript ? "" :
+        action == ProjectAction::ExportScript ? BrushScriptFileName(scriptName_).string() :
         action == ProjectAction::ExportImage ? "map.png" :
         action == ProjectAction::Export ? "elevation.png" :
         projectPath_.empty() ? "project.oswald" : projectPath_.filename().string();
@@ -1647,7 +1872,13 @@ void UIManager::BeginProjectDialog(ProjectAction action) {
                                .replace_extension(extensions[exportFormat_]).string();
     }
     try {
-        const auto directory = !projectPath_.empty() ? projectPath_.parent_path() :
+        const bool script = action == ProjectAction::ImportScript ||
+                            action == ProjectAction::ExportScript;
+        const auto directory = script ?
+            (!scriptBrowserDirectory_.empty() ? scriptBrowserDirectory_ :
+             !brushScriptDirectory_.empty() && std::filesystem::is_directory(brushScriptDirectory_) ?
+                 brushScriptDirectory_ : std::filesystem::current_path()) :
+            !projectPath_.empty() ? projectPath_.parent_path() :
             projectBrowser_.GetDirectory().empty() ? std::filesystem::current_path() :
                                                     projectBrowser_.GetDirectory();
         projectBrowser_.Navigate(directory, true);
@@ -1672,7 +1903,22 @@ void UIManager::SaveProject(SphericalGrid& grid) {
 
 void UIManager::PerformProjectAction(SphericalGrid& grid, GlobeRenderer& renderer,
                                      const std::filesystem::path& path) {
-    if (projectAction_ == ProjectAction::Save) {
+    if (projectAction_ == ProjectAction::ImportScript) {
+        LoadScriptIntoEditor(BrushScriptFile::Load(path));
+        scriptBrowserDirectory_ = path.parent_path();
+        scriptLibraryMessage_ = "Imported " + path.filename().string() + ".";
+        scriptLibraryMessageIsError_ = false;
+    } else if (projectAction_ == ProjectAction::ExportScript) {
+        CurrentScriptFile().Save(path);
+        scriptBrowserDirectory_ = path.parent_path();
+        scriptLibraryMessage_ = "Exported " + path.filename().string() + ".";
+        scriptLibraryMessageIsError_ = false;
+        std::error_code ignored;
+        if (!brushScriptDirectory_.empty() &&
+            std::filesystem::equivalent(path.parent_path(), brushScriptDirectory_, ignored)) {
+            RescanScriptLibrary();
+        }
+    } else if (projectAction_ == ProjectAction::Save) {
         ProjectFile::Save(path, grid);
         projectPath_ = std::filesystem::absolute(path);
     } else if (projectAction_ == ProjectAction::Export) {
@@ -1750,10 +1996,15 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
     }
     ImGui::SetNextWindowSize(ImVec2(680, 480), ImGuiCond_FirstUseEver);
     if (ImGui::BeginPopupModal("Project File")) {
-        const bool opening = projectAction_ == ProjectAction::Open;
+        const bool opening = projectAction_ == ProjectAction::Open ||
+                             projectAction_ == ProjectAction::ImportScript;
+        const bool scriptFile = projectAction_ == ProjectAction::ImportScript ||
+                                projectAction_ == ProjectAction::ExportScript;
         const bool imageExport = projectAction_ == ProjectAction::ExportImage;
         const bool exporting = projectAction_ == ProjectAction::Export || imageExport;
-        ImGui::TextUnformatted(opening ? "Open Project" :
+        ImGui::TextUnformatted(projectAction_ == ProjectAction::ImportScript ? "Import Brush Script" :
+                               projectAction_ == ProjectAction::ExportScript ? "Export Brush Script" :
+                               opening ? "Open Project" :
                                imageExport ? "Export Image" : exporting ? "Export Data" : "Save Project");
         const auto navigate = [&](const std::filesystem::path& directory) {
             try {
@@ -1855,7 +2106,9 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
             ImGui::TextWrapped("%s", projectError_.c_str());
         }
         ImGui::BeginDisabled(projectFileName_.empty());
-        perform |= ImGui::Button(opening ? "Open" : exporting ? "Export" : "Save");
+        perform |= ImGui::Button(projectAction_ == ProjectAction::ImportScript ? "Import" :
+                                 opening ? "Open" :
+                                 exporting || scriptFile ? "Export" : "Save");
         ImGui::EndDisabled();
         if (perform && !projectFileName_.empty()) {
             try {
@@ -1865,7 +2118,8 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
                 }
                 if (!opening && path.extension().empty()) {
                     const std::array extensions{".png", ".bmp", ".tga", ".tif"};
-                    path += exporting ? extensions[exportFormat_] : ".oswald";
+                    path += exporting ? extensions[exportFormat_] :
+                            scriptFile ? ".toml" : ".oswald";
                 }
                 if (exporting && (exportWidth_ < 2 || exportWidth_ > 8192 || exportWidth_ % 2)) {
                     throw std::invalid_argument("Export width must be even and between 2 and 8192.");

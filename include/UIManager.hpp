@@ -5,6 +5,7 @@
 #include "RasterFileBrowser.hpp"
 #include "BrushTool.hpp"
 #include "ScriptedBrushTool.hpp"
+#include "BrushScriptFile.hpp"
 #include "Filter.hpp"
 #include "SelectionTool.hpp"
 #include "UndoStack.hpp"
@@ -38,6 +39,8 @@ public:
     bool IsBrushActive() const { return brushTools_.IsActive() || selectionMode_ != SelectionMode::None; }
     void SetCameraController(CameraController* camera) { camera_ = camera; }
     CameraController* GetCameraController() const { return camera_; }
+    // Folder listed by the Scripted brush panel's script library; created on first save.
+    void SetBrushScriptDirectory(std::filesystem::path directory);
 
 private:
     friend class RasterImportCommand;
@@ -68,6 +71,11 @@ private:
     void NavigateRasterDirectory(const std::filesystem::path& directory);
     void RenderBrushPanel();
     void RenderScriptEditor(ScriptedBrushTool& tool);
+    void RenderScriptLibrary();
+    void LoadScriptIntoEditor(const BrushScriptFile& file);
+    BrushScriptFile CurrentScriptFile() const;
+    void SaveScriptToLibrary(const std::filesystem::path& path);
+    void RescanScriptLibrary();
     void RenderSelectionPanel();
     void RenderValueSelectionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderFillFilterDialog(SphericalGrid& grid, GlobeRenderer& renderer);
@@ -80,7 +88,7 @@ private:
                                const glm::mat4& modelMatrix, float zoom);
     void SetSelectionMode(SelectionMode mode);
     void FinishPolygonSelection(SphericalGrid& grid, GlobeRenderer& renderer);
-    enum class ProjectAction { Open, Save, Export, ExportImage };
+    enum class ProjectAction { Open, Save, Export, ExportImage, ImportScript, ExportScript };
     void BeginProjectDialog(ProjectAction action);
     void RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& renderer);
     void PerformProjectAction(SphericalGrid& grid, GlobeRenderer& renderer,
@@ -131,6 +139,16 @@ private:
     std::optional<std::string> scriptDraft_;
     std::vector<std::string> scriptErrors_;
     std::string brushError_;
+    ScriptedBrushTool* scriptedTool_ = nullptr;
+    std::filesystem::path brushScriptDirectory_;
+    std::filesystem::path scriptBrowserDirectory_;
+    BrushScriptLibrary scriptLibrary_;
+    int selectedLibraryScript_ = -1;
+    std::string scriptName_;
+    std::string scriptDescription_;
+    std::string scriptLibraryMessage_;
+    bool scriptLibraryMessageIsError_ = false;
+    std::filesystem::path scriptOverwritePath_;
     bool settingsOpen_ = false;
     double pendingRaiseLowerRate_ = BrushSettings{}.raiseLowerRate;
     CameraController* camera_ = nullptr;

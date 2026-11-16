@@ -112,6 +112,18 @@ FetchContent_MakeAvailable(exprtk)
 add_library(exprtk INTERFACE)
 target_include_directories(exprtk SYSTEM INTERFACE "${exprtk_SOURCE_DIR}")
 
+# toml++ parses brush script files; it is only included by BrushScriptFile.cpp.
+FetchContent_Declare(
+    tomlplusplus
+    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+    GIT_TAG v3.4.0
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR no-cmake
+)
+FetchContent_MakeAvailable(tomlplusplus)
+add_library(tomlplusplus_header INTERFACE)
+target_include_directories(tomlplusplus_header SYSTEM INTERFACE "${tomlplusplus_SOURCE_DIR}/include")
+
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(TIFF REQUIRED)
@@ -123,9 +135,10 @@ target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
 target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r TIFF::TIFF)
 
 # exprtk is only included by ScriptEngine.cpp, keeping its compile cost in one unit.
-add_library(oswald_scripting STATIC src/ScriptEngine.cpp src/ScriptedBrushTool.cpp)
+add_library(oswald_scripting STATIC src/ScriptEngine.cpp src/ScriptedBrushTool.cpp
+    src/BrushScriptFile.cpp)
 target_include_directories(oswald_scripting PUBLIC include)
-target_link_libraries(oswald_scripting PUBLIC oswald_model PRIVATE exprtk)
+target_link_libraries(oswald_scripting PUBLIC oswald_model PRIVATE exprtk tomlplusplus_header)
 if(MSVC)
     target_compile_options(oswald_scripting PRIVATE /bigobj)
 elseif(MINGW)
@@ -157,6 +170,7 @@ add_executable(oswald_gis src/main.cpp src/UIManager.cpp src/RasterFileBrowser.c
 target_compile_definitions(oswald_gis PRIVATE
     GLFW_INCLUDE_NONE
     OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
+    OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/brushes"
 )
 target_link_libraries(oswald_gis PRIVATE
     oswald_view
@@ -201,6 +215,12 @@ if(BUILD_TESTING)
     add_executable(scripted_brush_tool_tests tests/ScriptedBrushToolTests.cpp)
     target_link_libraries(scripted_brush_tool_tests PRIVATE oswald_scripting)
     add_test(NAME scripted_brush_tool COMMAND scripted_brush_tool_tests)
+
+    add_executable(brush_script_file_tests tests/BrushScriptFileTests.cpp)
+    target_link_libraries(brush_script_file_tests PRIVATE oswald_scripting)
+    target_compile_definitions(brush_script_file_tests PRIVATE
+        OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/brushes")
+    add_test(NAME brush_script_file COMMAND brush_script_file_tests)
 
     add_executable(selection_tool_tests tests/SelectionToolTests.cpp)
     target_link_libraries(selection_tool_tests PRIVATE oswald_model)

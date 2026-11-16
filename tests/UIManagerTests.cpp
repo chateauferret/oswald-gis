@@ -1,4 +1,5 @@
 #include "UIManager.hpp"
+#include "BrushScriptFile.hpp"
 #include "ProjectFile.hpp"
 
 #include <GLFW/glfw3.h>
@@ -957,6 +958,98 @@ void testDialog() {
           "File menu Open did not open the project browser.");
     key(ImGuiKey_Escape);
     check(grid.GetSnapshot() == imageSnapshot, "Cancelling Open changed the project.");
+
+    // Scripted brush library: load, save, overwrite, export and import.
+    const auto library = temporary.path / "brushes";
+    std::filesystem::create_directories(library);
+    BrushScriptFile{"ridges", "Ridged relief", "ridged(x, y, z, 3, 2, 0.5, 5, 1, 2)"}
+        .Save(library / "ridges.toml");
+    BrushScriptFile{"imported", "From elsewhere", "simplex(x, y, z)\n* 0.5",
+                    ScriptedBrushSettings::Output::Elevation}
+        .Save(temporary.path / "outside.toml");
+    ui.SetBrushScriptDirectory(library);
+    selectMenuItem(3, 8, "Scripted Brush");
+    ImGui::SetWindowPos("###BrushParameters", ImVec2(40.0F, 40.0F));
+    ImGui::SetWindowSize("###BrushParameters", ImVec2(560.0F, 720.0F));
+    const auto panelClick = [&](const char* label) {
+        frame();
+        auto* panel = ImGui::FindWindowByName("###BrushParameters");
+        check(panel != nullptr && panel->Active, "Scripted brush panel is not visible.");
+        ImGui::FocusWindow(panel);
+        const auto id = panel->GetID(label);
+        for (float scroll = 0.0F;; scroll += panel->InnerRect.GetHeight() * 0.5F) {
+            ImGui::SetScrollY(panel, std::min(scroll, panel->ScrollMax.y));
+            frame();
+            for (float y = panel->InnerRect.Min.y + 2.0F; y < panel->InnerRect.Max.y; y += 5.0F) {
+                for (float x = panel->InnerRect.Min.x + 10.0F; x < panel->InnerRect.Max.x; x += 14.0F) {
+                    ImGui::GetIO().AddMousePosEvent(x, y);
+                    frame();
+                    if (ImGui::GetCurrentContext()->HoveredId == id) {
+                        click(x, y);
+                        frame();
+                        frame();
+                        return;
+                    }
+                }
+            }
+            if (scroll >= panel->ScrollMax.y) {
+                break;
+            }
+        }
+        throw std::runtime_error(std::string("Scripted brush item was not interactive: ") + label);
+    };
+    const auto replacePanelText = [&](const char* label, const char* text) {
+        panelClick(label);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        key(ImGuiKey_A);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        ImGui::GetIO().AddInputCharactersUTF8(text);
+        frame();
+        key(ImGuiKey_Tab);
+    };
+    panelClick("##ScriptLibrary");
+    frame();
+    frame();
+    {
+        const auto& popups = ImGui::GetCurrentContext()->OpenPopupStack;
+        check(!popups.empty() && popups.back().Window != nullptr,
+              "Script library list did not open.");
+        auto* list = popups.back().Window;
+        click(list->DC.CursorStartPos.x + 10.0F,
+              list->DC.CursorStartPos.y + ImGui::GetTextLineHeight() * 0.5F);
+    }
+    panelClick("Load");
+    replacePanelText("Name", "ridges copy");
+    panelClick("Save to library");
+    const auto copy = BrushScriptFile::Load(library / "ridges_copy.toml");
+    check(copy.name == "ridges copy" && copy.description == "Ridged relief" &&
+          copy.script == "ridged(x, y, z, 3, 2, 0.5, 5, 1, 2)" &&
+          copy.output == ScriptedBrushSettings::Output::Normalized,
+          "Loading from the library and saving under a new name lost the script.");
+    replacePanelText("Description", "Changed");
+    panelClick("Save to library");
+    check(ImGui::FindWindowByName("Replace Brush Script?")->Active,
+          "Saving over a library script did not ask for confirmation.");
+    clickDialogItem("Replace Brush Script?", "Replace");
+    check(BrushScriptFile::Load(library / "ridges_copy.toml").description == "Changed",
+          "Confirmed library overwrite did not save.");
+
+    panelClick("Export...");
+    check(ImGui::FindWindowByName("Project File")->Active, "Export did not open a file browser.");
+    replaceDialogText("Project File", "File name", "exported");
+    clickDialogItem("Project File", "Export");
+    check(!dialogOpen() && BrushScriptFile::Load(library / "exported.toml").name == "ridges copy",
+          "Exporting a brush script did not write a .toml file.");
+
+    panelClick("Import...");
+    replaceDialogText("Project File", "File name", (temporary.path / "outside.toml").string().c_str());
+    clickDialogItem("Project File", "Import");
+    check(!dialogOpen(), "Importing a brush script did not close the browser.");
+    panelClick("Save to library");
+    const auto imported = BrushScriptFile::Load(library / "imported.toml");
+    check(imported.description == "From elsewhere" && imported.script == "simplex(x, y, z)\n* 0.5" &&
+          imported.output == ScriptedBrushSettings::Output::Elevation,
+          "Imported brush script did not replace the editor contents and output mode.");
 }
 
 } // namespace

@@ -42,6 +42,7 @@ The software stack integrates industry-standard libraries managed directly via C
 | **Spherical Triangulation** | Qhull `8.0.2` | Reentrant 3D convex hull, yielding spherical Delaunay triangles for the half-edge graph. |
 | **Raster Decoding** | `stb_image` | Single-header decoding of common equirectangular image formats. |
 | **Scripting** | exprtk `0.0.3` | Header-only expression parser/evaluator for user scripts that generate brush values. |
+| **Brush script files** | toml++ `3.4.0` | Header-only TOML parser for saved brush scripts. |
 
 ### 2.2 VS Code & Copilot Workflow Integration
 
@@ -117,6 +118,18 @@ The software is structured strictly around a Model-View-Controller design patter
   * `UIManager` registers the tool, so `oswald_model` does not depend on exprtk.
   * The panel edits a draft script. The draft is compiled only when Compile is pressed.
   * Compile diagnostics show the line and column. A failed compile keeps the previous script active.
+* **Brush script files (`BrushScriptFile`, `BrushScriptLibrary`)**: Scripts are saved as TOML files with string keys `name`, `description`, `output` and `script`, as in `brushes/fbm.toml`.
+  * `name` and `script` are required; `description` and `output` are optional, and unknown keys are ignored.
+  * `output` is `"normalized"` (`"normalised"` is also accepted, case-insensitively) or `"elevation"`. Loading a file without it keeps the panel's current Script output setting; saving always writes it.
+  * Single-line values are written as basic strings. Multi-line scripts are written as `'''` literal strings so the file stays readable, falling back to escaped basic strings when the text contains quotes or control characters.
+  * Files are written to a temporary file and renamed, so a failed save never truncates an existing script.
+  * `BrushScriptLibrary::Scan` loads every `.toml` file in a folder, sorted by name, and reports files that fail to parse instead of aborting.
+  * The application's library folder is the source tree's `brushes/` directory (`OSWALD_BRUSH_SCRIPT_DIR`), set with `UIManager::SetBrushScriptDirectory`.
+  * The Scripted brush panel lists the library with each script's description, and has Load, Refresh, Name and Description fields.
+  * Save to library writes `<name>.toml`, with unsafe file-name characters replaced by `_`, and asks before replacing an existing file.
+  * Import... and Export... use the project file browser to read or write a script anywhere.
+  * Loading or importing replaces the editor's name, description, draft and (when present) output mode, then compiles the script. A script that fails to compile stays in the editor with its diagnostics, and strokes keep using the last compiled script.
+  * Saving and exporting write the editor's current draft.
 
 The single hover readout reports the cumulative elevation through the active layer,
 including visible layers below it and any in-progress brush preview, but excluding
@@ -563,8 +576,10 @@ exprtk is fetched as a header-only `exprtk` INTERFACE target and is included
 only by `src/ScriptEngine.cpp` in the `oswald_scripting` library, keeping its
 large compile cost in one translation unit. The scripting library links
 `oswald_model` for the shared noise primitives and also contains the
-`ScriptedBrushTool`. `script_engine_tests` and `scripted_brush_tool_tests` cover
-the engine and brush without a display.
+`ScriptedBrushTool`. toml++ is fetched as a header-only INTERFACE target and is
+included only by `src/BrushScriptFile.cpp`, also in `oswald_scripting`.
+`script_engine_tests`, `scripted_brush_tool_tests` and `brush_script_file_tests`
+cover the engine, brush and script files without a display.
 Shaders and all `.map`
 files in `assets/colormaps` are copied at configuration time into the build's
 `resources` directory. Editing a source shader/map triggers CMake regeneration

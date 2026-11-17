@@ -4,6 +4,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <iomanip>
+#include <limits>
+#include <locale>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -101,6 +105,115 @@ std::optional<ScriptedBrushSettings::Output> parseOutput(const toml::table& tabl
                              ": \"output\" must be \"normalized\" or \"elevation\".");
 }
 
+double requireNumber(const toml::table& table, std::string_view key,
+                     std::string_view source) {
+    const auto* node = table.get(key);
+    if (node != nullptr) {
+        if (const auto text = node->value<std::string>()) {
+            double result = 0.0;
+            const auto [end, error] = std::from_chars(text->data(), text->data() + text->size(), result);
+            if (error == std::errc{} && end == text->data() + text->size()) {
+                return result;
+            }
+        } else if (node->is_number()) {
+            return *node->value<double>();
+        }
+    }
+    throw std::runtime_error(describe(source) + ": \"" + std::string(key) +
+                             "\" must be a number or numeric string.");
+}
+
+std::vector<ScriptParameter> parseParameters(const toml::table& table, std::string_view source) {
+    const auto* node = table.get("parameter");
+    if (node == nullptr) {
+        return {};
+    }
+    const auto* array = node->as_array();
+    if (array == nullptr) {
+        throw std::runtime_error(describe(source) + ": \"parameter\" must be an array of tables.");
+    }
+    std::vector<ScriptParameter> parameters;
+    for (const auto& entry : *array) {
+        const auto* definition = entry.as_table();
+        if (definition == nullptr) {
+            throw std::runtime_error(describe(source) + ": each parameter must be a table.");
+        }
+        ScriptParameter parameter;
+        parameter.name = requireString(*definition, "name", true, source);
+        parameter.label = requireString(*definition, "label", false, source);
+        parameter.units = requireString(*definition, "units", false, source);
+        const auto context = std::string(source) + " parameter '" + parameter.name + "'";
+        const auto type = requireString(*definition, "type", true, context);
+        if (type == "float") {
+            parameter.type = ScriptParameter::Type::Float;
+        } else if (type == "integer") {
+            parameter.type = ScriptParameter::Type::Integer;
+        } else if (type == "choice") {
+            parameter.type = ScriptParameter::Type::Choice;
+        } else {
+            throw std::runtime_error(describe(context) + ": type must be float, integer or choice.");
+        }
+        if (parameter.type == ScriptParameter::Type::Choice) {
+            const auto* choices = (*definition)["choices"].as_array();
+            if (choices == nullptr) {
+                throw std::runtime_error(describe(context) + ": choices must be an array of strings.");
+            }
+            for (const auto& choice : *choices) {
+                const auto value = choice.value<std::string>();
+                if (!value) {
+                    throw std::runtime_error(describe(context) + ": choices must contain strings.");
+                }
+                parameter.choices.push_back(*value);
+            }
+            for (const auto key : {"control", "min", "max", "scale"}) {
+                if (definition->contains(key)) {
+                    throw std::runtime_error(describe(context) + ": choice parameters cannot specify " + key + ".");
+                }
+            }
+            parameter.defaultValue = requireString(*definition, "default", true, context);
+        } else {
+            const auto control = requireString(*definition, "control", true, context);
+            if (control == "slider") {
+                parameter.control = ScriptParameter::Control::Slider;
+            } else if (control == "spin") {
+                parameter.control = ScriptParameter::Control::Spin;
+            } else if (control == "text") {
+                parameter.control = ScriptParameter::Control::Text;
+            } else {
+                throw std::runtime_error(describe(context) + ": control must be slider, spin or text.");
+            }
+            parameter.minimum = requireNumber(*definition, "min", context);
+            parameter.maximum = requireNumber(*definition, "max", context);
+            parameter.defaultValue = requireNumber(*definition, "default", context);
+            if (definition->contains("choices")) {
+                throw std::runtime_error(describe(context) + ": only choice parameters can specify choices.");
+            }
+            if (definition->contains("scale")) {
+                const auto scale = requireString(*definition, "scale", true, context);
+                if (parameter.type != ScriptParameter::Type::Float ||
+                    (scale != "linear" && scale != "log")) {
+                    throw std::runtime_error(describe(context) + ": scale must be linear or log, for floats only.");
+                }
+                parameter.scale = scale == "log" ? ScriptParameter::Scale::Log : ScriptParameter::Scale::Linear;
+            }
+        }
+        parameters.push_back(std::move(parameter));
+    }
+    try {
+        ScriptedBrushTool::ValidateParameters(parameters);
+    } catch (const std::invalid_argument& error) {
+        throw std::runtime_error(describe(source) + ": " + error.what());
+    }
+    return parameters;
+}
+
+std::string numberString(double value) {
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
+    return tomlString(stream.str());
+}
+
 } // namespace
 
 BrushScriptFile BrushScriptFile::Parse(std::string_view text, std::string_view source) {
@@ -118,6 +231,25 @@ BrushScriptFile BrushScriptFile::Parse(std::string_view text, std::string_view s
     file.description = requireString(table, "description", false, source);
     file.output = parseOutput(table, source);
     file.script = requireString(table, "script", true, source);
+    file.parameters = parseParameters(table, source);
+    if (table.contains("application")) {
+        const auto application = requireString(table, "application", true, source);
+        if (application == "noise") {
+            file.application = BrushApplication::Noise;
+        } else if (application == "elevation") {
+            file.application = BrushApplication::Elevation;
+        } else if (application == "delta") {
+            file.application = BrushApplication::Delta;
+        } else {
+            throw std::runtime_error(describe(source) + ": application must be noise, elevation or delta.");
+        }
+    }
+    if (const auto* node = table.get("continuous")) {
+        if (!node->is_boolean()) {
+            throw std::runtime_error(describe(source) + ": continuous must be a boolean.");
+        }
+        file.continuous = *node->value<bool>();
+    }
     if (file.name.empty()) {
         throw std::runtime_error(describe(source) + " has an empty name.");
     }
@@ -138,12 +270,43 @@ BrushScriptFile BrushScriptFile::Load(const std::filesystem::path& path) {
 }
 
 std::string BrushScriptFile::ToToml() const {
+    ScriptedBrushTool::ValidateParameters(parameters);
     std::string text = "name=" + tomlString(name) + "\ndescription=" + tomlString(description);
     if (output) {
         text += *output == ScriptedBrushSettings::Output::Elevation ? "\noutput=\"elevation\""
                                                                    : "\noutput=\"normalized\"";
     }
-    return text + "\nscript=" + tomlString(script) + "\n";
+    text += "\napplication=" + tomlString(application == BrushApplication::Noise ? "noise" :
+                                          application == BrushApplication::Elevation ? "elevation" : "delta");
+    text += continuous ? "\ncontinuous=true" : "\ncontinuous=false";
+    text += "\nscript=" + tomlString(script) + "\n";
+    for (const auto& parameter : parameters) {
+        text += "\n[[parameter]]\nname=" + tomlString(parameter.name);
+        if (!parameter.label.empty()) {
+            text += "\nlabel=" + tomlString(parameter.label);
+        }
+        if (!parameter.units.empty()) {
+            text += "\nunits=" + tomlString(parameter.units);
+        }
+        if (parameter.type == ScriptParameter::Type::Choice) {
+            text += "\ntype=\"choice\"\nchoices=[";
+            for (std::size_t i = 0; i < parameter.choices.size(); ++i) {
+                text += (i == 0 ? "" : ", ") + tomlString(parameter.choices[i]);
+            }
+            text += "]\ndefault=" + tomlString(std::get<std::string>(parameter.defaultValue)) + "\n";
+        } else {
+            text += parameter.type == ScriptParameter::Type::Float ? "\ntype=\"float\"" : "\ntype=\"integer\"";
+            text += "\ncontrol=" + tomlString(parameter.control == ScriptParameter::Control::Slider ?
+                "slider" : parameter.control == ScriptParameter::Control::Spin ? "spin" : "text");
+            text += "\nmin=" + numberString(parameter.minimum) +
+                    "\nmax=" + numberString(parameter.maximum);
+            if (parameter.type == ScriptParameter::Type::Float) {
+                text += "\nscale=" + tomlString(parameter.scale == ScriptParameter::Scale::Log ? "log" : "linear");
+            }
+            text += "\ndefault=" + numberString(std::get<double>(parameter.defaultValue)) + "\n";
+        }
+    }
+    return text;
 }
 
 void BrushScriptFile::Save(const std::filesystem::path& path) const {

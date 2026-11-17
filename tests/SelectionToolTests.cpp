@@ -54,6 +54,24 @@ void testRadiusSelectionAndWeights() {
         std::vector<float> wrongSize(1);
         tool.Apply(*snapshot, center, wrongSize, settings);
     });
+    model.SetPlanetRadius(3000.0);
+    settings.radius = 1500.0;
+    settings.falloffPercent = 100.0;
+    for (const auto unit : {BrushDistanceUnit::Kilometres, BrushDistanceUnit::Miles}) {
+        settings.distanceUnit = unit;
+        const double radius = unit == BrushDistanceUnit::Kilometres ? 3000.0 : 3000.0 / 1.609344;
+        std::fill(weights.begin(), weights.end(), 0.0F);
+        tool.Apply(*model.GetSnapshot(), center, weights, settings);
+        for (std::size_t i = 0; i < weights.size(); ++i) {
+            const auto point = glm::normalize(glm::dvec3(vertices[i].position));
+            const auto direction = glm::normalize(center);
+            const double distance = std::atan2(glm::length(glm::cross(direction, point)),
+                                               glm::dot(direction, point)) * radius;
+            const auto expected = static_cast<float>(std::max(0.0, 1.0 - distance / settings.radius));
+            check(std::abs(weights[i] - expected) < 1e-5F,
+                  "Radius selection did not use the configured planet radius and distance units.");
+        }
+    }
 }
 
 void testSphericalPolygonSelection() {

@@ -34,6 +34,7 @@ struct GridOptions {
     std::uint32_t seed = 42;
     // Lloyd relaxation passes applied after Poisson sampling; they make cells more regular.
     std::uint32_t relaxationIterations = 0;
+    double planetRadius = 6371.0; // Kilometres.
 };
 
 // Thread-safe progress and cancellation channel for long grid generations.
@@ -95,7 +96,10 @@ public:
 
     std::size_t FindNearest(glm::dvec3 direction) const;
     std::vector<std::size_t> FindWithinRadius(
-        glm::dvec3 direction, double arcRadius, double planetRadius = 6371.0) const;
+        glm::dvec3 direction, double arcRadius, double planetRadius) const;
+    std::vector<std::size_t> FindWithinRadius(glm::dvec3 direction, double arcRadius) const {
+        return FindWithinRadius(direction, arcRadius, options_.planetRadius);
+    }
 
     // Returns a new immutable snapshot, or nullptr if the selection contains no eligible faces.
     // Eligible face centers are selected and not much smaller than the selected region's
@@ -112,6 +116,7 @@ public:
 
 private:
     friend class ProjectFile;
+    friend class SphericalGrid;
     SphericalGridSnapshot(const GridOptions& options, std::vector<GridVertex> vertices,
                           std::vector<std::uint32_t> triangleIndices,
                           std::vector<std::uint8_t> refinementVertices,
@@ -138,6 +143,7 @@ public:
     void GenerateGrid(const GridOptions& options);
     void InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot);
     void SetElevations(std::span<const float> elevations);
+    void SetPlanetRadius(double radiusKilometres);
     void SetSelectionWeights(std::span<const float> selectionWeights, bool active = true);
     std::shared_ptr<const SphericalGridSnapshot> GetSnapshot() const;
     ProjectMetadata& GetMetadata() { return metadata_; }

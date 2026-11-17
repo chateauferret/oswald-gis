@@ -563,6 +563,43 @@ void verifyCancellation() {
     expectInvalid([&] { grid.InstallSnapshot(nullptr); });
 }
 
+void verifyPlanetRadius() {
+    SphericalGrid grid({1000, 0.0, 18});
+    std::vector<float> elevations(1000, 123.0F);
+    grid.SetElevations(elevations);
+    grid.SetSelectionWeights(std::vector<float>(1000, 0.5F));
+    const auto before = grid.GetSnapshot();
+    grid.SetPlanetRadius(3000.0);
+    const auto after = grid.GetSnapshot();
+    check(after->GetOptions().planetRadius == 3000.0 &&
+          before->GetOptions().planetRadius == 6371.0 &&
+          after->GetTriangleIndices() == before->GetTriangleIndices() &&
+          after->HasSelection(),
+          "Changing planet radius mutated old snapshots or changed topology/selection.");
+    for (std::size_t i = 0; i < elevations.size(); ++i) {
+        check(after->GetVertices()[i].position == before->GetVertices()[i].position &&
+              after->GetVertices()[i].elevation == 123.0F &&
+              after->GetVertices()[i].selectionWeight == 0.5F &&
+              grid.GetElevationLayer().GetValues()[i] == 123.0F,
+              "Changing planet radius changed vertices or layer data.");
+    }
+    const glm::dvec3 center(after->GetVertices()[0].position);
+    check(after->FindWithinRadius(center, 1500.0) == after->FindWithinRadius(center, 1500.0, 3000.0) &&
+          after->FindWithinRadius(center, 1500.0).size() > before->FindWithinRadius(center, 1500.0).size(),
+          "Default radius searches ignored planet geometry.");
+    for (const double invalid : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::infinity()}) {
+        expectInvalid([&] { grid.SetPlanetRadius(invalid); });
+        check(grid.GetSnapshot() == after, "Invalid planet radius changed the model.");
+        GridOptions options{1000, 0.0, 18};
+        options.planetRadius = invalid;
+        expectInvalid([&] { SphericalGrid invalidGrid(options); });
+    }
+    grid.SetElevations(elevations);
+    check(grid.GetSnapshot()->GetOptions().planetRadius == 3000.0,
+          "Elevation edits discarded the configured radius.");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -591,6 +628,7 @@ int main(int argc, char** argv) {
             verifyCoarsenThenRefineDensity();
             verifyRelaxation();
             verifyCancellation();
+            verifyPlanetRadius();
         }
         std::cout << "Spherical grid tests passed.\n";
         return 0;

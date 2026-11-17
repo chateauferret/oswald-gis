@@ -1,5 +1,9 @@
 # Project Architecture & Technical Specification: oswald-gis MVP
 
+This is the maintained architecture document, retaining its original MVP filename.
+The implementation now includes the post-MVP features in [roadmap.md](./roadmap.md),
+including layers, persistence/export, projections, FastNoise2, and TOML-driven tools.
+
 ## 1. System Vision & Architectural Strategy
 
 The `oswald-gis` project is a specialized, interactive Geographic Information System (GIS) and terrain worldbuilding framework tailored for fantasy and fictional planetary creation. Unlike general-purpose GIS packages such as QGIS or ArcGIS—which focus on 2D cartographic projections and complex vector attribute tables—`oswald-gis` prioritizes geodetically sound planetary representation, procedural terrain synthesis, and intuitive artist-centric editing workflows.
@@ -17,7 +21,11 @@ To eliminate these constraints, the `oswald-gis` Minimum Viable Product (MVP) re
 
 The objective for the MVP framework is strictly functional logic: establishing an interactive, geodetically grounded virtual globe capable of ingesting equirectangular elevation rasters, displaying terrain in a 3D orthographic viewport via custom GLSL color mapping, and providing real-world metric navigation controls. 
 
-Advanced data editing, multi-layer stack management, and atmospheric shading are intentionally deferred to post-MVP iterations to ensure the foundational graphics and data architecture functions flawlessly.
+That initial scope has been implemented and extended: the current application
+includes undoable editing, multi-layer stack management, atmospheric rim shading,
+adaptive refinement/coarsening, project persistence/export, equirectangular view,
+and scripted brushes. The MVP scope above is historical, not a list of current
+limitations.
 
 ---
 
@@ -32,8 +40,8 @@ The software stack integrates industry-standard libraries managed directly via C
 | Library / Tool | Version / Standard | Functional Purpose within Framework |
 | :--- | :--- | :--- |
 | **C++ Compiler** | C++20 (`GCC 11+` / `Clang 13+`) | Core application runtime, memory management, and graph data structures. |
-| **CMake** | `3.20+` | Cross-platform build automation and dependency fetching via `FetchContent`. |
-| **IDE & Assistant** | VS Code + Google Copilot | Code editing, CMake Tools integration, and AI-assisted C++ development. |
+| **CMake** | `4.0+` | Cross-platform build automation and dependency fetching via `FetchContent`. |
+| **IDE & Assistant** | VS Code + GitHub Copilot | Code editing, CMake Tools integration, and AI-assisted C++ development. |
 | **Windowing & Input** | GLFW `3.4` | Native X11/Wayland window creation, event dispatch, and OpenGL context management. |
 | **OpenGL Loader** | GLAD (`OpenGL 4.5 Core`) | Runtime function pointer resolution for desktop OpenGL 4.5 Direct State Access (DSA). |
 | **Mathematics** | GLM `1.0.1` | 3D vector, matrix, quaternion transform, and orthographic projection math. |
@@ -41,12 +49,14 @@ The software stack integrates industry-standard libraries managed directly via C
 | **Spatial Indexing** | `nanoflann 1.5.5` | Header-only 3D k-d tree spatial index over vertex arrays for $O(\log N)$ queries. |
 | **Spherical Triangulation** | Qhull `8.0.2` | Reentrant 3D convex hull, yielding spherical Delaunay triangles for the half-edge graph. |
 | **Raster Decoding** | `stb_image` | Single-header decoding of common equirectangular image formats. |
+| **TIFF / GeoTIFF I/O** | System libtiff | Numeric and RGB TIFF import/export, GeoTIFF tags, and precision-preserving elevation samples. |
+| **Noise** | FastNoise2 `1.1.1` | Native Simplex, Value, White, fBm, and ridged generators; pinned FastSIMD dependency and strict floating point. |
 | **Scripting** | exprtk `0.0.3` | Header-only expression parser/evaluator for user scripts that generate brush values. |
 | **Brush script files** | toml++ `3.4.0` | Header-only TOML parser for saved brush scripts. |
 
 ### 2.2 VS Code & Copilot Workflow Integration
 
-Development is configured around VS Code using the `CMake Tools` extension for one-click compilation, target selection, and debugging (`gdb`/`lldb`). Google Copilot is integrated to accelerate boilerplate generation for GLSL shader uniforms, GLFW input handlers, and C++ struct bindings.
+Development is configured around VS Code using the `CMake Tools` extension for one-click compilation, target selection, and debugging (`gdb`/`lldb`). GitHub Copilot assists with C++ and GLSL development.
 
 ---
 
@@ -71,7 +81,7 @@ The software is structured strictly around a Model-View-Controller design patter
 |  - SphericalGrid (Poisson-sampled std::vector<GridVertex>)         |
 |  - Spherical Half-Edge Topology Graph                             |
 |  - 3D k-d Tree Index (nanoflann Adaptor)                          |
-|  - Layer Collection (currently a Float32 Elevation raster)        |
+|  - Layer Collection (independent Float32 Elevation rasters)       |
 |  - Separate Per-Vertex Selection Channel                         |
 +---------------------------------+---------------------------------+
                                   |
@@ -82,7 +92,7 @@ The software is structured strictly around a Model-View-Controller design patter
 |                              VIEW                                 |
 |  - OpenGL 4.5 GPU Buffers (VAO, VBO, EBO via DSA)                |
 |  - GLSL Hypsometric Color Mapping Shader                         |
-|  - 3D Orthographic Globe Projection Viewport                     |
+|  - Orthographic Globe / Equirectangular Map Viewports            |
 +-------------------------------------------------------------------+
 ```
 
@@ -91,8 +101,8 @@ The software is structured strictly around a Model-View-Controller design patter
 * **Model (`SphericalGrid`)**: Owns the CPU-side vertex buffers, topological edge connectivities, its data-layer collection, and the `nanoflann` 3D k-d tree index. `Layer` defines shared metadata, `RasterLayer` stores raster values, and each `ElevationLayer` has independent values synchronized with immutable mesh snapshots when active. Elevation- and selection-only snapshots share the geometry's immutable spatial index; it is rebuilt only when mesh geometry changes. The per-vertex selection channel remains separate from the layer collection. The model exposes cancellable grid generation, immutable snapshots, and spatial point sampling.
 * **View (`GlobeRenderer`)**: Manages GPU-side OpenGL resources (Vertex Array Objects, Vertex Buffer Objects, Element Buffer Objects). Each layer has a persistent elevation buffer, and brush previews update changed vertex ranges in the active layer. A compute shader combines visible elevations bottom-to-top before a single globe draw, using the topmost visible layer's selected/unselected colour maps. Overlay replaces the accumulated value; Add, Subtract (lower minus upper), Multiply, Minimum, and Maximum operate on elevations, not RGB colours. Each operation clamps to the supported elevation range [-32767, 32767]; the bottommost visible layer seeds the result regardless of its blend mode. Composition is cached until values, order, visibility, or blend modes change. Selection, graticules, and rim shading are applied once, after composition.
 * **Controller (`CameraController` & `UIManager`)**: Processes window input events. It translates 2D mouse drags into 3D camera rotations, handles double-click raycasts for globe re-centering, and renders Dear ImGui interface overlays.
-* **Scripting (`ScriptEngine`)**: Wraps exprtk so user scripts can combine maths, control flow, and noise to generate values. The engine owns one symbol table shared by all scripts it compiles. It stores engine-owned variables at stable addresses, binds caller-owned variables, constants, and C++ functions (fixed arity 0–4 or variadic), and compiles source into a `CompiledScript`. Compiled scripts keep the engine state alive and can be evaluated repeatedly. Built-in `simplex`, `valuenoise`, `fbm`, `billow`, `valuefbm`, and `ridged` functions use the same `Noise` primitives as the noise brushes. These functions use an engine-level uint64 seed, which is set from C++ because a double cannot represent every seed.
-  * Compile failures raise `ScriptError` with 1-based line and column diagnostics. Unknown symbols, strings, I/O, and `return` statements are rejected.
+* **Scripting (`ScriptEngine`)**: Wraps exprtk so scripts can combine maths, control flow, string-valued choices, and noise to generate values. The engine owns one symbol table shared by all scripts it compiles. It stores numeric and string variables at stable addresses, binds caller-owned numeric variables, constants, and C++ functions (fixed arity 0–4 or variadic), and compiles source into a `CompiledScript`. Compiled scripts keep the engine state alive and can be evaluated repeatedly. Built-in `simplex`, `valuenoise`, `fbm`, `billow`, `valuefbm`, and `ridged` functions use the shared FastNoise2-backed `Noise` wrappers; `spectral` uses the cached FFT-filtered field. These functions use an engine-level uint64 seed, set from C++ because a double cannot represent every seed.
+  * Compile failures raise `ScriptError` with 1-based line and column diagnostics. Unknown symbols, file/console I/O, and `return` statements are rejected. Strings and comparisons such as `mode == 'one'` are supported.
   * Symbol names are case-sensitive.
   * Each loop entry is limited to a configurable iteration count, which defaults to 1,000,000.
   * exprtk evaluates an optimized expression tree; it does not generate machine code.
@@ -102,7 +112,7 @@ The software is structured strictly around a Model-View-Controller design patter
   * Before committing a stroke, the UI restores non-finite values and clamps all values.
   * Failures when committing a stroke, or during undo or redo, are reported in the UI and the grid stays unchanged.
   * The frame loop catches per-frame exceptions, logs them, and recovers ImGui state, so a runtime error does not terminate the application.
-* **Scripted brush (`ScriptedBrushTool`)**: A one-shot brush that owns a `ScriptEngine` and evaluates one compiled script per affected vertex.
+* **Scripted brush (`ScriptedBrushTool`)**: The runtime used by every Brushes menu entry. Each instance owns a name, `ScriptEngine`, compiled script, parameter definitions/values, and application settings. Brushes are one-shot unless TOML specifies `continuous=true`.
   * Read-only inputs:
     * `x`, `y`, `z`: unit position, domain-warped when warping is enabled.
     * `lat`, `lon`: unwarped position in degrees.
@@ -110,26 +120,37 @@ The software is structured strictly around a Model-View-Controller design patter
     * `weight`: falloff multiplied by the selection weight.
     * `distance`, `radius`: brush distance units.
     * `lower`, `upper`: the ordered Between/And range.
-  * Inputs are reset for every vertex, so script assignments do not leak to the next vertex.
-  * The result is either normalised, so [-1, 1] maps to the range, or treated as an elevation clamped to the range.
-  * The result is then combined using the same operation, domain warp, falloff, and selection pipeline as the noise brushes, through `ApplyNoiseSampler`.
+    * `elapsed`: seconds for the current dab; `rate`: Raise/Lower speed configured in Settings.
+  * Inputs and declared parameter values are reset for every vertex, so assignments do not modify subsequent vertices or UI control values.
+  * `application="noise"` (default) supports normalized output mapped from [-1, 1] to Between/And, or elevation output clamped to that range, then applies the selected noise operation. It retains seed, output-range and domain-warp controls.
+  * `application="elevation"` clamps the script result to [-32767, 32767] and blends toward it by falloff/selection. `application="delta"` adds the result multiplied by falloff/selection before clamping. Direct modes ignore noise settings.
+  * All three modes use `ApplyNoiseSampler`. Continuous brushes evaluate against current working values; one-shot strokes evaluate dabs against pre-stroke values and keep the strongest effect per vertex, preventing accumulation when held or retraced.
   * That pipeline samples all vertices before writing. A failing script, a non-finite result, or a loop-limit violation therefore leaves the layer unchanged.
   * The UI catches the error and shows it in the brush panel.
-  * `UIManager` registers the tool, so `oswald_model` does not depend on exprtk.
-  * The panel edits a draft script. The draft is compiled only when Compile is pressed.
-  * Compile diagnostics show the line and column. A failed compile keeps the previous script active.
-* **Brush script files (`BrushScriptFile`, `BrushScriptLibrary`)**: Scripts are saved as TOML files with string keys `name`, `description`, `output` and `script`, as in `brushes/fbm.toml`.
+  * `gaussian(range, sigma, unit)` samples a Gaussian-weighted spherical neighbourhood from immutable pre-dab values; unit 0 means kilometres and 1 means miles. Invalid arguments fail the dab without partial writes.
+  * `UIManager` builds the registry from library scripts and retains a separate `Custom` instance (formerly Scripted Brush). Native brush classes remain reference implementations for tests, not automatically registered Brushes entries. `oswald_model` remains independent of exprtk.
+  * Only Custom exposes the draft editor, Compile/Revert/Default, library Load/Save, and Import/Export. Library tools expose generated parameters without the editor. A failed compile keeps the previous script and parameters active; Revert restores them.
+* **Brush script files (`BrushScriptFile`, `BrushScriptLibrary`)**: Scripts are saved as TOML files with root keys `name`, `description`, `output`, `script`, optional `application` and boolean `continuous`, followed by optional `[[parameter]]` tables, as in [assets/brushes/fbm.toml](./assets/brushes/fbm.toml). Root keys must precede the parameter tables.
   * `name` and `script` are required; `description` and `output` are optional, and unknown keys are ignored.
-  * `output` is `"normalized"` (`"normalised"` is also accepted, case-insensitively) or `"elevation"`. Loading a file without it keeps the panel's current Script output setting; saving always writes it.
+  * `output` is `"normalized"` (`"normalised"` is also accepted, case-insensitively) or `"elevation"`. Loading into Custom without it keeps the current Script output setting; standalone library tools default to normalized. UI saves write the current output setting.
+  * Parameters are `float`, `integer`, or `choice`, with valid unique script identifiers that cannot shadow inputs/functions/constants/reserved words. Numeric parameters require `control` (`slider`, `spin`, `text`), `min < max`, and a valid `default`; numeric strings and TOML numbers are accepted. Integers use 32-bit bounds. Floats optionally use linear (default) or logarithmic scale; logarithmic bounds must be positive. Float slider bounds are limited to half the maximum finite double magnitude.
+  * Choices require a nonempty array of unique strings and a matching string default; scripts read the selected string by name. An optional `label` changes display text without changing the script identifier.
+  * Optional float `units` references a choice parameter with exactly `["Kilometres", "Miles"]`. Storage, bounds and script values stay in kilometres; the UI converts displayed/input values when Miles is selected. Gaussian Blur uses this to preserve physical range and sigma across unit changes.
   * Single-line values are written as basic strings. Multi-line scripts are written as `'''` literal strings so the file stays readable, falling back to escaped basic strings when the text contains quotes or control characters.
   * Files are written to a temporary file and renamed, so a failed save never truncates an existing script.
   * `BrushScriptLibrary::Scan` loads every `.toml` file in a folder, sorted by name, and reports files that fail to parse instead of aborting.
-  * The application's library folder is the source tree's `brushes/` directory (`OSWALD_BRUSH_SCRIPT_DIR`), set with `UIManager::SetBrushScriptDirectory`.
-  * The Scripted brush panel lists the library with each script's description, and has Load, Refresh, Name and Description fields.
+  * The application's library folder is the source tree's `assets/brushes/` directory (`OSWALD_BRUSH_SCRIPT_DIR`), set with `UIManager::SetBrushScriptDirectory`.
+  * Brushes is populated alphabetically from compilable files, followed by Custom, Refresh brushes, and Brush errors when needed. Invalid files/scripts, duplicate names, and the reserved name `Custom` are skipped with diagnostics. An empty/broken library still leaves Custom usable. No brush is active until selected.
+  * Refresh rebuilds library tools with their declared defaults while retaining Custom's instance, draft, compiled script, and control values. Save to library also refreshes Brushes. Refresh is disabled during a stroke. Files are read directly from the source library, not copied into build resources.
+  * The Custom panel lists the library with each script's description, and has Load, Refresh, Name and Description fields.
   * Save to library writes `<name>.toml`, with unsafe file-name characters replaced by `_`, and asks before replacing an existing file.
   * Import... and Export... use the project file browser to read or write a script anywhere.
-  * Loading or importing replaces the editor's name, description, draft and (when present) output mode, then compiles the script. A script that fails to compile stays in the editor with its diagnostics, and strokes keep using the last compiled script.
-  * Saving and exporting write the editor's current draft.
+  * Loading or importing replaces the editor's name, description, draft, behavior metadata and parameter controls/defaults, plus output mode when present, then compiles the script. A script that fails to compile stays in the editor with diagnostics; strokes retain the last compiled script and parameters.
+  * Saving/exporting writes the current draft, parameter definitions and original defaults, and behavior metadata, not current control values. Parameter definitions and behavior metadata are edited externally.
+* **Noise backend**: `Noise.cpp` reuses thread-local native FastNoise2 Simplex, Value, White, FractalFBm and FractalRidged nodes. Value uses cubic interpolation. Native fractal sums are divided by total octave amplitude and clamped to [-1, 1]. Both halves of a uint64 seed are folded into FastNoise2's 32-bit seed as `low32 + high32 * 0x9e3779b9` modulo 2^32; collisions are unavoidable and patterns differ from the original in-house backend.
+  * `fbm`, `billow`, `valuefbm` and `ridged` take `(x,y,z,frequency,lacunarity,persistence,octaves)`. Legacy nine-argument ridge scripts must remove offset/gain arguments; those controls and the Value interpolation selector no longer exist.
+  * FastNoise2 uses float coordinates. Fractal frequency/lacunarity/persistence must be finite and nonnegative, octaves 1-16, with float-representable lacunarity/persistence, per-octave coordinates within +/-1e8, and total amplitude within half the maximum finite float.
+  * `spectral(x,y,z,frequency,exponent,resolution)` uses FastNoise2 White samples and the existing periodic 3D FFT filter/cache. Frequency is in (0, 1e6], exponent in [-4, 8], and resolution is a power of two in [8, 128]. Domain warping uses the new Simplex backend. Saved terrain is not regenerated merely by opening a project.
 
 The single hover readout reports the cumulative elevation through the active layer,
 including visible layers below it and any in-progress brush preview, but excluding
@@ -292,7 +313,8 @@ Snapshot queries are safe concurrently:
 
 * `FindNearest(direction)` normalizes a finite, nonzero 3D direction and returns
   a vertex index using float Euclidean chord distance on the unit sphere.
-* `FindWithinRadius(direction, arcRadius, planetRadius = 6371.0)` takes the
+* `FindWithinRadius(direction, arcRadius)` uses the planet's configured radius
+  in kilometres. The three-argument overload takes an explicit radius and uses
   arc radius and planet radius in the same physical unit (kilometers by
   default). It converts arc to chord distance for k-d tree candidates, then
   filters in double precision using angular distance. The boundary is
@@ -311,6 +333,11 @@ refinement and flat-region coarsening are implemented as described above.
 The rendering engine utilizes OpenGL 4.5 Core Profile with Direct State Access (DSA) to minimize driver overhead and state management complexity.
 
 ### 7.1 GPU Buffer Initialization
+
+The following is a simplified DSA layout example, not the current renderer's
+complete buffer allocation. The implementation uses separate position,
+elevation, selection and index buffers, per-layer elevation buffers, and a
+compute-output buffer for composed elevations.
 
 ```cpp
 GLuint vao, vbo, ebo;
@@ -337,10 +364,12 @@ glVertexArrayElementBuffer(vao, ebo);
 
 ### 7.2 GLSL Shading Pipeline
 
-The maintained GLSL 450 core shader pair is
-[globe.vert](./shaders/globe.vert) and [globe.frag](./shaders/globe.frag).
-The vertex shader applies `uModelViewProjection` and passes elevation,
-selection weight, and object-space position to the fragment shader.
+The maintained GLSL 450 core globe pipeline is
+[globe.vert](./shaders/globe.vert), [globe.geom](./shaders/globe.geom), and
+[globe.frag](./shaders/globe.frag). The geometry stage handles projection-specific
+triangle output, including equirectangular seam wrapping. The separate
+[elevation.comp](./shaders/elevation.comp) shader composes visible layers;
+`wire.vert`/`wire.geom`/`wire.frag` render the optional wireframe.
 
 Selection weights are uploaded as a separate per-vertex attribute and passed
 to the fragment shader. With an active selection, the shader blends from the
@@ -427,8 +456,10 @@ back-face culling, an orthographic projection, and a Z-up view from negative Y.
 Projection bounds preserve the globe's circular silhouette and fit it within
 both portrait and landscape framebuffers. Zero-sized framebuffers are skipped
 while minimized; negative sizes and drawing before mesh/palette upload are
-errors. The caller clears colour and depth each frame. Rotation and zoom remain
-Phase 4 work; zero-initialized elevations currently produce a shaded green globe.
+errors. The caller clears colour and depth each frame. Rotation and zoom are
+implemented by `CameraController`: the caller supplies the current model matrix
+and zoom. Equirectangular mode renders a longitude/latitude map with horizontal
+wrapping and bounded latitude, rather than a circular globe.
 
 ---
 
@@ -445,7 +476,7 @@ Dear ImGui provides the main application interface overlay.
 |   ├── Save           (Ctrl+S)                                     |
 |   ├── Save As...     (Ctrl+Shift+S)                               |
 |   ├── Export                                                     |
-|   ├── Metadata...                                                |
+|   ├── Planet...                                                  |
 |   ├── Open Raster... (Ctrl+Shift+O)                               |
 |   ├── Settings...                                                 |
 |   └── Exit                                                        |
@@ -456,9 +487,10 @@ The main menu also includes `Select -> Radius Selection`, `Polygon Selection`,
 `Clear Selection`, and `Invert Selection`. Radius selection has outer-radius
 and feather controls. Polygon selection accepts globe clicks and finishes on
 a double-click or Enter; Escape cancels it.
-With either Select tool active, clicking outside the globe (including outside
-the viewport or on UI areas outside the globe) clears the selection and any
-unfinished polygon. Clearing is undoable and keeps the Select tool active.
+With either Select tool active, an unshifted left-click on empty viewport space
+outside the globe clears selection and any unfinished polygon. UI-captured
+clicks and clicks outside the viewport leave selection unchanged. Clearing is
+undoable and keeps the Select tool active.
 Hold Shift when starting a radius stroke or placing the first polygon point
 to add to the existing selection instead of replacing it. Overlapping weights
 combine by taking their maximum, preserving feathering without accumulation.
@@ -475,10 +507,24 @@ range midpoint to zero at both bounds. Equal bounds
 select exact matches only. OK swaps reversed bounds before applying one undoable selection change without
 changing elevations; Cancel or Escape dismisses the dialog without applying.
 
-#### Settings Dialog (`File -> Settings...`)
+#### Planet Dialog (`File -> Planet...`)
+* **Geometry tab**: Positive finite planet radius in kilometres (default 6371)
+  and point count. Radius is shared by incision, brush/noise distances, Gaussian
+  blur, radius selection, and their viewport rings; miles use the same radius
+  converted from kilometres. Changing radius alone preserves terrain, layers,
+  selection, and undo history.
 * **Point Count ($N$)**: Int slider controlling target base vertex density ($1,000$ to $1,000,000$).
+  Applying a new count regenerates the grid using the loaded raster if available,
+  remaps layers, and clears undo history, as in the former Settings control.
+* **Metadata tab**: Description, author, and read-only last-saved UTC date.
+  Apply commits both tabs; Cancel/Escape discards pending changes.
+
+#### Settings Dialog (`File -> Settings...`)
 * **Poisson Variability ($J$)**: Float slider ($0.00$ to $1.00$); higher values allow smaller minimum spacing.
 * **Apply Button**: Triggers `SphericalGrid::GenerateGrid()` and updates GPU VBO buffers.
+* **Raise/Lower speed**: Positive elevation units per second, default 8192; supplied
+  to scripts as `rate`. Changing only this setting preserves terrain and undo history.
+* **Display colours**: Graticule/highlight and selected/unselected wireframe colours.
 
 ### 8.2 Navigation & Viewport Controls
 
@@ -488,31 +534,77 @@ The navigation system provides interactive orthographic globe manipulation:
 * **Mouse Wheel**: Adjusts orthographic zoom scale factor smoothly.
 * **Middle-Button Drag**: Rotates the globe regardless of the selected tool,
   respecting UI mouse capture. Middle and right clicks do not clear selection;
-  only a left click without Shift outside the globe clears it.
+  only an uncaptured left click without Shift on empty viewport space clears it.
 * **Double Click (Left Button)**: Casts an orthographic ray from cursor screen space into 3D world space. If the ray intersects unit sphere $S^2$, the controller smoothly rotates the globe to center the clicked coordinate.
+
+`View -> Projection` switches between Orthographic and Equirectangular.
+In Equirectangular view, dragging pans, longitude wraps, latitude is bounded,
+the wheel scales the map, and double-click recenters geographically. Brush,
+selection, and hover picking use the selected projection.
 
 ### 8.3 Consistent UI Controls
 
 Use the same widget type and presentation wherever the same kind of value is
 entered, whether in a dialog or a parameters panel. In particular, elevation
-values in [-32767, +32767] use the elevation brush's float slider: the same
-range and whole-unit display format. Apply this control consistently to other
-elevation-value inputs, including the Fill filter dialog. Use the same
+values in [-32767, +32767] use float sliders with the same supported range.
+Script controls use their TOML datatype, control, label and scale, with numeric
+validation before values reach the active script. Use the same
 consistency rule for other data types and ranges rather than introducing a
 different widget style for equivalent values.
+
+### 8.4 Brushes Menu and Custom Editor
+
+The Brushes menu (formerly Tools) is data-driven from `assets/brushes/*.toml`; see Section 3.1 for
+validation, refresh, parameter binding, and application modes. The shipped
+definitions replace all eight original menu tools:
+
+| Tool | Definition | Application |
+| --- | --- | --- |
+| Elevation Brush | [elevation.toml](./assets/brushes/elevation.toml) | Direct height; Replace/Minimum/Maximum choice |
+| Raise/Lower Brush | [raise_lower.toml](./assets/brushes/raise_lower.toml) | Continuous delta using `rate * elapsed * intensity / 100` |
+| Simplex Noise | [simplex.toml](./assets/brushes/simplex.toml) | Normalized fBm, optional billowed output |
+| Value Noise | [value.toml](./assets/brushes/value.toml) | Normalized Value fBm with amplitude |
+| Ridge Noise | [ridge.toml](./assets/brushes/ridge.toml) | Normalized native ridged fractal |
+| Power-Law Spectral Noise | [spectral.toml](./assets/brushes/spectral.toml) | Normalized periodic spectral field |
+| Gaussian Blur | [gaussian_blur.toml](./assets/brushes/gaussian_blur.toml) | Direct Gaussian neighbourhood height |
+| Clamp | [clamp.toml](./assets/brushes/clamp.toml) | Direct height clamped between ordered parameter bounds |
+
+Other valid library files also appear in Brushes. Custom is a separate persistent
+editor/tool, not a file-backed preset name. Definitions and defaults are edited
+externally; Custom still permits editing/compiling the script body and saving
+or exporting its definition. Per-tool values are independent. Refresh resets
+library tools to file defaults, but does not replace Custom's state.
+
+Every brush panel includes **Fill selection**. `UIManager` copies the current
+`BrushSettings` with `coverage=BrushCoverage::Selection`, then calls the same
+brush `Apply` pipeline once with `elapsed=1`. The shared weighting code visits
+every selected vertex, using only its selection weight (or weight 1 everywhere
+if selection is inactive), bypassing radius searches and radial falloff. An empty
+active selection changes nothing. Scripts retain the configured radius but receive
+distance zero because a selection fill has no brush centre. Continuous scripts
+therefore apply one second at their configured rate/intensity. Gaussian/spectral
+sampling, seed, output operation/range, and parameters are otherwise unchanged.
+The action edits only the active layer and commits one `BrushStrokeCommand` when
+values change, supporting undo/redo. Script evaluation uses immutable pre-fill
+values and stages updates before writing; failures are reported in the panel
+without partial edits. The button is disabled during a stroke or without an
+active layer.
 
 ---
 
 ## 9. Data Ingestion & Cartographic Raster Pipeline
 
-When the user selects an equirectangular image file via `File -> Open...`:
+When the user selects an equirectangular image file via `File -> Open Raster...`
+(`File -> Open` opens an `.oswald` project):
 
 1. **Raster Loading**: The image is loaded into host memory (via `stb_image`) and scaled to a standard 2:1 aspect ratio format.
 2. **Luminosity Extraction**: Pixel RGB values are converted to normalized luminosity $L \in [0.0, 1.0]$:
 
 $$L = 0.2126 \cdot R + 0.7152 \cdot G + 0.0722 \cdot B$$
 
-3. **Elevation Mapping**: Luminosity is scaled to 16-bit signed integer range $[-32767, +32767]$ feet/meters:
+3. **Elevation Mapping**: Luminosity is mapped to Float32 elevation values in
+   $[-32767, +32767]$ (not quantized to signed integers). Supported Int16/Float32
+   TIFF elevations instead retain their numeric samples; see Section 10.6.
 
 $$\text{Elevation} = -32767.0 + L \cdot (65534.0)$$
 
@@ -524,6 +616,68 @@ $$\text{Elevation} = -32767.0 + L \cdot (65534.0)$$
 
 ---
 
+### 9.1 Absolute Magnitude Noise
+
+`Filter -> Absolute Magnitude Noise...` opens an amplitude slider from 0 to
+500 feet (default 100). Each Apply draws independent uniform random offsets
+between minus and plus the amplitude, converts feet to metres (`1 ft = 0.3048 m`),
+and adds each offset multiplied by the vertex's selection weight. With no active
+selection, all vertices have full weight; an active empty selection changes
+nothing. This operates on the current selection, not the history of Fill edits,
+and affects underwater elevations too.
+
+Final elevations are clamped to `[-32767, 32767] m` after feathering. Apply records
+one undoable edit on the active elevation layer; redo restores the exact same
+random result. Zero amplitude is a no-op. Cancel/Escape discards pending edits.
+
+### 9.2 Basin Filling
+
+`Filter -> Erosion -> Fill basins...` immediately runs the spherical priority-flood
+operator from Section 2.1 of the [erosion functional spec](./oswald-gis-erosion-functional-spec.md)
+on the active elevation layer, as one undoable edit. With no active selection it
+processes the globe; otherwise unselected vertices remain fixed drainage outlets
+and selection weights blend the filled elevations. Feathering intentionally
+partially fills basins rather than guaranteeing complete drainage.
+
+Vertices at or below sea level are fixed sinks, preserving the sea floor. If
+there are no ocean or unselected outlets, all vertices tied at the global minimum
+are used as sinks. Propagation follows the spherical Delaunay half-edge graph,
+including across the poles and longitude seam. Flat or depressed terrain is
+raised by `0.0001 m` above its resolved neighbor, or one Float32 representable step
+when that increment would round away. If drainage would exceed the supported
+`32767 m` elevation limit, the operation reports an error without applying changes.
+
+### 9.3 Stream Power Incision
+
+`Filter -> Erosion -> Incise flow...` opens a parameter dialog for a single pass of
+Section 2.2 of the [erosion functional spec](./oswald-gis-erosion-functional-spec.md).
+Defaults are incision rate `C = 1 m/pass`, reference runoff `Aref = 1`, flow
+exponent `m = 0.5`, slope exponent `n = 1`, uniform precipitation `P = 1` per
+vertex. Planet radius comes from `File -> Planet... -> Geometry` (default
+`6371 km`), not this filter's dialog. Reference runoff must be positive;
+the other parameters may be zero but not negative. All must be finite.
+
+Each non-sink vertex routes to its steepest strictly downhill Delaunay neighbor,
+using great-circle distance and slopes in metres per kilometre. Runoff starts at
+`P` per vertex (vertex-count units when `P = 1`) and accumulates from highest to
+lowest elevation. Incision uses the original slopes and accumulated runoff:
+`C * (A / Aref)^m * S^n`. Changes are simultaneous, not affected by processing order.
+
+Sink and selection rules match basin filling: vertices at or below sea level
+and unselected vertices are fixed terminal outlets; unselected terrain does not
+supply upstream runoff to the selection. With no outlets, tied global minima
+are fixed sinks. Feathered selections blend the final incision, not runoff.
+Local pits and flats without strictly downhill neighbors remain unchanged;
+basin filling is a separate, optional preparatory operation.
+
+The filter can carve land below sea level, but never changes existing ocean
+sinks. Target elevations are clamped to `[-32767, 32767] m` before selection
+blending, consistent with the Fill filter. Invalid parameters or numeric overflow
+are reported in the dialog without changing terrain. Apply records one undoable
+edit on the active elevation layer; Cancel leaves terrain untouched.
+
+---
+
 ## 10. CMake Configuration & Directory Layout
 
 ### 10.1 Directory Layout
@@ -531,30 +685,21 @@ $$\text{Elevation} = -32767.0 + L \cdot (65534.0)$$
 ```
 oswald-gis/
 ├── CMakeLists.txt
-├── include/
-│   ├── ColorMap.hpp
-│   ├── SphericalGrid.hpp
-│   ├── GlobeRenderer.hpp
-│   └── CameraController.hpp
-├── src/
-│   ├── ColorMap.cpp
-│   ├── main.cpp
-│   ├── SphericalGrid.cpp
-│   └── GlobeRenderer.cpp
-├── tests/
-│   ├── SphericalGridTests.cpp
-│   └── GlobeRendererTests.cpp
-├── shaders/
-│   ├── globe.vert
-│   └── globe.frag
+├── include/                 # Public model, renderer, controller and scripting headers
+├── src/                     # Implementations, main.cpp and internal file helpers
+├── tests/                   # CPU tests plus hidden-context GPU/UI integration tests
+├── shaders/                 # Globe/wire vertex, geometry, fragment shaders; elevation.comp
 └── assets/
-    ├── colormaps/
-    │   └── default.map
-    └── earth_elevation_default.png
+    ├── colormaps/           # External selected/unselected colour palettes
+    └── brushes/             # TOML scripts supplying Brushes menu entries
 ```
 
-This is the target MVP layout; camera and raster asset files remain for later
-phases. GLAD sources are generated inside the build directory.
+`include/` and `src/` include Layer, SphericalGrid, ProjectFile, ElevationRaster,
+BrushTool, SelectionTool, Filter, Noise, CameraController, GlobeRenderer,
+ScriptEngine, ScriptedBrushTool, BrushScriptFile, RasterFileBrowser and UIManager.
+`ScriptParameter.hpp` defines the shared parameter metadata/value types;
+`UndoStack.hpp` provides command history. GLAD and fetched dependencies are
+generated/populated inside the build directory.
 
 ### 10.2 Production CMake Configuration
 
@@ -564,6 +709,9 @@ builds `imgui_lib` with the GLFW/OpenGL3 backends, and exposes `oswald_model`
 as an OpenGL-independent C++20 library. The `oswald_gis` executable links the
 model and graphics dependencies. `spherical_grid_tests` links only the model
 and thread library; no display is needed to run the model tests.
+FastNoise2 is linked privately by `oswald_model`, with its tools, tests and
+utility executables disabled and `FASTNOISE2_STRICT_FP=ON`. Its pinned FastSIMD
+dependency provides CPU SIMD dispatch.
 TIFF image I/O additionally requires a system libtiff development package
 (`libtiff-dev` on Debian/Ubuntu, `libtiff-devel` on Fedora, or `libtiff` via
 Homebrew). CMake discovers it with `find_package(TIFF REQUIRED)` and links
@@ -580,6 +728,11 @@ large compile cost in one translation unit. The scripting library links
 included only by `src/BrushScriptFile.cpp`, also in `oswald_scripting`.
 `script_engine_tests`, `scripted_brush_tool_tests` and `brush_script_file_tests`
 cover the engine, brush and script files without a display.
+`noise_tests` compares the wrappers against native FastNoise2 and checks seed
+handling, ranges, validation and thread isolation. Scripted brush tests compile
+all shipped definitions and compare all eight replacements with native reference
+tools, including selection weights, tapered strokes, continuous deltas,
+Gaussian distance units, spectral fields and domain warping.
 Shaders and all `.map`
 files in `assets/colormaps` are copied at configuration time into the build's
 `resources` directory. Editing a source shader/map triggers CMake regeneration
@@ -587,19 +740,23 @@ on the next build.
 The executable uses the configured absolute resource path, independent of the
 working directory. Relocatable installation/resource discovery is not yet
 implemented; moving the build requires reconfiguration.
+Brush TOML files are read at runtime from the configured absolute source path
+`OSWALD_BRUSH_SCRIPT_DIR`, currently `assets/brushes/`, rather than the copied
+shader/colourmap resources.
 
 Qhull uses the reentrant static target `qhullstatic_r`. Its source directory
 is excluded from the default build, so only linked targets are built, not its
 standalone tools or unused C++ wrapper (which uses pre-C++20 constructor syntax).
-The application and model remain C++20. Its CMake 4 policy
-compatibility floor is scoped to Qhull's configuration. Qhull is configured
+The application and model remain C++20. The top-level build sets
+`CMAKE_POLICY_VERSION_MINIMUM` to at least 3.10 for fetched dependencies that
+declare older policy versions. Qhull is configured
 before nanoflann so the dependencies share an uninstall target without a
 name collision. Upstream examples and tests for nanoflann remain disabled.
 
 ### 10.3 Phase 1 Build and Run
 
-The initial build creates an OpenGL 4.5 core-profile window and clears it each
-frame. Configure and build it with:
+The application creates an OpenGL 4.5 core-profile window and renders the
+generated globe with its UI. Configure and build it with:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -717,7 +874,7 @@ With a working display and OpenGL 4.5, run the dialog interaction check with
 ### 10.7 Phase 15: Project Metadata, Persistence, and Export
 
 `SphericalGrid` owns project description, author, and last-saved UTC timestamp.
-`File -> Metadata...` edits description and author; its date field is read-only.
+`File -> Planet... -> Metadata` edits description and author; its date field is read-only.
 Changes are applied explicitly or discarded with Cancel. Only a successful project
 save changes the date (`YYYY-MM-DDTHH:MM:SSZ`); exporting does not change it.
 
@@ -729,23 +886,24 @@ Up/Refresh, folder double-clicks, and typed or selected filenames. Enter submits
 the filename; Cancel/Escape closes the dialog. File and validation errors remain
 visible without closing the dialog.
 
-Project format version 1 uses the following ordered layout. All integers and
+Project format version 2 uses the following ordered layout. Version 1 projects
+remain readable and default to an Earth radius of 6371 km. All integers and
 IEEE-754 floats are little-endian; strings are a uint32 byte count followed by
 text bytes (no terminator). String fields are limited to 1 MiB and cannot contain
 null characters. Booleans are uint32 values 0 or 1.
 
 | Section | Contents |
 | --- | --- |
-| Header | Eight bytes `OSWALD\r\n`, uint32 version (1). |
+| Header | Eight bytes `OSWALD\r\n`, uint32 version (2). |
 | Metadata | Description, author, last-saved date strings. |
-| Grid options | uint32 requested point count, float64 Poisson variability, uint32 seed, uint32 relaxation iterations. |
+| Grid options | uint32 requested point count, float64 Poisson variability, uint32 seed, uint32 relaxation iterations, float64 planet radius in km (omitted in version 1). |
 | Mesh header | uint32 actual vertex count, uint32 triangle-index count, selection-active boolean. |
 | Vertices | Per vertex: float32 x/y/z, raw snapshot elevation, selection weight; uint32 refinement-created flag. |
 | Faces | uint32 vertex indices, three per triangle, preserving exact order. |
 | Layer header | uint32 layer count, uint32 active-layer index (`0xffffffff` for none). |
 | Layers | In top-to-bottom order: uint32 layer type and data type; name, description, unselected colour-map name, selected colour-map name strings; uint32 blend mode; visibility boolean; uint32 value count followed by float32 raw values. |
 
-Version 1 accepts only Raster (type 0) / Float32 (data type 0) elevation layers.
+Both versions accept only Raster (type 0) / Float32 (data type 0) elevation layers.
 Blend mode identifiers are Overlay=0, Add=1, Subtract=2, Multiply=3, Minimum=4,
 Maximum=5. Each layer has exactly one value per vertex. Limits are 1,000,000
 vertices and 1,024 layers. Generation options retain their existing limits.
@@ -831,3 +989,27 @@ The GPU-backed `raster_file_dialog` test also exercises metadata editing,
 untitled Save, repeated Save, Save As, overwrite confirmation/cancellation, invalid and valid
 project Open, undo-history clearing, both Export submenu actions, RGB selection
 highlighting, TIFF precision selection, and image/sidecar overwrite handling.
+
+### 10.8 Noise, Scripting, and Brush Library Verification
+
+Build and run the focused CPU suites plus the GPU-backed UI/dialog suite with:
+
+```bash
+cmake --build build/ninja --target brush_tool_tests noise_tests \
+    scripted_brush_tool_tests script_engine_tests brush_script_file_tests ui_manager_tests
+ctest --test-dir build/ninja \
+    -R '^(brush_tool|noise|scripted_brush_tool|script_engine|brush_script_file|raster_file_dialog)$' \
+    --output-on-failure
+```
+
+The `ui_manager_tests` executable is registered with CTest as `raster_file_dialog`
+and requires a working display/OpenGL 4.5 context. In addition to file workflows,
+it covers data-driven Brushes entries, generated parameter controls, Gaussian
+kilometre/mile display, external library edits and refresh, error reporting,
+and preservation of Custom's editor/compiled state. Omit `raster_file_dialog`
+from the expression for CPU-only validation.
+Selection-fill tests compare all eight shipped scripts with whole-globe native
+reference applications, with and without selection feathering. They also verify
+footprint-independent coverage, fill-specific script inputs, current UI parameters,
+one-second continuous fills, saturation, failed-script atomicity, and single-action
+undo/redo.

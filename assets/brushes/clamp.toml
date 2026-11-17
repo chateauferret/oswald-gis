@@ -1,0 +1,21 @@
+name = "Clamp"
+description = "Clamp elevations to an interval; bounds may be supplied in either order."
+application = "elevation"
+output = "elevation"
+script = "clamp(min(Minimum, Maximum), elevation, max(Minimum, Maximum))"
+
+[[parameter]]
+name = "Minimum"
+type = "float"
+control = "slider"
+min = -32767
+max = 32767
+default = -32767
+
+[[parameter]]
+name = "Maximum"
+type = "float"
+control = "slider"
+min = -32767
+max = 32767
+default = 32767

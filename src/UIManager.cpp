@@ -24,8 +24,6 @@
 
 namespace {
 
-constexpr double earthRadiusKilometres = 6371.0;
-constexpr double earthRadiusMiles = 3958.7613;
 
 float clipUiValue(float value, float minimum, float maximum, float fallback) {
     if (!std::isfinite(value)) {
@@ -321,8 +319,10 @@ public:
 
 private:
     void Apply(const std::shared_ptr<const SphericalGridSnapshot>& snapshot) {
+        const double radius = grid_.GetSnapshot()->GetOptions().planetRadius;
         grid_.InstallSnapshot(snapshot);
-        renderer_.UploadGrid(*snapshot);
+        grid_.SetPlanetRadius(radius);
+        renderer_.UploadGrid(*grid_.GetSnapshot());
     }
 
     SphericalGrid& grid_;
@@ -346,9 +346,13 @@ UIManager::UIManager(const GridOptions& options, std::filesystem::path colorMapD
     auto scripted = std::make_unique<ScriptedBrushTool>();
     scriptedTool_ = scripted.get();
     brushTools_.RegisterTool(std::move(scripted));
+    brushTools_.SetActive(false);
 }
 
 void UIManager::SetBrushScriptDirectory(std::filesystem::path directory) {
+    if (stroke_) {
+        throw std::logic_error("Finish the current stroke before changing the brush library.");
+    }
     brushScriptDirectory_ = std::move(directory);
     RescanScriptLibrary();
 }
@@ -491,12 +495,40 @@ std::vector<std::string> scriptDiagnostics(const ScriptError& error) {
 } // namespace
 
 void UIManager::RescanScriptLibrary() {
+    // Registry replacement invalidates tool references; never replace it during a stroke.
+    if (stroke_) {
+        scriptLibraryMessage_ = "Finish the current stroke before refreshing brushes.";
+        scriptLibraryMessageIsError_ = true;
+        return;
+    }
     const auto selectedPath = selectedLibraryScript_ >= 0 &&
             selectedLibraryScript_ < static_cast<int>(scriptLibrary_.entries.size()) ?
         scriptLibrary_.entries[static_cast<std::size_t>(selectedLibraryScript_)].path :
         std::filesystem::path{};
     scriptLibrary_ = brushScriptDirectory_.empty() ? BrushScriptLibrary{} :
         BrushScriptLibrary::Scan(brushScriptDirectory_);
+    brushLibraryErrors_ = scriptLibrary_.errors;
+    std::vector<std::unique_ptr<BrushTool>> tools;
+    for (const auto& entry : scriptLibrary_.entries) {
+        try {
+            if (entry.file.name == "Custom" ||
+                std::any_of(tools.begin(), tools.end(), [&](const auto& tool) {
+                    return tool->GetName() == entry.file.name;
+                })) {
+                throw std::invalid_argument("Duplicate or reserved brush name '" + entry.file.name + "'.");
+            }
+            auto tool = std::make_unique<ScriptedBrushTool>(entry.file.name);
+            tool->SetScript(entry.file.script, entry.file.parameters);
+            tool->GetSettings().output = entry.file.output.value_or(ScriptedBrushSettings::Output::Normalized);
+            tool->GetSettings().application = entry.file.application;
+            tool->GetSettings().continuous = entry.file.continuous;
+            tools.push_back(std::move(tool));
+        } catch (const std::exception& error) {
+            brushLibraryErrors_.push_back(entry.path.string() + ": " + error.what());
+        }
+    }
+    // Preserve the Custom editor/tool and its compiled state across rescans.
+    brushTools_.ReplaceTools(std::move(tools), "Custom");
     selectedLibraryScript_ = -1;
     for (std::size_t index = 0; index < scriptLibrary_.entries.size(); ++index) {
         if (scriptLibrary_.entries[index].path == selectedPath) {
@@ -509,6 +541,15 @@ void UIManager::LoadScriptIntoEditor(const BrushScriptFile& file) {
     scriptName_ = file.name;
     scriptDescription_ = file.description;
     scriptDraft_ = file.script;
+    scriptApplication_ = file.application;
+    scriptContinuous_ = file.continuous;
+    scriptParameters_ = file.parameters;
+    scriptParameterValues_.clear();
+    for (const auto& parameter : scriptParameters_) {
+        scriptParameterValues_.push_back(parameter.defaultValue);
+    }
+    scriptParameterError_.clear();
+    scriptParametersInstalled_ = false;
     scriptErrors_.clear();
     if (scriptedTool_ == nullptr) {
         return;
@@ -519,7 +560,10 @@ void UIManager::LoadScriptIntoEditor(const BrushScriptFile& file) {
     // A script that fails to compile stays in the editor with its diagnostics; strokes keep
     // using the last compiled script.
     try {
-        scriptedTool_->SetScript(file.script);
+        scriptedTool_->SetScript(file.script, scriptParameters_, scriptParameterValues_);
+        scriptedTool_->GetSettings().application = scriptApplication_;
+        scriptedTool_->GetSettings().continuous = scriptContinuous_;
+        scriptParametersInstalled_ = true;
         brushError_.clear();
     } catch (const ScriptError& error) {
         scriptErrors_ = scriptDiagnostics(error);
@@ -533,7 +577,8 @@ BrushScriptFile UIManager::CurrentScriptFile() const {
     if (scriptedTool_ != nullptr) {
         output = scriptedTool_->GetSettings().output;
     }
-    return {scriptName_, scriptDescription_, std::move(script), output};
+    return {scriptName_, scriptDescription_, std::move(script), output, scriptParameters_,
+            scriptApplication_, scriptContinuous_};
 }
 
 void UIManager::SaveScriptToLibrary(const std::filesystem::path& path) {
@@ -574,9 +619,15 @@ void UIManager::RenderScriptLibrary() {
                                   ImGuiSelectableFlags_AllowDoubleClick)) {
                 selectedLibraryScript_ = static_cast<int>(index);
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    LoadScriptIntoEditor(entry.file);
-                    scriptLibraryMessage_ = "Loaded " + entry.file.name + ".";
-                    scriptLibraryMessageIsError_ = false;
+                    try {
+                        const auto file = BrushScriptFile::Load(entry.path);
+                        LoadScriptIntoEditor(file);
+                        scriptLibraryMessage_ = "Loaded " + file.name + ".";
+                        scriptLibraryMessageIsError_ = false;
+                    } catch (const std::exception& error) {
+                        scriptLibraryMessage_ = error.what();
+                        scriptLibraryMessageIsError_ = true;
+                    }
                 }
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
@@ -688,7 +739,7 @@ void UIManager::RenderScriptLibrary() {
         ImGui::TextWrapped("%s", scriptLibraryMessage_.c_str());
         ImGui::PopStyleColor();
     }
-    for (const auto& message : scriptLibrary_.errors) {
+    for (const auto& message : brushLibraryErrors_) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.72F, 0.32F, 1.0F));
         ImGui::TextWrapped("Skipped: %s", message.c_str());
         ImGui::PopStyleColor();
@@ -696,8 +747,101 @@ void UIManager::RenderScriptLibrary() {
     ImGui::Separator();
 }
 
+void UIManager::RenderScriptParameters(ScriptedBrushTool& tool, bool custom) {
+    const auto definitions = custom ? scriptParameters_ : tool.GetParameters();
+    auto values = custom ? scriptParameterValues_ : tool.GetParameterValues();
+    if (!definitions.empty()) {
+        ImGui::SeparatorText("Script parameters");
+        for (std::size_t i = 0; i < definitions.size(); ++i) {
+            auto parameter = definitions[i];
+            auto value = values[i];
+            double displayScale = 1.0;
+            if (!parameter.units.empty()) {
+                const auto unit = std::find_if(definitions.begin(), definitions.end(),
+                    [&](const auto& candidate) { return candidate.name == parameter.units; });
+                const auto index = static_cast<std::size_t>(unit - definitions.begin());
+                if (std::get<std::string>(values[index]) == "Miles") {
+                    displayScale = 0.621371192;
+                    parameter.minimum *= displayScale;
+                    parameter.maximum *= displayScale;
+                    value = std::get<double>(value) * displayScale;
+                }
+            }
+            bool changed = false;
+            ImGui::PushID(static_cast<int>(i));
+            const auto label = (parameter.label.empty() ? parameter.name : parameter.label) +
+                               "###ScriptParameter";
+            if (parameter.type == ScriptParameter::Type::Choice) {
+                auto& text = std::get<std::string>(value);
+                if (ImGui::BeginCombo(label.c_str(), text.c_str())) {
+                    for (const auto& choice : parameter.choices) {
+                        if (ImGui::Selectable(choice.c_str(), choice == text)) {
+                            text = choice;
+                            changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            } else if (parameter.type == ScriptParameter::Type::Integer) {
+                std::int64_t number = static_cast<std::int64_t>(std::get<double>(value));
+                if (parameter.control == ScriptParameter::Control::Slider) {
+                    const auto minimum = static_cast<std::int64_t>(parameter.minimum);
+                    const auto maximum = static_cast<std::int64_t>(parameter.maximum);
+                    changed = ImGui::SliderScalar(label.c_str(), ImGuiDataType_S64, &number,
+                        &minimum, &maximum, "%lld", ImGuiSliderFlags_AlwaysClamp);
+                } else {
+                    const std::int64_t step = 1;
+                    const std::int64_t fastStep = 10;
+                    const bool spin = parameter.control == ScriptParameter::Control::Spin;
+                    changed = ImGui::InputScalar(label.c_str(), ImGuiDataType_S64, &number,
+                                                 spin ? &step : nullptr, spin ? &fastStep : nullptr);
+                }
+                value = static_cast<double>(number);
+            } else {
+                auto& number = std::get<double>(value);
+                if (parameter.control == ScriptParameter::Control::Slider) {
+                    changed = ImGui::SliderScalar(label.c_str(), ImGuiDataType_Double, &number,
+                        &parameter.minimum, &parameter.maximum, "%.6g",
+                        ImGuiSliderFlags_AlwaysClamp |
+                        (parameter.scale == ScriptParameter::Scale::Log ?
+                            ImGuiSliderFlags_Logarithmic : ImGuiSliderFlags_None));
+                } else {
+                    const double step = parameter.control == ScriptParameter::Control::Spin ?
+                        (parameter.scale == ScriptParameter::Scale::Log ?
+                            number * 0.01 : parameter.maximum * 0.01 - parameter.minimum * 0.01) : 0.0;
+                    changed = ImGui::InputDouble(label.c_str(), &number, step, step * 10.0, "%.6g");
+                }
+            }
+            ImGui::PopID();
+            if (changed) {
+                try {
+                    if (displayScale != 1.0) {
+                        value = std::get<double>(value) / displayScale;
+                    }
+                    definitions[i].ValidateValue(value);
+                    if (!custom || scriptParametersInstalled_) {
+                        tool.SetParameterValue(i, value);
+                    }
+                    if (custom) {
+                        scriptParameterValues_[i] = std::move(value);
+                    }
+                    scriptParameterError_.clear();
+                } catch (const std::invalid_argument& error) {
+                    scriptParameterError_ = error.what();
+                }
+            }
+        }
+        ImGui::TextDisabled("Edit parameter definitions and defaults in the TOML file, then reload.");
+    }
+    if (!scriptParameterError_.empty()) {
+        ImGui::TextWrapped("%s", scriptParameterError_.c_str());
+    }
+}
+
 void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
     RenderScriptLibrary();
+    RenderScriptParameters(tool, true);
+    const bool matchingParameters = scriptParametersInstalled_;
     auto& parameters = tool.GetSettings();
     constexpr std::array outputNames{"Normalised (-1 to 1 mapped to range)",
                                      "Elevation (clamped to range)"};
@@ -715,11 +859,14 @@ void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
     ImGui::InputTextMultiline("##BrushScript", &*scriptDraft_,
                               ImVec2(-1.0F, ImGui::GetTextLineHeight() * 10.0F),
                               ImGuiInputTextFlags_AllowTabInput);
-    const bool modified = *scriptDraft_ != compiled;
+    const bool modified = *scriptDraft_ != compiled || !matchingParameters;
     ImGui::BeginDisabled(!modified);
     if (ImGui::Button("Compile")) {
         try {
-            tool.SetScript(*scriptDraft_);
+            tool.SetScript(*scriptDraft_, scriptParameters_, scriptParameterValues_);
+            tool.GetSettings().application = scriptApplication_;
+            tool.GetSettings().continuous = scriptContinuous_;
+            scriptParametersInstalled_ = true;
             scriptErrors_.clear();
             brushError_.clear();
         } catch (const ScriptError& error) {
@@ -729,6 +876,12 @@ void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
     ImGui::SameLine();
     if (ImGui::Button("Revert")) {
         scriptDraft_ = compiled;
+        scriptParameters_ = tool.GetParameters();
+        scriptParameterValues_ = tool.GetParameterValues();
+        scriptApplication_ = tool.GetSettings().application;
+        scriptContinuous_ = tool.GetSettings().continuous;
+        scriptParametersInstalled_ = true;
+        scriptParameterError_.clear();
         scriptErrors_.clear();
     }
     ImGui::EndDisabled();
@@ -750,38 +903,63 @@ void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
             "The value of the final statement is the brush output. Inputs: x, y, z "
             "(unit position, domain-warped when enabled), lat, lon (degrees), elevation "
             "(current value), weight (falloff x selection), distance and radius (brush "
-            "units), lower and upper (ordered range).");
+            "units), lower and upper (ordered range), elapsed (seconds per dab), "
+            "rate (configured elevation units per second).");
         ImGui::TextWrapped(
             "Noise (uses the seed, returns -1 to 1): simplex(x,y,z), valuenoise(x,y,z), "
             "fbm(x,y,z,freq,lacunarity,persistence,octaves), billow(...same...), "
-            "valuefbm(...same...), ridged(...same..., offset, gain).");
+            "valuefbm(...same...), ridged(...same...). Uses FastNoise2; value noise "
+            "has cubic interpolation. Fractals use 1-16 octaves and nonnegative "
+            "frequency, lacunarity and persistence. Coordinates at each octave "
+            "must stay within +/-1e8.");
+        ImGui::TextWrapped(
+            "spectral(x,y,z,frequency,exponent,resolution): periodic power-law noise, "
+            "exponent -4 to 8, resolution 8/16/32/64/128. "
+            "gaussian(range,sigma,unit): pre-dab neighbourhood average; unit 0 is kilometres, "
+            "1 is miles. TOML application='elevation' blends direct heights; application='delta' "
+            "adds weight-scaled changes. continuous=true evaluates while held.");
         ImGui::TextWrapped(
             "Also available: + - * / %% ^, comparisons, if/else, for/while loops, "
             "var locals, abs, min, max, clamp(lo,x,hi), sqrt, exp, log, pow, sin, cos, "
-            "floor, round, pi. Names are case-sensitive; strings and return are not allowed.");
+            "floor, round, pi. Names are case-sensitive; return is not allowed. "
+            "Script parameters are available by name; compare choice values with quoted "
+            "strings, e.g. mode == 'one'. Parameter changes affect new strokes. "
+            "Save/export preserves the TOML defaults, not the current control values.");
     }
 }
 
-void UIManager::RenderBrushPanel() {
+void UIManager::FillSelection(SphericalGrid& grid, GlobeRenderer& renderer) {
+    try {
+        const auto snapshot = grid.GetSnapshot();
+        std::vector<float> before;
+        before.reserve(snapshot->GetVertices().size());
+        for (const auto& vertex : snapshot->GetVertices()) {
+            before.push_back(vertex.elevation);
+        }
+        auto after = before;
+        auto settings = brushTools_.GetSettings();
+        settings.coverage = BrushCoverage::Selection;
+        brushTools_.GetSelectedTool().Apply(*snapshot, {0.0, 0.0, 1.0}, after, settings, 1.0);
+        if (before != after) {
+            undoStack_.Execute(std::make_unique<BrushStrokeCommand>(
+                grid, renderer, std::move(before), std::move(after)));
+        }
+        brushError_.clear();
+    } catch (const std::exception& error) {
+        brushError_ = std::string("Fill selection failed: ") + error.what();
+    }
+}
+
+void UIManager::RenderBrushPanel(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (!brushTools_.IsActive()) {
         return;
     }
     bool open = true;
     auto& tool = brushTools_.GetSelectedTool();
-    const bool raiseLower = dynamic_cast<const RaiseLowerBrushTool*>(&tool) != nullptr;
-    const bool elevation = dynamic_cast<const ElevationBrushTool*>(&tool) != nullptr;
-    auto* noise = dynamic_cast<SimplexNoiseBrushTool*>(&tool);
-    auto* valueNoise = dynamic_cast<ValueNoiseBrushTool*>(&tool);
-    auto* ridgeNoise = dynamic_cast<RidgeNoiseBrushTool*>(&tool);
-    auto* spectralNoise = dynamic_cast<PowerLawNoiseBrushTool*>(&tool);
-    auto* blur = dynamic_cast<GaussianBlurBrushTool*>(&tool);
-    auto* clamp = dynamic_cast<ClampBrushTool*>(&tool);
     auto* scripted = dynamic_cast<ScriptedBrushTool*>(&tool);
-    NoiseSettings* noiseCommon = noise != nullptr ? &noise->GetSettings() :
-        valueNoise != nullptr ? &valueNoise->GetSettings() :
-        ridgeNoise != nullptr ? &ridgeNoise->GetSettings() :
-        spectralNoise != nullptr ? &spectralNoise->GetSettings() :
-        scripted != nullptr ? static_cast<NoiseSettings*>(&scripted->GetSettings()) : nullptr;
+    NoiseSettings* noiseCommon = scripted != nullptr &&
+        scripted->GetSettings().application == BrushApplication::Noise ?
+            &scripted->GetSettings() : nullptr;
     const std::string title = std::string(tool.GetName()) + "###BrushParameters";
     if (ImGui::Begin(title.c_str(), &open)) {
         if (!brushError_.empty()) {
@@ -790,21 +968,7 @@ void UIManager::RenderBrushPanel() {
             ImGui::PopStyleColor();
         }
         auto& settings = brushTools_.GetSettings();
-        if (raiseLower) {
-            constexpr std::array operationNames{"Raise", "Lower"};
-            int operation = static_cast<int>(settings.raiseLowerOperation);
-            if (ImGui::Combo("Operation", &operation, operationNames.data(),
-                             static_cast<int>(operationNames.size()))) {
-                settings.raiseLowerOperation = static_cast<RaiseLowerOperation>(operation);
-            }
-        } else if (elevation) {
-            constexpr std::array operationNames{"Replace", "Minimum", "Maximum"};
-            int operation = static_cast<int>(settings.operation);
-            if (ImGui::Combo("Operation", &operation, operationNames.data(),
-                             static_cast<int>(operationNames.size()))) {
-                settings.operation = static_cast<BrushOperation>(operation);
-            }
-        } else if (noiseCommon != nullptr) {
+        if (noiseCommon != nullptr) {
             constexpr std::array operationNames{"Replace", "Add", "Subtract",
                                                 "Minimum", "Maximum"};
             auto& operation = noiseCommon->operation;
@@ -834,8 +998,7 @@ void UIManager::RenderBrushPanel() {
         settings.radius = radius;
         showRangeTooltip(0.1F, maximumRadius);
         if (noiseCommon != nullptr) {
-            const double planetRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
-                                            ? earthRadiusKilometres : earthRadiusMiles;
+            const double planetRadius = PlanetRadiusInUnit(*grid.GetSnapshot(), settings.distanceUnit);
             const double angularRadius = std::min(settings.radius / planetRadius,
                                                   std::numbers::pi);
             const double expectedVertices = static_cast<double>(options_.pointCount) *
@@ -856,18 +1019,7 @@ void UIManager::RenderBrushPanel() {
         falloff = clipUiValue(falloff, 0.0F, 100.0F, 25.0F);
         settings.falloffPercent = falloff;
         showRangeTooltip(0.0F, 100.0F);
-        if (raiseLower) {
-            float intensity = static_cast<float>(settings.intensityPercent);
-            ImGui::SliderFloat("Intensity (%)", &intensity, 0.0F, 100.0F, "%.0f%%",
-                               ImGuiSliderFlags_AlwaysClamp);
-            settings.intensityPercent = clipUiValue(intensity, 0.0F, 100.0F, 100.0F);
-            showRangeTooltip(0.0F, 100.0F);
-        } else if (elevation) {
-            ImGui::SliderFloat("Elevation", &settings.value, -32767.0F, 32767.0F,
-                               "%.0f", ImGuiSliderFlags_AlwaysClamp);
-            settings.value = clipUiValue(settings.value, -32767.0F, 32767.0F, 0.0F);
-            showRangeTooltip(-32767.0F, 32767.0F);
-        } else if (noiseCommon != nullptr) {
+        if (noiseCommon != nullptr) {
             NoiseSettings& common = *noiseCommon;
             ImGui::InputScalar("Seed", ImGuiDataType_U64, &common.seed);
             ImGui::SameLine();
@@ -921,129 +1073,28 @@ void UIManager::RenderBrushPanel() {
                 showRangeTooltip(0.0F, 1.0F);
                 ImGui::TextDisabled("Higher strength folds the noise field more dramatically.");
             }
-            if (noise != nullptr || valueNoise != nullptr || ridgeNoise != nullptr) {
-                FractalNoiseSettings& fractal = noise != nullptr ?
-                    static_cast<FractalNoiseSettings&>(noise->GetSettings()) :
-                    valueNoise != nullptr ?
-                    static_cast<FractalNoiseSettings&>(valueNoise->GetSettings()) :
-                    static_cast<FractalNoiseSettings&>(ridgeNoise->GetSettings());
-                ImGui::SliderFloat("Frequency", &fractal.frequency, 0.01F, 1.0e6F,
-                                   "%.2f", ImGuiSliderFlags_Logarithmic |
-                                               ImGuiSliderFlags_AlwaysClamp);
-                fractal.frequency = clipUiValue(fractal.frequency, 0.01F, 1.0e6F, 4.0F);
-                showRangeTooltip(0.01F, 1.0e6F);
-                ImGui::SliderFloat("Lacunarity", &fractal.lacunarity, 1.0F, 4.0F,
-                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
-                fractal.lacunarity = clipUiValue(fractal.lacunarity, 1.0F, 4.0F, 2.0F);
-                showRangeTooltip(1.0F, 4.0F);
-                ImGui::SliderFloat("Persistence", &fractal.persistence, 0.0F, 1.0F,
-                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
-                fractal.persistence = clipUiValue(fractal.persistence, 0.0F, 1.0F, 0.5F);
-                showRangeTooltip(0.0F, 1.0F);
-                ImGui::SliderInt("Octaves", &fractal.octaves, 1, 16,
-                                 "%d", ImGuiSliderFlags_AlwaysClamp);
-                fractal.octaves = std::clamp(fractal.octaves, 1, 16);
-                showRangeTooltip(1, 16);
-            }
-            if (noise != nullptr) {
-                ImGui::Checkbox("Billowed", &noise->GetSettings().billowed);
-            } else if (valueNoise != nullptr) {
-                auto& parameters = valueNoise->GetSettings();
-                ImGui::SliderFloat("Amplitude", &parameters.amplitude, 0.0F, 2.0F,
-                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
-                parameters.amplitude = clipUiValue(parameters.amplitude, 0.0F, 2.0F, 1.0F);
-                showRangeTooltip(0.0F, 2.0F);
-                constexpr std::array interpolationNames{"Linear", "Cubic", "Quintic"};
-                int interpolation = static_cast<int>(parameters.interpolation);
-                if (ImGui::Combo("Interpolation", &interpolation, interpolationNames.data(),
-                                 static_cast<int>(interpolationNames.size()))) {
-                    parameters.interpolation = static_cast<ValueNoiseSettings::Interpolation>(
-                        interpolation);
-                }
-            } else if (ridgeNoise != nullptr) {
-                auto& parameters = ridgeNoise->GetSettings();
-                ImGui::SliderFloat("Ridge offset", &parameters.ridgeOffset, 0.0F, 2.0F,
-                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
-                parameters.ridgeOffset = clipUiValue(parameters.ridgeOffset, 0.0F, 2.0F, 1.0F);
-                showRangeTooltip(0.0F, 2.0F);
-                ImGui::SliderFloat("Gain exponent", &parameters.gainExponent, 0.1F, 8.0F,
-                                   "%.2f", ImGuiSliderFlags_AlwaysClamp);
-                parameters.gainExponent = clipUiValue(parameters.gainExponent, 0.1F, 8.0F, 1.0F);
-                showRangeTooltip(0.1F, 8.0F);
-            } else if (spectralNoise != nullptr) {
-                auto& parameters = spectralNoise->GetSettings();
-                ImGui::SliderFloat("Spectral exponent", &parameters.spectralExponent,
-                                   -4.0F, 8.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-                parameters.spectralExponent = clipUiValue(parameters.spectralExponent,
-                                                          -4.0F, 8.0F, 2.0F);
-                showRangeTooltip(-4.0F, 8.0F);
-                constexpr std::array resolutions{"8", "16", "32", "64", "128"};
-                int resolution = parameters.gridResolution == 8 ? 0 :
-                    parameters.gridResolution == 16 ? 1 : parameters.gridResolution == 32 ? 2 :
-                    parameters.gridResolution == 64 ? 3 : 4;
-                if (ImGui::Combo("Grid resolution", &resolution, resolutions.data(),
-                                 static_cast<int>(resolutions.size()))) {
-                    parameters.gridResolution = 8 << resolution;
-                }
-                ImGui::SliderFloat("Frequency", &parameters.frequency, 0.01F, 1.0e6F,
-                                   "%.2f", ImGuiSliderFlags_Logarithmic |
-                                               ImGuiSliderFlags_AlwaysClamp);
-                parameters.frequency = clipUiValue(parameters.frequency, 0.01F, 1.0e6F, 4.0F);
-                showRangeTooltip(0.01F, 1.0e6F);
-            } else if (scripted != nullptr) {
-                RenderScriptEditor(*scripted);
-            }
-        } else if (blur != nullptr) {
-            auto& parameters = blur->GetSettings();
-            int blurUnit = static_cast<int>(parameters.distanceUnit);
-            constexpr std::array blurUnitNames{"Kilometres", "Miles"};
-            if (ImGui::Combo("Blur distance unit", &blurUnit, blurUnitNames.data(),
-                             static_cast<int>(blurUnitNames.size())) &&
-                blurUnit != static_cast<int>(parameters.distanceUnit)) {
-                const double factor = blurUnit ==
-                                              static_cast<int>(BrushDistanceUnit::Miles)
-                                          ? 0.621371192 : 1.609344;
-                parameters.range *= factor;
-                parameters.sigma = static_cast<float>(parameters.sigma * factor);
-                parameters.distanceUnit = static_cast<BrushDistanceUnit>(blurUnit);
-            }
-            const float maximumRange = static_cast<float>(
-                std::numbers::pi * (parameters.distanceUnit ==
-                                            BrushDistanceUnit::Kilometres
-                                        ? earthRadiusKilometres : earthRadiusMiles));
-            float range = static_cast<float>(parameters.range);
-            ImGui::SliderFloat("Blur range", &range, 0.1F, maximumRange,
-                               "%.1f", ImGuiSliderFlags_Logarithmic |
-                                           ImGuiSliderFlags_AlwaysClamp);
-            range = clipUiValue(range, 0.1F, maximumRange, 100.0F);
-            parameters.range = range;
-            showRangeTooltip(0.1F, maximumRange);
-            float sigma = parameters.sigma;
-            ImGui::SliderFloat("Sigma", &sigma, 0.01F, maximumRange,
-                               "%.2f", ImGuiSliderFlags_Logarithmic |
-                                           ImGuiSliderFlags_AlwaysClamp);
-            parameters.sigma = clipUiValue(sigma, 0.01F, maximumRange, 25.0F);
-            showRangeTooltip(0.01F, maximumRange);
-        } else if (clamp != nullptr) {
-            auto& parameters = clamp->GetSettings();
-            float minimum = parameters.minimum;
-            ImGui::DragFloat("Minimum", &minimum, 1.0F, -32767.0F,
-                             parameters.maximum, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-            parameters.minimum = clipUiValue(minimum, -32767.0F, parameters.maximum,
-                                             -32767.0F);
-            showRangeTooltip(-32767.0F, parameters.maximum);
-            float maximum = parameters.maximum;
-            ImGui::DragFloat("Maximum", &maximum, 1.0F, parameters.minimum,
-                             32767.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-            parameters.maximum = clipUiValue(maximum, parameters.minimum, 32767.0F,
-                                             32767.0F);
-            showRangeTooltip(parameters.minimum, 32767.0F);
+        }
+        if (scripted == scriptedTool_) {
+            RenderScriptEditor(*scripted);
+        } else if (scripted != nullptr) {
+            RenderScriptParameters(*scripted, false);
+        }
+        ImGui::BeginDisabled(!grid.HasActiveLayer() || stroke_.has_value());
+        if (ImGui::Button("Fill selection")) {
+            FillSelection(grid, renderer);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Apply once using selection feathering, ignoring radius and radial falloff.\n"
+                "Without a selection, fill the active layer. Continuous brushes apply one second.\n"
+                "Scripts receive distance=0 and the configured radius.");
         }
         ImGui::TextWrapped("Left-drag over the globe to apply this tool. Falloff sets the tapered portion of the outer radius: 0%% is a cylinder, 100%% is a cone.");
-        if (raiseLower) {
-            ImGui::TextWrapped("At 100%% intensity, raise/lower by %.0f units per second. Configure this speed in File > Settings.",
+        if (tool.IsContinuous()) {
+            ImGui::TextWrapped("The script runs continuously while held. The rate input is %.0f units per second, configured in File > Settings.",
                               settings.raiseLowerRate);
-        } else if (elevation) {
+        } else {
             ImGui::TextWrapped("Each click or drag applies the operation once; holding the button or retracing the stroke does not build it up further.");
         }
     }
@@ -1155,6 +1206,21 @@ void UIManager::RenderValueSelectionDialog(SphericalGrid& grid,
     }
 }
 
+void UIManager::ApplyTerrainFilter(const Filter& filter, SphericalGrid& grid,
+                                   GlobeRenderer& renderer) {
+    const auto snapshot = grid.GetSnapshot();
+    std::vector<float> before;
+    before.reserve(snapshot->GetVertices().size());
+    for (const auto& vertex : snapshot->GetVertices()) {
+        before.push_back(vertex.elevation);
+    }
+    auto after = filter.Apply(*snapshot, before);
+    if (before != after) {
+        undoStack_.Execute(std::make_unique<TerrainFilterCommand>(
+            grid, renderer, std::move(before), std::move(after)));
+    }
+}
+
 void UIManager::RenderFillFilterDialog(SphericalGrid& grid,
                                        GlobeRenderer& renderer) {
     if (fillFilterOpen_) {
@@ -1186,17 +1252,7 @@ void UIManager::RenderFillFilterDialog(SphericalGrid& grid,
         try {
             auto& filter = dynamic_cast<FillFilter&>(filters_.GetFilter("Fill"));
             filter.SetSettings(pendingFillSettings_);
-            const auto snapshot = grid.GetSnapshot();
-            std::vector<float> before;
-            before.reserve(snapshot->GetVertices().size());
-            for (const auto& vertex : snapshot->GetVertices()) {
-                before.push_back(vertex.elevation);
-            }
-            auto after = filter.Apply(*snapshot, before);
-            if (before != after) {
-                undoStack_.Execute(std::make_unique<TerrainFilterCommand>(
-                    grid, renderer, std::move(before), std::move(after)));
-            }
+            ApplyTerrainFilter(filter, grid, renderer);
             fillFilterError_.clear();
             ImGui::CloseCurrentPopup();
         } catch (const std::exception& error) {
@@ -1206,6 +1262,87 @@ void UIManager::RenderFillFilterDialog(SphericalGrid& grid,
     ImGui::SameLine();
     if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         fillFilterError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void UIManager::RenderAbsoluteMagnitudeNoiseDialog(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (absoluteMagnitudeNoiseOpen_) {
+        ImGui::OpenPopup("Absolute Magnitude Noise");
+        absoluteMagnitudeNoiseOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Absolute Magnitude Noise", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::SliderFloat("Amplitude (feet)", &pendingNoiseAmplitudeFeet_, 0.0F, 500.0F,
+                       "%.1f", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 480.0F);
+    ImGui::TextWrapped("Adds independent uniform random offsets from -amplitude to +amplitude, multiplied by selection feathering. No active selection affects the whole globe, including underwater terrain. Elevations are clamped to [-32767, 32767] metres.");
+    if (!absoluteMagnitudeNoiseError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", absoluteMagnitudeNoiseError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<AbsoluteMagnitudeNoiseFilter&>(
+                filters_.GetFilter("Absolute Magnitude Noise"));
+            filter.SetAmplitudeFeet(pendingNoiseAmplitudeFeet_);
+            ApplyTerrainFilter(filter, grid, renderer);
+            absoluteMagnitudeNoiseError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            absoluteMagnitudeNoiseError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        absoluteMagnitudeNoiseError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void UIManager::RenderInciseFlowDialog(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (inciseFlowOpen_) {
+        ImGui::OpenPopup("Incise Flow");
+        inciseFlowOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Incise Flow", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputDouble("Incision rate (m/pass)", &pendingInciseFlowSettings_.incisionRate, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Reference area (runoff)", &pendingInciseFlowSettings_.referenceArea, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Flow exponent (m)", &pendingInciseFlowSettings_.flowExponent, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Slope exponent (n)", &pendingInciseFlowSettings_.slopeExponent, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Precipitation (per vertex)", &pendingInciseFlowSettings_.precipitation, 0.0, 0.0, "%.6g");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 560.0F);
+    ImGui::TextWrapped("One pass: C * (A / Aref)^m * S^n. Runoff starts at the precipitation value per vertex; Aref uses the same units (vertex count when precipitation is 1). Slopes use m/km.");
+    ImGui::TextWrapped("Typical m: 0.3 to 0.8; default n: 1. Reference area must be positive; other parameters must be non-negative. All parameters must be finite. Planet radius is set in File -> Planet -> Geometry.");
+    ImGui::TextWrapped("Sea-level/ocean sinks and unselected outlets remain fixed. Selection weights blend incision; no selection processes the globe. Pits and flats without downhill receivers remain unchanged: run Fill basins first if needed. Results are limited to [-32767, 32767] m.");
+    if (!inciseFlowError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", inciseFlowError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<InciseFlowFilter&>(filters_.GetFilter("Incise flow"));
+            filter.SetSettings(pendingInciseFlowSettings_);
+            ApplyTerrainFilter(filter, grid, renderer);
+            inciseFlowError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            inciseFlowError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        inciseFlowError_.clear();
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -1706,8 +1843,7 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
 
     if (brushTools_.IsActive() && cursorCenter && !captured) {
         const auto& settings = brushTools_.GetSettings();
-        const double planetRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
-                                        ? earthRadiusKilometres : earthRadiusMiles;
+        const double planetRadius = PlanetRadiusInUnit(*grid.GetSnapshot(), settings.distanceUnit);
         const double outerRadius = settings.radius;
         const double innerRadius = outerRadius * (1.0 - settings.falloffPercent / 100.0);
         constexpr ImU32 white = IM_COL32(255, 255, 255, 230);
@@ -1816,9 +1952,7 @@ void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& render
     }
 
     if (radiusMode && cursorCenter && !captured) {
-        const double planetRadius = selectionSettings_.distanceUnit ==
-                                            BrushDistanceUnit::Kilometres
-                                        ? earthRadiusKilometres : earthRadiusMiles;
+        const double planetRadius = PlanetRadiusInUnit(*grid.GetSnapshot(), selectionSettings_.distanceUnit);
         const double outerRadius = selectionSettings_.radius;
         const double innerRadius = outerRadius *
                                    (1.0 - selectionSettings_.falloffPercent / 100.0);
@@ -1966,22 +2100,62 @@ void UIManager::PerformProjectAction(SphericalGrid& grid, GlobeRenderer& rendere
 }
 
 void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& renderer) {
-    if (metadataOpen_) {
+    if (planetOpen_) {
         pendingMetadata_ = grid.GetMetadata();
-        ImGui::OpenPopup("Project Metadata");
-        metadataOpen_ = false;
+        pendingPlanetRadius_ = grid.GetSnapshot()->GetOptions().planetRadius;
+        pendingPointCount_ = static_cast<int>(grid.GetSnapshot()->GetOptions().pointCount);
+        planetError_.clear();
+        ImGui::OpenPopup("Planet");
+        planetOpen_ = false;
     }
     ImGui::SetNextWindowSize(ImVec2(540, 320), ImGuiCond_FirstUseEver);
-    if (ImGui::BeginPopupModal("Project Metadata", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::InputTextMultiline("Description", &pendingMetadata_.description, ImVec2(380, 150));
-        ImGui::InputText("Author", &pendingMetadata_.author);
-        std::string date = grid.GetMetadata().savedAt.empty() ?
-            "Not yet saved" : grid.GetMetadata().savedAt;
-        ImGui::InputText("Date (UTC)", &date, ImGuiInputTextFlags_ReadOnly);
+    if (ImGui::BeginPopupModal("Planet", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (ImGui::BeginTabBar("PlanetTabs")) {
+            if (ImGui::BeginTabItem("Geometry")) {
+                ImGui::InputDouble("Planet radius (km)", &pendingPlanetRadius_, 0.0, 0.0, "%.6g");
+                ImGui::SliderInt("Point Count (N)", &pendingPointCount_, 1'000, 1'000'000,
+                                 "%d", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 480.0F);
+                ImGui::TextWrapped("Changing point count regenerates the grid and clears undo history, using the loaded raster if available. Changing radius alone preserves terrain and selection.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Metadata")) {
+                ImGui::InputTextMultiline("Description", &pendingMetadata_.description, ImVec2(380, 150));
+                ImGui::InputText("Author", &pendingMetadata_.author);
+                std::string date = grid.GetMetadata().savedAt.empty() ?
+                    "Not yet saved" : grid.GetMetadata().savedAt;
+                ImGui::InputText("Date (UTC)", &date, ImGuiInputTextFlags_ReadOnly);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        if (!planetError_.empty()) {
+            ImGui::TextWrapped("%s", planetError_.c_str());
+        }
         if (ImGui::Button("Apply")) {
-            grid.GetMetadata().description = pendingMetadata_.description;
-            grid.GetMetadata().author = pendingMetadata_.author;
-            ImGui::CloseCurrentPopup();
+            try {
+                if (!std::isfinite(pendingPlanetRadius_) || pendingPlanetRadius_ <= 0.0) {
+                    throw std::invalid_argument("Planet radius must be finite and positive.");
+                }
+                if (pendingPointCount_ < 1000 || pendingPointCount_ > 1'000'000) {
+                    throw std::invalid_argument("Point count must be between 1,000 and 1,000,000.");
+                }
+                options_ = grid.GetSnapshot()->GetOptions();
+                options_.planetRadius = pendingPlanetRadius_;
+                options_.pointCount = static_cast<std::size_t>(pendingPointCount_);
+                if (options_.pointCount != grid.GetSnapshot()->GetOptions().pointCount) {
+                    StartGridGeneration(grid, renderer);
+                } else {
+                    grid.SetPlanetRadius(pendingPlanetRadius_);
+                    previousOptions_ = options_;
+                }
+                grid.GetMetadata().description = pendingMetadata_.description;
+                grid.GetMetadata().author = pendingMetadata_.author;
+                ImGui::CloseCurrentPopup();
+            } catch (const std::exception& error) {
+                planetError_ = error.what();
+            }
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
@@ -2282,8 +2456,8 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                 }
                 ImGui::EndMenu();
             }
-            if (ImGui::MenuItem("Metadata...")) {
-                metadataOpen_ = true;
+            if (ImGui::MenuItem("Planet...")) {
+                planetOpen_ = true;
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Open Raster...", "Ctrl+Shift+O", false, grid.HasActiveLayer())) {
@@ -2352,7 +2526,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Tools")) {
+        if (ImGui::BeginMenu("Brushes")) {
             for (const auto& tool : brushTools_.GetTools()) {
                 const std::string name(tool->GetName());
                 const bool selected = brushTools_.IsActive() &&
@@ -2361,7 +2535,25 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                     SetSelectionMode(SelectionMode::None);
                     brushTools_.SelectTool(name);
                     brushTools_.SetActive(!selected);
+                    scriptParameterError_.clear();
                 }
+                if (ImGui::IsItemHovered()) {
+                    const auto entry = std::find_if(scriptLibrary_.entries.begin(), scriptLibrary_.entries.end(),
+                        [&](const auto& candidate) { return candidate.file.name == name; });
+                    if (entry != scriptLibrary_.entries.end()) {
+                        ImGui::SetTooltip("%s\n%s", entry->file.description.c_str(), entry->path.string().c_str());
+                    }
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Refresh brushes", nullptr, false, !stroke_)) {
+                RescanScriptLibrary();
+            }
+            if (!brushLibraryErrors_.empty() && ImGui::BeginMenu("Brush errors")) {
+                for (const auto& error : brushLibraryErrors_) {
+                    ImGui::TextWrapped("%s", error.c_str());
+                }
+                ImGui::EndMenu();
             }
             ImGui::EndMenu();
         }
@@ -2372,6 +2564,33 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                 pendingFillSettings_ = filter.GetSettings();
                 fillFilterError_.clear();
                 fillFilterOpen_ = true;
+            }
+            if (ImGui::BeginMenu("Erosion", grid.HasActiveLayer() && !projectBusy)) {
+                if (ImGui::MenuItem("Fill basins...")) {
+                    try {
+                        ApplyTerrainFilter(filters_.GetFilter("Fill basins"), grid, renderer);
+                        fillBasinsError_.clear();
+                    } catch (const std::exception& error) {
+                        fillBasinsError_ = error.what();
+                        fillBasinsErrorOpen_ = true;
+                    }
+                }
+                if (ImGui::MenuItem("Incise flow...")) {
+                    const auto& filter = dynamic_cast<const InciseFlowFilter&>(
+                        filters_.GetFilter("Incise flow"));
+                    pendingInciseFlowSettings_ = filter.GetSettings();
+                    inciseFlowError_.clear();
+                    inciseFlowOpen_ = true;
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Absolute Magnitude Noise...", nullptr, false,
+                                grid.HasActiveLayer() && !projectBusy)) {
+                const auto& filter = dynamic_cast<const AbsoluteMagnitudeNoiseFilter&>(
+                    filters_.GetFilter("Absolute Magnitude Noise"));
+                pendingNoiseAmplitudeFeet_ = filter.GetAmplitudeFeet();
+                absoluteMagnitudeNoiseError_.clear();
+                absoluteMagnitudeNoiseOpen_ = true;
             }
             ImGui::EndMenu();
         }
@@ -2642,11 +2861,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
         settingsOpen_ = false;
     }
     if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        int pointCount = static_cast<int>(options_.pointCount);
         float poissonVariability = static_cast<float>(options_.poissonVariability);
-        if (ImGui::SliderInt("Point Count (N)", &pointCount, 1'000, 1'000'000)) {
-            options_.pointCount = static_cast<std::size_t>(pointCount);
-        }
         if (ImGui::SliderFloat("Poisson Variability (J)", &poissonVariability,
                                0.0F, 1.0F, "%.2f")) {
             options_.poissonVariability = poissonVariability;
@@ -2705,21 +2920,40 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     }
     RenderProjectDialogs(grid, renderer);
     const bool projectModal = ImGui::IsPopupOpen("Project File") ||
-        ImGui::IsPopupOpen("Project Metadata") || ImGui::IsPopupOpen("Project Error");
+        ImGui::IsPopupOpen("Planet") || ImGui::IsPopupOpen("Project Error");
     const bool valueSelectionDialog = valueSelectionOpen_ || ImGui::IsPopupOpen("Select By Value");
     RenderValueSelectionDialog(grid, renderer);
     const bool fillFilterDialog = fillFilterOpen_ || ImGui::IsPopupOpen("Fill Filter");
     RenderFillFilterDialog(grid, renderer);
+    const bool inciseFlowDialog = inciseFlowOpen_ || ImGui::IsPopupOpen("Incise Flow");
+    RenderInciseFlowDialog(grid, renderer);
+    const bool noiseDialog = absoluteMagnitudeNoiseOpen_ ||
+        ImGui::IsPopupOpen("Absolute Magnitude Noise");
+    RenderAbsoluteMagnitudeNoiseDialog(grid, renderer);
+    if (fillBasinsErrorOpen_) {
+        ImGui::OpenPopup("Fill Basins Error");
+        fillBasinsErrorOpen_ = false;
+    }
+    if (ImGui::BeginPopupModal("Fill Basins Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", fillBasinsError_.c_str());
+        if (ImGui::Button("OK") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    const bool fillBasinsDialog = ImGui::IsPopupOpen("Fill Basins Error");
     RenderGridProgressDialog();
     if (generating) {
         return requestExit;
     }
     if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings") &&
-        !valueSelectionDialog && !fillFilterDialog && !projectModal) {
-        RenderBrushPanel();
+        !valueSelectionDialog && !fillFilterDialog && !fillBasinsDialog &&
+        !inciseFlowDialog && !noiseDialog && !projectModal) {
+        RenderBrushPanel(grid, renderer);
         RenderSelectionPanel();
     }
-    if (!valueSelectionDialog && !fillFilterDialog && !projectModal) {
+    if (!valueSelectionDialog && !fillFilterDialog && !fillBasinsDialog &&
+        !inciseFlowDialog && !noiseDialog && !projectModal) {
         ProcessBrushInput(grid, renderer, modelMatrix, zoom);
         ProcessSelectionInput(grid, renderer, modelMatrix, zoom);
     }

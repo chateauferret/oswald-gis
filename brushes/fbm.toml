@@ -1,4 +1,0 @@
-name="fbm"
-description="fractal Brownian motion"
-output="normalized"
-script="fbm(x, y, z, 4, 2, 0.5, 6)"

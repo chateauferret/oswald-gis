@@ -12,8 +12,6 @@
 
 namespace {
 
-constexpr double earthRadiusKilometres = 6371.0;
-constexpr double earthRadiusMiles = 3958.7613;
 constexpr float minimumElevation = -32767.0F;
 constexpr float maximumElevation = 32767.0F;
 
@@ -41,22 +39,29 @@ void validate(const SphericalGridSnapshot& grid, const std::vector<float>& eleva
     }
 }
 
-double planetRadius(BrushDistanceUnit unit) {
-    return unit == BrushDistanceUnit::Kilometres ? earthRadiusKilometres
-                                                   : earthRadiusMiles;
-}
-
 std::vector<std::pair<std::size_t, double>> brushWeights(
     const SphericalGridSnapshot& grid, glm::dvec3 center,
     const std::vector<float>& elevations, const BrushSettings& settings,
     double elapsedSeconds) {
     validate(grid, elevations, settings, elapsedSeconds);
+    if (settings.coverage == BrushCoverage::Selection) {
+        std::vector<std::pair<std::size_t, double>> result;
+        const auto& vertices = grid.GetVertices();
+        result.reserve(vertices.size());
+        for (std::size_t index = 0; index < vertices.size(); ++index) {
+            const double weight = grid.HasSelection() ? vertices[index].selectionWeight : 1.0;
+            if (weight > 0.0) {
+                result.emplace_back(index, weight);
+            }
+        }
+        return result;
+    }
     const double centerLength = glm::length(center);
     if (!std::isfinite(centerLength) || centerLength == 0.0) {
         throw std::invalid_argument("Brush center must be finite and nonzero.");
     }
     center /= centerLength;
-    const double radius = planetRadius(settings.distanceUnit);
+    const double radius = PlanetRadiusInUnit(grid, settings.distanceUnit);
     const double outerRadius = settings.radius;
     const double innerRadius = outerRadius * (1.0 - settings.falloffPercent / 100.0);
     const auto candidates = grid.FindWithinRadius(center, outerRadius, radius);
@@ -197,11 +202,11 @@ template <typename Sampler>
 std::vector<std::size_t> applyNoiseSamples(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
-    Sampler&& sample) {
+    Sampler&& sample, BrushApplication application = BrushApplication::Noise) {
     validateNoiseSettings(parameters);
     const auto weights = brushWeights(grid, center, elevations, brushSettings, elapsedSeconds);
     center = glm::normalize(center);
-    const double radius = planetRadius(brushSettings.distanceUnit);
+    const double radius = PlanetRadiusInUnit(grid, brushSettings.distanceUnit);
     const float lower = std::min(parameters.rangeBetween, parameters.rangeAnd);
     const float upper = std::max(parameters.rangeBetween, parameters.rangeAnd);
     // Sample every vertex before writing so a throwing sampler leaves elevations intact.
@@ -218,12 +223,25 @@ std::vector<std::size_t> applyNoiseSamples(
         noiseSample.index = index;
         noiseSample.elevation = current;
         noiseSample.weight = weight;
-        noiseSample.distance = radius * std::atan2(
+        noiseSample.distance = brushSettings.coverage == BrushCoverage::Selection ? 0.0 :
+            radius * std::atan2(
             glm::length(glm::cross(center, noiseSample.location)),
             glm::dot(center, noiseSample.location));
-        const float result = destinationForNoise(parameters.operation, sample(noiseSample),
-                                                 current, lower, upper);
-        const float updated = blendElevation(current, result, weight);
+        const double value = sample(noiseSample);
+        if (!std::isfinite(value)) {
+            throw std::invalid_argument("Brush sampler returned a non-finite value.");
+        }
+        float updated;
+        if (application == BrushApplication::Noise) {
+            const float result = destinationForNoise(parameters.operation, value, current, lower, upper);
+            updated = blendElevation(current, result, weight);
+        } else if (application == BrushApplication::Delta) {
+            updated = static_cast<float>(std::clamp(current + value * weight,
+                                                    -32767.0, 32767.0));
+        } else {
+            updated = blendElevation(current, static_cast<float>(std::clamp(value, -32767.0, 32767.0)),
+                                     weight);
+        }
         if (updated != current) {
             updates.emplace_back(index, updated);
         }
@@ -383,12 +401,12 @@ bool validElevation(float value) {
 std::vector<std::size_t> ApplyNoiseSampler(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
-    const NoiseSampler& sample) {
+    const NoiseSampler& sample, BrushApplication application) {
     if (!sample) {
         throw std::invalid_argument("Noise sampler is empty.");
     }
     return applyNoiseSamples(grid, center, elevations, brushSettings, elapsedSeconds, parameters,
-                             sample);
+                             sample, application);
 }
 
 std::vector<std::size_t> ElevationBrushTool::Apply(
@@ -468,8 +486,7 @@ std::vector<std::size_t> ValueNoiseBrushTool::Apply(
     }
     return applyNoise(grid, center, elevations, settings, elapsedSeconds, parameters,
         [&](glm::dvec3 position, std::size_t) {
-            const double value = noise::ValueFbm(position, parameters.seed,
-                                                 parameters.interpolation, fractalOf(parameters));
+            const double value = noise::ValueFbm(position, parameters.seed, fractalOf(parameters));
             return std::clamp(value * parameters.amplitude, -1.0, 1.0);
         });
 }
@@ -479,15 +496,9 @@ std::vector<std::size_t> RidgeNoiseBrushTool::Apply(
     const BrushSettings& settings, double elapsedSeconds) const {
     const auto& parameters = settings_;
     validateFractalSettings(parameters);
-    if (!std::isfinite(parameters.ridgeOffset) || parameters.ridgeOffset < 0.0F ||
-        parameters.ridgeOffset > 2.0F || !std::isfinite(parameters.gainExponent) ||
-        parameters.gainExponent <= 0.0F || parameters.gainExponent > 8.0F) {
-        throw std::invalid_argument("Ridge noise offset or gain exponent is invalid.");
-    }
     return applyNoise(grid, center, elevations, settings, elapsedSeconds, parameters,
         [&](glm::dvec3 position, std::size_t) {
-            return noise::Ridged(position, parameters.seed, fractalOf(parameters),
-                                 parameters.ridgeOffset, parameters.gainExponent);
+            return noise::Ridged(position, parameters.seed, fractalOf(parameters));
         });
 }
 
@@ -496,12 +507,22 @@ std::vector<std::size_t> PowerLawNoiseBrushTool::Apply(
     const BrushSettings& settings, double elapsedSeconds) const {
     const auto& parameters = settings_;
     validateNoiseSettings(parameters);
+    return applyNoise(grid, center, elevations, settings, elapsedSeconds, parameters,
+        [&](glm::dvec3 position, std::size_t) { return Sample(position, parameters); });
+}
+
+double PowerLawNoiseBrushTool::Sample(glm::dvec3 position,
+                                      const PowerLawNoiseSettings& parameters) const {
     if (!std::isfinite(parameters.frequency) || parameters.frequency <= 0.0F ||
         parameters.frequency > 1.0e6F || !std::isfinite(parameters.spectralExponent) ||
         parameters.spectralExponent < -4.0F || parameters.spectralExponent > 8.0F ||
         parameters.gridResolution < 8 || parameters.gridResolution > 128 ||
         (parameters.gridResolution & (parameters.gridResolution - 1)) != 0) {
         throw std::invalid_argument("Power-law spectral noise parameters are invalid.");
+    }
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z) ||
+        glm::any(glm::greaterThan(glm::abs(position), glm::dvec3(1e8)))) {
+        throw std::invalid_argument("Spectral noise coordinates must be finite and within +/-1e8.");
     }
     std::shared_ptr<const std::vector<float>> field;
     {
@@ -517,17 +538,43 @@ std::vector<std::size_t> PowerLawNoiseBrushTool::Apply(
         }
         field = cachedField_;
     }
-    return applyNoise(grid, center, elevations, settings, elapsedSeconds, parameters,
-        [&](glm::dvec3 position, std::size_t) {
-            return sampleSpectralField(*field, parameters.gridResolution, position,
-                                       parameters.frequency);
-        });
+    return sampleSpectralField(*field, parameters.gridResolution, position, parameters.frequency);
+}
+
+double SampleGaussian(const SphericalGridSnapshot& grid, const std::vector<float>& source,
+                      std::size_t index, const GaussianBlurSettings& settings) {
+    if (source.size() != grid.GetVertices().size() || index >= source.size() ||
+        !std::isfinite(settings.range) || settings.range <= 0.0 ||
+        !std::isfinite(settings.sigma) || settings.sigma <= 0.0F) {
+        throw std::invalid_argument("Gaussian blur needs matching elevations and positive finite range/sigma.");
+    }
+    const auto& vertices = grid.GetVertices();
+    const double radius = PlanetRadiusInUnit(grid, settings.distanceUnit);
+    const glm::dvec3 point = glm::normalize(glm::dvec3(vertices[index].position));
+    const auto neighbors = grid.FindWithinRadius(point, settings.range, radius);
+    double weightedSum = 0.0;
+    double weightSum = 0.0;
+    for (const auto neighbor : neighbors) {
+        if (!validElevation(source[neighbor])) {
+            throw std::invalid_argument("Gaussian blur input elevations must be finite and in range.");
+        }
+        const glm::dvec3 neighborPoint = glm::normalize(glm::dvec3(vertices[neighbor].position));
+        const double distance = radius * std::atan2(glm::length(glm::cross(point, neighborPoint)),
+                                                    glm::dot(point, neighborPoint));
+        const double ratio = distance / settings.sigma;
+        const double gaussianWeight = std::exp(-0.5 * ratio * ratio);
+        weightedSum += static_cast<double>(source[neighbor]) * gaussianWeight;
+        weightSum += gaussianWeight;
+    }
+    if (!(weightSum > 0.0)) {
+        throw std::runtime_error("Gaussian blur neighbourhood has no positive weight.");
+    }
+    return weightedSum / weightSum;
 }
 
 std::vector<std::size_t> GaussianBlurBrushTool::Apply(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& settings, double elapsedSeconds) const {
-    const double radius = planetRadius(settings_.distanceUnit);
     if (!std::isfinite(settings_.range) || settings_.range <= 0.0 ||
         !std::isfinite(settings_.sigma) || settings_.sigma <= 0.0F) {
         throw std::invalid_argument("Gaussian blur range and sigma must be finite and positive.");
@@ -539,29 +586,10 @@ std::vector<std::size_t> GaussianBlurBrushTool::Apply(
             throw std::invalid_argument("Gaussian blur input elevations must be finite and in range.");
         }
     }
-    const auto& vertices = grid.GetVertices();
     std::vector<std::size_t> changed;
     changed.reserve(weights.size());
     for (const auto& [index, brushWeight] : weights) {
-        const glm::dvec3 point = glm::normalize(glm::dvec3(vertices[index].position));
-        const auto neighbors = grid.FindWithinRadius(point, settings_.range, radius);
-        double weightedSum = 0.0;
-        double weightSum = 0.0;
-        for (const auto neighbor : neighbors) {
-            const glm::dvec3 neighborPoint =
-                glm::normalize(glm::dvec3(vertices[neighbor].position));
-            const double angle = std::atan2(glm::length(glm::cross(point, neighborPoint)),
-                          glm::dot(point, neighborPoint));
-            const double distance = angle * radius;
-            const double ratio = distance / settings_.sigma;
-            const double gaussianWeight = std::exp(-0.5 * ratio * ratio);
-            weightedSum += static_cast<double>(source[neighbor]) * gaussianWeight;
-            weightSum += gaussianWeight;
-        }
-        if (!(weightSum > 0.0)) {
-            continue;
-        }
-        const float destination = static_cast<float>(weightedSum / weightSum);
+        const float destination = static_cast<float>(SampleGaussian(grid, source, index, settings_));
         const float updated = blendElevation(source[index], destination, brushWeight);
         if (updated != source[index]) {
             elevations[index] = updated;
@@ -589,15 +617,30 @@ std::vector<std::size_t> ClampBrushTool::Apply(
     });
 }
 
-BrushToolManager::BrushToolManager() {
-    RegisterTool(std::make_unique<ElevationBrushTool>());
-    RegisterTool(std::make_unique<RaiseLowerBrushTool>());
-    RegisterTool(std::make_unique<SimplexNoiseBrushTool>());
-    RegisterTool(std::make_unique<ValueNoiseBrushTool>());
-    RegisterTool(std::make_unique<RidgeNoiseBrushTool>());
-    RegisterTool(std::make_unique<PowerLawNoiseBrushTool>());
-    RegisterTool(std::make_unique<GaussianBlurBrushTool>());
-    RegisterTool(std::make_unique<ClampBrushTool>());
+void BrushToolManager::ReplaceTools(std::vector<std::unique_ptr<BrushTool>> tools, std::string_view retain) {
+    const auto selected = tools_.empty() ? std::string{} : std::string(GetSelectedTool().GetName());
+    BrushToolManager replacement;
+    for (auto& tool : tools) {
+        replacement.RegisterTool(std::move(tool));
+    }
+    if (!retain.empty()) {
+        if (std::any_of(replacement.tools_.begin(), replacement.tools_.end(),
+                        [&](const auto& tool) { return tool->GetName() == retain; })) {
+            throw std::invalid_argument("Replacement tools duplicate the retained brush.");
+        }
+        const auto retained = std::find_if(tools_.begin(), tools_.end(),
+            [&](const auto& tool) { return tool->GetName() == retain; });
+        if (retained == tools_.end()) {
+            throw std::invalid_argument("The retained brush is not registered.");
+        }
+        replacement.RegisterTool(std::move(*retained));
+    }
+    if (replacement.tools_.empty()) {
+        throw std::invalid_argument("The brush registry needs at least one tool.");
+    }
+    replacement.SelectTool(selected);
+    tools_ = std::move(replacement.tools_);
+    selectedIndex_ = replacement.selectedIndex_;
 }
 
 void BrushToolManager::RegisterTool(std::unique_ptr<BrushTool> tool) {
@@ -621,20 +664,4 @@ bool BrushToolManager::SelectTool(std::string_view name) {
     }
     selectedIndex_ = static_cast<std::size_t>(std::distance(tools_.begin(), found));
     return true;
-}
-
-ElevationBrushTool& BrushToolManager::GetElevationBrush() {
-    auto* brush = dynamic_cast<ElevationBrushTool*>(tools_.at(selectedIndex_).get());
-    if (brush == nullptr) {
-        throw std::logic_error("The selected brush is not an elevation brush.");
-    }
-    return *brush;
-}
-
-const ElevationBrushTool& BrushToolManager::GetElevationBrush() const {
-    auto* brush = dynamic_cast<const ElevationBrushTool*>(tools_.at(selectedIndex_).get());
-    if (brush == nullptr) {
-        throw std::logic_error("The selected brush is not an elevation brush.");
-    }
-    return *brush;
 }

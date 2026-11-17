@@ -148,13 +148,14 @@ void testRaiseLowerBrush() {
 
 void testOuterRadiusProfiles() {
     SphericalGrid model({1000, 0.0, 21});
+    model.SetPlanetRadius(3000.0);
     const auto& grid = *model.GetSnapshot();
     const auto& vertices = grid.GetVertices();
     const glm::dvec3 center = glm::normalize(glm::dvec3(vertices[0].position));
     ElevationBrushTool brush;
     for (const auto unit : {BrushDistanceUnit::Kilometres, BrushDistanceUnit::Miles}) {
         const double planetRadius = unit == BrushDistanceUnit::Kilometres
-                                        ? 6371.0 : 3958.7613;
+                                        ? 3000.0 : 3000.0 / 1.609344;
         for (const double percent : {0.0, 25.0, 50.0, 100.0}) {
             BrushSettings settings;
             settings.distanceUnit = unit;
@@ -384,14 +385,14 @@ void testPhase18NoiseTools() {
                     [](float height) { return height == 300.0F; }),
             "Zero value-noise amplitude did not map to the output range midpoint.");
     valueSettings.amplitude = 1.0F;
-    valueSettings.interpolation = static_cast<ValueNoiseSettings::Interpolation>(99);
-    bool invalidInterpolationRejected = false;
+    valueSettings.amplitude = 3.0F;
+    bool invalidAmplitudeRejected = false;
     try {
         value.Apply(grid, {0, 0, 1}, zeroAmplitude, brushSettings, 0.0);
     } catch (const std::invalid_argument&) {
-        invalidInterpolationRejected = true;
+        invalidAmplitudeRejected = true;
     }
-    check(invalidInterpolationRejected, "Value noise accepted an invalid interpolation mode.");
+    check(invalidAmplitudeRejected, "Value noise accepted an invalid amplitude.");
 
     RidgeNoiseBrushTool ridge;
     auto& ridgeSettings = ridge.GetSettings();
@@ -399,8 +400,6 @@ void testPhase18NoiseTools() {
     ridgeSettings.frequency = 6.0F;
     ridgeSettings.octaves = 4;
     ridgeSettings.persistence = 0.55F;
-    ridgeSettings.ridgeOffset = 1.1F;
-    ridgeSettings.gainExponent = 1.4F;
     std::vector<float> ridgeField(grid.GetVertices().size(), 0.0F);
     ridge.Apply(grid, {0, 0, 1}, ridgeField, brushSettings, 0.0);
     check(*std::min_element(ridgeField.begin(), ridgeField.end()) <
@@ -411,14 +410,14 @@ void testPhase18NoiseTools() {
     auto repeatedRidge = std::vector<float>(grid.GetVertices().size(), 0.0F);
     ridge.Apply(grid, {0, 0, 1}, repeatedRidge, brushSettings, 0.0);
     check(repeatedRidge == ridgeField, "Ridge noise was not deterministic for a fixed seed.");
-    ridgeSettings.gainExponent = 0.0F;
-    bool invalidGainRejected = false;
+    ridgeSettings.octaves = 0;
+    bool invalidOctavesRejected = false;
     try {
         ridge.Apply(grid, {0, 0, 1}, repeatedRidge, brushSettings, 0.0);
     } catch (const std::invalid_argument&) {
-        invalidGainRejected = true;
+        invalidOctavesRejected = true;
     }
-    check(invalidGainRejected, "Ridge noise accepted an invalid gain exponent.");
+    check(invalidOctavesRejected, "Ridge noise accepted an invalid octave count.");
 
     PowerLawNoiseBrushTool spectral;
     auto& spectralSettings = spectral.GetSettings();
@@ -678,6 +677,15 @@ public:
 
 void testToolManager() {
     BrushToolManager manager;
+    check(manager.GetTools().empty(), "Manager still registers hard-coded built-in brushes.");
+    manager.RegisterTool(std::make_unique<ElevationBrushTool>());
+    manager.RegisterTool(std::make_unique<RaiseLowerBrushTool>());
+    manager.RegisterTool(std::make_unique<SimplexNoiseBrushTool>());
+    manager.RegisterTool(std::make_unique<ValueNoiseBrushTool>());
+    manager.RegisterTool(std::make_unique<RidgeNoiseBrushTool>());
+    manager.RegisterTool(std::make_unique<PowerLawNoiseBrushTool>());
+    manager.RegisterTool(std::make_unique<GaussianBlurBrushTool>());
+    manager.RegisterTool(std::make_unique<ClampBrushTool>());
     check(manager.GetSelectedTool().GetName() == "Elevation Brush",
           "Manager did not select its default elevation brush.");
         check(manager.GetTools().size() == 8, "Manager did not register all built-in brush tools.");
@@ -706,6 +714,24 @@ void testToolManager() {
         duplicateRejected = true;
     }
     check(duplicateRejected, "Manager accepted duplicate tool names.");
+    auto* retained = &manager.GetSelectedTool();
+    std::vector<std::unique_ptr<BrushTool>> replacements;
+    replacements.push_back(std::make_unique<ClampBrushTool>());
+    manager.ReplaceTools(std::move(replacements), "Test Brush");
+    check(manager.GetTools().size() == 2 && &manager.GetSelectedTool() == retained &&
+          !manager.SelectTool("Elevation Brush") && manager.SelectTool("Clamp"),
+          "Replacing the registry did not retain the named tool or remove old tools.");
+    bool retainedDuplicateRejected = false;
+    try {
+        std::vector<std::unique_ptr<BrushTool>> duplicate;
+        duplicate.push_back(std::make_unique<TestBrush>());
+        manager.ReplaceTools(std::move(duplicate), "Test Brush");
+    } catch (const std::invalid_argument&) {
+        retainedDuplicateRejected = true;
+    }
+    check(retainedDuplicateRejected && manager.SelectTool("Test Brush") &&
+          &manager.GetSelectedTool() == retained,
+          "A rejected replacement damaged the registry's retained tool.");
 }
 
 } // namespace

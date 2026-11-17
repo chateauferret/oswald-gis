@@ -1,0 +1,21 @@
+name = "Raise/Lower Brush"
+description = "Continuously raise or lower terrain at the speed configured in Settings."
+application = "delta"
+continuous = true
+output = "elevation"
+script = "(Operation == 'Raise' ? 1 : -1) * rate * (Intensity / 100) * elapsed"
+
+[[parameter]]
+name = "Operation"
+type = "choice"
+choices = ["Raise", "Lower"]
+default = "Raise"
+
+[[parameter]]
+name = "Intensity"
+label = "Intensity (%)"
+type = "float"
+control = "slider"
+min = 0
+max = 100
+default = 100

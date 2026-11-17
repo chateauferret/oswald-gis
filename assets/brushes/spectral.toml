@@ -1,0 +1,36 @@
+name = "Power-Law Spectral Noise"
+description = "Cached periodic 3D white noise filtered by a power-law spectrum."
+output = "normalized"
+script = '''
+var resolution := 32;
+if (Resolution == '8') resolution := 8;
+else if (Resolution == '16') resolution := 16;
+else if (Resolution == '64') resolution := 64;
+else if (Resolution == '128') resolution := 128;
+spectral(x, y, z, Frequency, Exponent, resolution)
+'''
+
+[[parameter]]
+name = "Exponent"
+label = "Spectral exponent"
+type = "float"
+control = "slider"
+min = -4
+max = 8
+default = 2
+
+[[parameter]]
+name = "Resolution"
+label = "Grid resolution"
+type = "choice"
+choices = ["8", "16", "32", "64", "128"]
+default = "32"
+
+[[parameter]]
+name = "Frequency"
+type = "float"
+control = "slider"
+min = 0.01
+max = 1000000
+scale = "log"
+default = 4

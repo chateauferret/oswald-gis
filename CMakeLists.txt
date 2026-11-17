@@ -99,6 +99,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(stb)
 
+set(FASTNOISE2_TOOLS OFF CACHE BOOL "" FORCE)
+set(FASTNOISE2_TESTS OFF CACHE BOOL "" FORCE)
+set(FASTNOISE2_UTILITY OFF CACHE BOOL "" FORCE)
+set(FASTNOISE2_STRICT_FP ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    FastNoise2
+    GIT_REPOSITORY https://github.com/Auburn/FastNoise2.git
+    GIT_TAG v1.1.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(FastNoise2)
+
 # exprtk is a single header; SOURCE_SUBDIR points at a directory without a
 # CMakeLists.txt so only the sources are fetched.
 FetchContent_Declare(
@@ -132,7 +144,7 @@ add_library(oswald_model STATIC src/Layer.cpp src/ColorMap.cpp src/SphericalGrid
     src/SelectionTool.cpp src/Filter.cpp src/Noise.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
-target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r TIFF::TIFF)
+target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r TIFF::TIFF FastNoise)
 
 # exprtk is only included by ScriptEngine.cpp, keeping its compile cost in one unit.
 add_library(oswald_scripting STATIC src/ScriptEngine.cpp src/ScriptedBrushTool.cpp
@@ -170,7 +182,7 @@ add_executable(oswald_gis src/main.cpp src/UIManager.cpp src/RasterFileBrowser.c
 target_compile_definitions(oswald_gis PRIVATE
     GLFW_INCLUDE_NONE
     OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
-    OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/brushes"
+    OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/brushes"
 )
 target_link_libraries(oswald_gis PRIVATE
     oswald_view
@@ -208,18 +220,24 @@ if(BUILD_TESTING)
     target_link_libraries(brush_tool_tests PRIVATE oswald_model)
     add_test(NAME brush_tool COMMAND brush_tool_tests)
 
+    add_executable(noise_tests tests/NoiseTests.cpp)
+    target_link_libraries(noise_tests PRIVATE oswald_model FastNoise Threads::Threads)
+    add_test(NAME noise COMMAND noise_tests)
+
     add_executable(script_engine_tests tests/ScriptEngineTests.cpp)
     target_link_libraries(script_engine_tests PRIVATE oswald_scripting)
     add_test(NAME script_engine COMMAND script_engine_tests)
 
     add_executable(scripted_brush_tool_tests tests/ScriptedBrushToolTests.cpp)
     target_link_libraries(scripted_brush_tool_tests PRIVATE oswald_scripting)
+    target_compile_definitions(scripted_brush_tool_tests PRIVATE
+        OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/brushes")
     add_test(NAME scripted_brush_tool COMMAND scripted_brush_tool_tests)
 
     add_executable(brush_script_file_tests tests/BrushScriptFileTests.cpp)
     target_link_libraries(brush_script_file_tests PRIVATE oswald_scripting)
     target_compile_definitions(brush_script_file_tests PRIVATE
-        OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/brushes")
+        OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/brushes")
     add_test(NAME brush_script_file COMMAND brush_script_file_tests)
 
     add_executable(selection_tool_tests tests/SelectionToolTests.cpp)
@@ -250,6 +268,7 @@ if(BUILD_TESTING)
     target_link_libraries(ui_manager_tests PRIVATE oswald_view oswald_scripting oswald_controller imgui_lib glfw Threads::Threads)
     target_compile_definitions(ui_manager_tests PRIVATE
         GLFW_INCLUDE_NONE
+        OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/brushes"
         OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
     )
     add_test(NAME raster_file_dialog COMMAND ui_manager_tests)

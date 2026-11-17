@@ -1,0 +1,19 @@
+name = "Elevation Brush"
+description = "Paint a fixed elevation using Replace, Minimum, or Maximum."
+application = "elevation"
+output = "elevation"
+script = "Operation == 'Minimum' ? min(elevation, Elevation) : (Operation == 'Maximum' ? max(elevation, Elevation) : Elevation)"
+
+[[parameter]]
+name = "Operation"
+type = "choice"
+choices = ["Replace", "Minimum", "Maximum"]
+default = "Replace"
+
+[[parameter]]
+name = "Elevation"
+type = "float"
+control = "slider"
+min = -32767
+max = 32767
+default = 0

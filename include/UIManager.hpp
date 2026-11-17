@@ -39,7 +39,7 @@ public:
     bool IsBrushActive() const { return brushTools_.IsActive() || selectionMode_ != SelectionMode::None; }
     void SetCameraController(CameraController* camera) { camera_ = camera; }
     CameraController* GetCameraController() const { return camera_; }
-    // Folder listed by the Scripted brush panel's script library; created on first save.
+    // Folder supplying Brushes menu entries and the Custom brush's script library.
     void SetBrushScriptDirectory(std::filesystem::path directory);
 
 private:
@@ -69,8 +69,10 @@ private:
                               std::shared_ptr<const SphericalGridSnapshot> snapshot);
     void RenderGridProgressDialog();
     void NavigateRasterDirectory(const std::filesystem::path& directory);
-    void RenderBrushPanel();
+    void RenderBrushPanel(SphericalGrid& grid, GlobeRenderer& renderer);
+    void FillSelection(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderScriptEditor(ScriptedBrushTool& tool);
+    void RenderScriptParameters(ScriptedBrushTool& tool, bool custom);
     void RenderScriptLibrary();
     void LoadScriptIntoEditor(const BrushScriptFile& file);
     BrushScriptFile CurrentScriptFile() const;
@@ -79,6 +81,9 @@ private:
     void RenderSelectionPanel();
     void RenderValueSelectionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderFillFilterDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderInciseFlowDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderAbsoluteMagnitudeNoiseDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void ApplyTerrainFilter(const Filter& filter, SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer);
     void ApplyActiveLayerColorMaps(SphericalGrid& grid, GlobeRenderer& renderer);
     const ColorMap& GetColorMap(const std::string& name);
@@ -99,8 +104,11 @@ private:
     RasterFileBrowser projectBrowser_;
     ProjectAction projectAction_ = ProjectAction::Open;
     bool projectDialogOpen_ = false;
-    bool metadataOpen_ = false;
+    bool planetOpen_ = false;
     ProjectMetadata pendingMetadata_;
+    double pendingPlanetRadius_ = 6371.0;
+    int pendingPointCount_ = 10'000;
+    std::string planetError_;
     std::string projectFileName_;
     std::string projectDirectory_;
     std::string projectError_;
@@ -135,14 +143,29 @@ private:
     bool fillFilterOpen_ = false;
     FillFilterSettings pendingFillSettings_;
     std::string fillFilterError_;
+    std::string fillBasinsError_;
+    bool fillBasinsErrorOpen_ = false;
+    bool inciseFlowOpen_ = false;
+    InciseFlowSettings pendingInciseFlowSettings_;
+    std::string inciseFlowError_;
+    bool absoluteMagnitudeNoiseOpen_ = false;
+    float pendingNoiseAmplitudeFeet_ = 100.0F;
+    std::string absoluteMagnitudeNoiseError_;
     std::string simplexSeedError_;
     std::optional<std::string> scriptDraft_;
+    std::vector<ScriptParameter> scriptParameters_;
+    std::vector<ScriptParameterValue> scriptParameterValues_;
+    bool scriptParametersInstalled_ = true;
+    BrushApplication scriptApplication_ = BrushApplication::Noise;
+    bool scriptContinuous_ = false;
+    std::string scriptParameterError_;
     std::vector<std::string> scriptErrors_;
     std::string brushError_;
     ScriptedBrushTool* scriptedTool_ = nullptr;
     std::filesystem::path brushScriptDirectory_;
     std::filesystem::path scriptBrowserDirectory_;
     BrushScriptLibrary scriptLibrary_;
+    std::vector<std::string> brushLibraryErrors_;
     int selectedLibraryScript_ = -1;
     std::string scriptName_;
     std::string scriptDescription_;

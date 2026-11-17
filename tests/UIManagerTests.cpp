@@ -103,6 +103,7 @@ void testDialog() {
     renderer.UploadGrid(*grid.GetSnapshot());
     UIManager ui(grid.GetSnapshot()->GetOptions(),
                  std::filesystem::path(OSWALD_RESOURCE_DIR) / "assets/colormaps");
+    ui.SetBrushScriptDirectory(OSWALD_BRUSH_SCRIPT_DIR);
     const ImGuiSession imgui;
     const TemporaryDirectory temporary;
     auto frame = [&] {
@@ -160,25 +161,49 @@ void testDialog() {
         frame();
     };
 
-    auto selectBrushCombo = [&](const char* label, int row, int selectedItem,
+    const auto panelClick = [&](const char* label, int parameterIndex = -1) {
+        frame();
+        auto* panel = ImGui::FindWindowByName("###BrushParameters");
+        check(panel != nullptr && panel->Active, "Brush panel is not visible.");
+        ImGui::FocusWindow(panel);
+        const auto seed = parameterIndex < 0 ? panel->IDStack.back() :
+            ImHashData(&parameterIndex, sizeof(parameterIndex), panel->IDStack.back());
+        const auto id = ImHashStr(label, 0, seed);
+        for (float scroll = 0.0F;; scroll += panel->InnerRect.GetHeight() * 0.5F) {
+            ImGui::SetScrollY(panel, std::min(scroll, panel->ScrollMax.y));
+            frame();
+            for (float y = panel->InnerRect.Min.y + 2.0F; y < panel->InnerRect.Max.y; y += 5.0F) {
+                for (float x = panel->InnerRect.Min.x + 10.0F; x < panel->InnerRect.Max.x; x += 14.0F) {
+                    ImGui::GetIO().AddMousePosEvent(x, y);
+                    frame();
+                    if (ImGui::GetCurrentContext()->HoveredId == id) {
+                        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+                        frame();
+                        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+                        frame();
+                        frame();
+                        return ImVec2(x, y);
+                    }
+                }
+            }
+            if (scroll >= panel->ScrollMax.y) {
+                break;
+            }
+        }
+        throw std::runtime_error(std::string("Brush item was not interactive: ") + label);
+    };
+    auto selectBrushCombo = [&](const char* label, int, int selectedItem,
                                 const char* expectedItem) {
         auto* panel = ImGui::FindWindowByName("###BrushParameters");
         check(panel != nullptr && panel->Active, "Brush panel is not visible.");
-        const float height = ImGui::GetFrameHeight();
-        const auto start = panel->DC.CursorStartPos;
-        const ImGuiID popupId = ImHashStr("##ComboPopup", 0, panel->GetID(label));
-        ImGui::GetIO().AddMousePosEvent(start.x + panel->ItemWidthDefault - height * 0.5F,
-            start.y + row * (height + ImGui::GetStyle().ItemSpacing.y) + height * 0.5F);
-        frame();
-        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
-        frame();
-        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
-        frame();
+        const bool parameter = std::string_view(label) == "Operation" ||
+                               std::string_view(label) == "Blur distance unit";
+        panelClick(parameter ? "###ScriptParameter" : label, parameter ? 0 : -1);
         frame();
         auto* popup = ImGui::FindWindowByName("##Combo_00");
         check(panel->Active && popup != nullptr && popup->Active &&
               !ImGui::GetCurrentContext()->OpenPopupStack.empty() &&
-              ImGui::GetCurrentContext()->OpenPopupStack.back().PopupId == popupId,
+              !ImGui::GetCurrentContext()->OpenPopupStack.empty(),
               "Clicking a brush combo arrow did not keep its dropdown and panel visible.");
 
         ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 10.0F,
@@ -186,7 +211,8 @@ void testDialog() {
             ImGui::GetTextLineHeight() * 0.5F);
         frame();
         check(ImGui::GetCurrentContext()->HoveredId ==
-                  ImHashStr(expectedItem, 0, popup->GetID(selectedItem)),
+                  (parameter ? popup->GetID(expectedItem) :
+                               ImHashStr(expectedItem, 0, popup->GetID(selectedItem))),
               "Brush combo did not point to the expected option.");
         ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
         frame();
@@ -195,14 +221,17 @@ void testDialog() {
         check(!dialogOpen() && panel->Active,
               "Selecting a brush combo option did not close the dropdown.");
     };
-    auto checkBrushSlider = [&](const char* label, int row, bool enabled, float relativeX = 0.25F) {
+    auto checkBrushSlider = [&](const char* label, int, bool enabled, float relativeX = 0.25F) {
         auto* panel = ImGui::FindWindowByName("###BrushParameters");
         check(panel != nullptr && panel->Active, "Brush panel is not visible.");
-        const float height = ImGui::GetFrameHeight();
-        const auto start = panel->DC.CursorStartPos;
-        const ImGuiID sliderId = panel->GetID(label);
-        ImGui::GetIO().AddMousePosEvent(start.x + panel->ItemWidthDefault * relativeX,
-            start.y + row * (height + ImGui::GetStyle().ItemSpacing.y) + height * 0.5F);
+        const bool parameter = std::string_view(label) == "Elevation" ||
+                               std::string_view(label) == "Intensity (%)";
+        const auto point = panelClick(parameter ? "###ScriptParameter" : label, parameter ? 1 : -1);
+        const int index = 1;
+        const ImGuiID sliderId = parameter ? ImHashStr("###ScriptParameter", 0,
+            ImHashData(&index, sizeof(index), panel->IDStack.back())) : panel->GetID(label);
+        ImGui::GetIO().AddMousePosEvent(panel->DC.CursorStartPos.x + panel->ItemWidthDefault * relativeX,
+                                      point.y);
         frame();
         ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
         frame();
@@ -210,27 +239,6 @@ void testDialog() {
               enabled ? "Brush slider should be enabled." : "Brush slider should be disabled.");
         ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
         frame();
-    };
-    auto sliderGrabPosition = [&](int row) -> std::optional<float> {
-        frame();
-        auto* panel = ImGui::FindWindowByName("###BrushParameters");
-        check(panel != nullptr && panel->Active, "Brush panel is not visible.");
-        const float height = ImGui::GetFrameHeight();
-        const float top = panel->DC.CursorStartPos.y +
-                          row * (height + ImGui::GetStyle().ItemSpacing.y);
-        const ImU32 color = ImGui::GetColorU32(ImGuiCol_SliderGrab);
-        float left = std::numeric_limits<float>::max();
-        float right = std::numeric_limits<float>::lowest();
-        for (const auto& vertex : panel->DrawList->VtxBuffer) {
-            if (vertex.col == color && vertex.pos.y >= top && vertex.pos.y <= top + height) {
-                left = std::min(left, vertex.pos.x);
-                right = std::max(right, vertex.pos.x);
-            }
-        }
-        if (left > right) {
-            return std::nullopt;
-        }
-        return (left + right) * 0.5F;
     };
     auto click = [&](float x, float y) {
         ImGui::GetIO().AddMousePosEvent(x, y);
@@ -243,7 +251,7 @@ void testDialog() {
     auto selectMenuItem = [&](int menu, int row, const char* label) {
         auto* bar = ImGui::FindWindowByName("##MainMenuBar");
         check(bar != nullptr && bar->Active, "Main menu bar was not rendered.");
-        constexpr std::array names{"File", "Edit", "Select", "Tools", "Filter", "Mesh"};
+        constexpr std::array names{"File", "Edit", "Select", "Brushes", "Filter", "Mesh"};
         float x = bar->DC.CursorStartPos.x + ImGui::GetStyle().ItemSpacing.x * 0.5F;
         for (int i = 0; i < menu; ++i) {
             x += ImGui::CalcTextSize(names[i]).x + ImGui::GetStyle().ItemSpacing.x * 2.0F;
@@ -254,11 +262,21 @@ void testDialog() {
         auto& popups = ImGui::GetCurrentContext()->OpenPopupStack;
         check(!popups.empty() && popups.back().Window != nullptr, "Menu did not open.");
         auto* popup = popups.back().Window;
-        ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 20.0F,
-            popup->DC.CursorStartPos.y + row * ImGui::GetTextLineHeightWithSpacing() +
-            (menu == 0 && row >= 5 ? ImGui::GetStyle().ItemSpacing.y : 0.0F) +
-            ImGui::GetTextLineHeight() * 0.5F);
-        frame();
+        if (menu == 3) {
+            for (float y = popup->InnerRect.Min.y + 1; y < popup->InnerRect.Max.y; y += 2) {
+                ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 20.0F, y);
+                frame();
+                if (ImGui::GetCurrentContext()->HoveredId == popup->GetID(label)) {
+                    break;
+                }
+            }
+        } else {
+            ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 20.0F,
+                popup->DC.CursorStartPos.y + row * ImGui::GetTextLineHeightWithSpacing() +
+                (menu == 0 && row >= 5 ? ImGui::GetStyle().ItemSpacing.y : 0.0F) +
+                ImGui::GetTextLineHeight() * 0.5F);
+            frame();
+        }
         check(ImGui::GetCurrentContext()->HoveredId == popup->GetID(label),
               "Menu did not point to the expected item.");
         ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
@@ -271,24 +289,41 @@ void testDialog() {
     frame();
     frame();
     frame();
+    selectMenuItem(3, 0, "Elevation Brush");
     checkBrushSlider("Falloff (%)", 3, true);
     constexpr std::array operationNames{"Replace", "Minimum", "Maximum"};
     for (int operation = 0; operation <= 2; ++operation) {
         selectBrushCombo("Operation", 0, operation, operationNames[operation]);
         checkBrushSlider("Elevation", 4, true);
-        check(!sliderGrabPosition(5).has_value(),
-              "Elevation brush still shows an intensity slider.");
     }
     selectBrushCombo("Distance unit", 1, 1, "Miles");
     selectMenuItem(3, 1, "Raise/Lower Brush");
     checkBrushSlider("Intensity (%)", 4, true);
-    check(!sliderGrabPosition(5).has_value(), "Raise/Lower brush still has a value slider.");
     selectBrushCombo("Operation", 0, 1, "Lower");
     checkBrushSlider("Intensity (%)", 4, true);
     selectMenuItem(3, 0, "Elevation Brush");
     checkBrushSlider("Elevation", 4, true);
-    check(!sliderGrabPosition(5).has_value(),
-          "Switching tools restored an intensity slider to the elevation brush.");
+    selectMenuItem(3, 0, "Gaussian Blur");
+    const auto readParameterNumber = [&](int index) {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        panelClick("###ScriptParameter", index);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        frame();
+        const auto* panel = ImGui::FindWindowByName("###BrushParameters");
+        const auto id = ImHashStr("###ScriptParameter", 0,
+            ImHashData(&index, sizeof(index), panel->IDStack.back()));
+        const auto* input = ImGui::GetInputTextState(id);
+        check(input != nullptr, "Script parameter did not enter numeric input mode.");
+        const double value = std::stod(input->TextA.Data);
+        key(ImGuiKey_Escape);
+        return value;
+    };
+    check(std::abs(readParameterNumber(1) - 100.0) < 0.001,
+          "Gaussian blur range did not use its TOML default.");
+    selectBrushCombo("Blur distance unit", 0, 1, "Miles");
+    check(std::abs(readParameterNumber(1) - 62.1371192) < 0.001,
+          "Changing Gaussian blur units did not preserve the physical range.");
+    selectMenuItem(3, 0, "Elevation Brush");
     openDialog();
     selectRow(0);
     key(ImGuiKey_Enter);
@@ -313,7 +348,7 @@ void testDialog() {
     const float rowHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y;
     auto focusSpeed = [&] {
         click(settings->DC.CursorStartPos.x + 30.0F,
-              settings->DC.CursorStartPos.y + 2.0F * rowHeight +
+              settings->DC.CursorStartPos.y + rowHeight +
               ImGui::GetFrameHeight() * 0.5F);
     };
     auto editSpeed = [&](const char* text) {
@@ -368,11 +403,9 @@ void testDialog() {
     selectBrushCombo("Operation", 0, 1, "Minimum");
     {
         auto* panel = ImGui::FindWindowByName("###BrushParameters");
-        const float height = ImGui::GetFrameHeight();
-        const auto start = panel->DC.CursorStartPos;
+        const auto point = panelClick("Outer radius");
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
-        click(start.x + panel->ItemWidthDefault * 0.5F,
-              start.y + 2.0F * (height + ImGui::GetStyle().ItemSpacing.y) + height * 0.5F);
+        click(panel->DC.CursorStartPos.x + panel->ItemWidthDefault * 0.5F, point.y);
         key(ImGuiKey_A);
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
         frame();
@@ -715,6 +748,256 @@ void testDialog() {
           grid.GetSnapshot()->GetVertices()[2].elevation == 32767.0F,
           "Redo did not reapply the Fill filter.");
 
+    const auto noiseDialog = [&] {
+        auto* dialog = ImGui::FindWindowByName("Absolute Magnitude Noise");
+        check(dialog != nullptr && dialog->Active, "Absolute Magnitude Noise dialog did not open.");
+        return dialog;
+    };
+    const auto setNoiseAmplitude = [&](bool maximum) {
+        auto* dialog = noiseDialog();
+        click(dialog->DC.CursorStartPos.x + (maximum ? dialog->ItemWidthDefault - 1.0F : 1.0F),
+              dialog->DC.CursorStartPos.y + ImGui::GetFrameHeight() * 0.5F);
+    };
+    const auto noiseDialogButton = [&](bool apply) {
+        frame();
+        frame();
+        auto* dialog = noiseDialog();
+        const float width = ImGui::CalcTextSize("Apply").x +
+                            ImGui::GetStyle().FramePadding.x * 2.0F;
+        const float x = apply ? width * 0.5F :
+            width + ImGui::GetStyle().ItemSpacing.x +
+                ImGui::CalcTextSize("Cancel").x * 0.5F + ImGui::GetStyle().FramePadding.x;
+        click(dialog->DC.CursorStartPos.x + x,
+              dialog->DC.CursorPosPrevLine.y + ImGui::GetFrameHeight() * 0.5F);
+    };
+    const auto beforeNoiseDialog = grid.GetSnapshot();
+    selectMenuItem(4, 2, "Absolute Magnitude Noise...");
+    setNoiseAmplitude(true);
+    noiseDialogButton(false);
+    check(!dialogOpen() && grid.GetSnapshot() == beforeNoiseDialog,
+          "Cancelling noise changed terrain or left the dialog open.");
+    selectMenuItem(4, 2, "Absolute Magnitude Noise...");
+    setNoiseAmplitude(false);
+    noiseDialogButton(true);
+    check(!dialogOpen() && grid.GetSnapshot() == beforeNoiseDialog,
+          "Zero-amplitude noise changed terrain.");
+    std::vector<float> noiseTerrain(grid.GetSnapshot()->GetVertices().size(), -1000.0F);
+    std::vector<float> noiseWeights(noiseTerrain.size());
+    for (std::size_t i = 0; i < noiseWeights.size(); ++i) {
+        noiseWeights[i] = i % 3 == 0 ? 0.0F : i % 3 == 1 ? 0.25F : 1.0F;
+    }
+    for (const bool selected : {false, true}) {
+        grid.SetElevations(noiseTerrain);
+        grid.SetSelectionWeights(noiseWeights, selected);
+        renderer.UploadGrid(*grid.GetSnapshot());
+        const auto before = grid.GetSnapshot();
+        selectMenuItem(4, 2, "Absolute Magnitude Noise...");
+        check(grid.GetSnapshot() == before, "Opening noise applied random variation before Apply.");
+        setNoiseAmplitude(true);
+        noiseDialogButton(true);
+        check(!dialogOpen(), "Noise Apply did not close the dialog.");
+        const auto after = grid.GetSnapshot();
+        bool positive = false;
+        bool negative = false;
+        for (std::size_t i = 0; i < noiseTerrain.size(); ++i) {
+            const float delta = after->GetVertices()[i].elevation - noiseTerrain[i];
+            const double weight = selected ? noiseWeights[i] : 1.0;
+            check(std::abs(delta) <= 152.4 * weight + 0.0001,
+                  "Noise dialog ignored its amplitude, feet conversion, or selection feathering.");
+            positive |= delta > 0.0F;
+            negative |= delta < 0.0F;
+            check(after->GetVertices()[i].selectionWeight == before->GetVertices()[i].selectionWeight,
+                  "Noise changed selection weights.");
+        }
+        check(positive && negative, "Noise did not apply signed variation.");
+        shortcut(ImGuiKey_Z);
+        for (std::size_t i = 0; i < noiseTerrain.size(); ++i) {
+            check(grid.GetSnapshot()->GetVertices()[i].elevation == noiseTerrain[i],
+                  "Undo did not restore terrain before noise.");
+        }
+        shortcut(ImGuiKey_Y);
+        for (std::size_t i = 0; i < noiseTerrain.size(); ++i) {
+            check(grid.GetSnapshot()->GetVertices()[i].elevation == after->GetVertices()[i].elevation,
+                  "Redo regenerated noise instead of restoring the exact result.");
+        }
+        check(grid.GetSnapshot()->HasSelection() == selected, "Noise changed selection state.");
+        renderer.Draw(256, 256);
+        check(glGetError() == GL_NO_ERROR, "Rendering noise produced an OpenGL error.");
+    }
+
+    const auto selectErosionItem = [&](int row, const char* label) {
+        selectMenuItem(4, 1, "Erosion");
+        frame();
+        auto& popups = ImGui::GetCurrentContext()->OpenPopupStack;
+        check(popups.Size >= 2 && popups.back().Window != nullptr,
+              "Filter Erosion did not open a submenu.");
+        auto* menu = popups.back().Window;
+        ImGui::GetIO().AddMousePosEvent(menu->DC.CursorStartPos.x + 30.0F,
+            menu->DC.CursorStartPos.y + row * ImGui::GetTextLineHeightWithSpacing() +
+            ImGui::GetTextLineHeight() * 0.5F);
+        frame();
+        check(ImGui::GetCurrentContext()->HoveredId == menu->GetID(label),
+              "Erosion submenu did not contain the expected filter.");
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+        frame();
+    };
+    const auto fillBasins = [&] { selectErosionItem(0, "Fill basins..."); };
+    std::vector<float> basinTerrain(grid.GetSnapshot()->GetVertices().size(), -20.0F);
+    const auto& basinEdges = grid.GetSnapshot()->GetHalfEdges();
+    for (const auto& edge : basinEdges) {
+        if (edge.originVertex == 0) {
+            basinTerrain[static_cast<std::size_t>(
+                basinEdges[static_cast<std::size_t>(edge.nextEdge)].originVertex)] = 100.0F;
+        }
+    }
+    basinTerrain[0] = 1.0F;
+    std::vector<float> basinSelection(basinTerrain.size(), 0.0F);
+    for (const bool selected : {false, true}) {
+        basinSelection[0] = selected ? 0.5F : 0.0F;
+        grid.SetSelectionWeights(basinSelection, selected);
+        grid.SetElevations(basinTerrain);
+        renderer.UploadGrid(*grid.GetSnapshot());
+        fillBasins();
+        check(!dialogOpen(), "Fill basins should run immediately without a settings dialog.");
+        const auto filled = grid.GetSnapshot();
+        const float expected = selected ? 1.0F + ((100.0F + 1.0e-4F) - 1.0F) * 0.5F
+                                        : 100.0F + 1.0e-4F;
+        check(filled->GetVertices()[0].elevation == expected &&
+              filled->GetVertices()[1].elevation == basinTerrain[1],
+              "Fill basins menu did not fill the basin using the current selection.");
+        shortcut(ImGuiKey_Z);
+        for (std::size_t i = 0; i < basinTerrain.size(); ++i) {
+            check(grid.GetSnapshot()->GetVertices()[i].elevation == basinTerrain[i],
+                  "Undo did not restore the terrain before Fill basins.");
+        }
+        shortcut(ImGuiKey_Y);
+        check(grid.GetSnapshot()->GetVertices()[0].elevation == expected &&
+              grid.GetSnapshot()->HasSelection() == selected &&
+              grid.GetSnapshot()->GetVertices()[0].selectionWeight == basinSelection[0],
+              "Redo did not restore filled basins or changed the selection.");
+        renderer.Draw(256, 256);
+        check(glGetError() == GL_NO_ERROR, "Rendering filled basins produced an OpenGL error.");
+    }
+    std::fill(basinTerrain.begin(), basinTerrain.end(), 32767.0F);
+    basinTerrain[0] = 1.0F;
+    grid.SetElevations(basinTerrain);
+    renderer.UploadGrid(*grid.GetSnapshot());
+    fillBasins();
+    const auto* basinError = ImGui::FindWindowByName("Fill Basins Error");
+    check(dialogOpen() && basinError != nullptr && basinError->Active,
+          "Fill basins did not display an error for unrepresentable drainage.");
+    for (std::size_t i = 0; i < basinTerrain.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == basinTerrain[i],
+              "Failed Fill basins partially modified terrain.");
+    }
+    key(ImGuiKey_Escape);
+    check(!dialogOpen(), "Fill basins error could not be dismissed.");
+
+    const auto inciseDialog = [&] {
+        auto* dialog = ImGui::FindWindowByName("Incise Flow");
+        check(dialog != nullptr && dialog->Active, "Incise Flow parameter dialog did not open.");
+        return dialog;
+    };
+    const auto editInciseParameter = [&](int row, const char* label, const char* text) {
+        auto* dialog = inciseDialog();
+        click(dialog->DC.CursorStartPos.x + 30.0F,
+              dialog->DC.CursorStartPos.y + row * rowHeight + ImGui::GetFrameHeight() * 0.5F);
+        check(ImGui::GetCurrentContext()->ActiveId == dialog->GetID(label),
+              "Incise Flow parameter is not an editable numeric input.");
+        shortcut(ImGuiKey_A);
+        ImGui::GetIO().AddInputCharactersUTF8(text);
+        frame();
+        key(ImGuiKey_Enter);
+    };
+    const auto inciseDialogButton = [&](bool apply) {
+        frame();
+        frame();
+        auto* dialog = inciseDialog();
+        const float applyWidth = ImGui::CalcTextSize("Apply").x +
+                                 ImGui::GetStyle().FramePadding.x * 2.0F;
+        const float x = apply ? applyWidth * 0.5F :
+            applyWidth + ImGui::GetStyle().ItemSpacing.x +
+                ImGui::CalcTextSize("Cancel").x * 0.5F + ImGui::GetStyle().FramePadding.x;
+        click(dialog->DC.CursorStartPos.x + x,
+              dialog->DC.CursorPosPrevLine.y + ImGui::GetFrameHeight() * 0.5F);
+    };
+    std::vector<float> incisionTerrain(basinTerrain.size(), -20.0F);
+    for (std::size_t i = 0; i < incisionTerrain.size(); ++i) {
+        if (i % 7 != 0) incisionTerrain[i] = 100.0F + static_cast<float>((i * 193) % 4000);
+    }
+    grid.SetElevations(incisionTerrain);
+    renderer.UploadGrid(*grid.GetSnapshot());
+    const auto beforeIncisionDialog = grid.GetSnapshot();
+    selectErosionItem(1, "Incise flow...");
+    editInciseParameter(0, "Incision rate (m/pass)", "20");
+    inciseDialogButton(false);
+    check(!dialogOpen() && grid.GetSnapshot() == beforeIncisionDialog,
+          "Cancelling Incise Flow changed terrain or left the dialog open.");
+    selectErosionItem(1, "Incise flow...");
+    editInciseParameter(1, "Reference area (runoff)", "0");
+    inciseDialogButton(true);
+    check(dialogOpen() && grid.GetSnapshot() == beforeIncisionDialog,
+          "Invalid Incise Flow parameters changed terrain or closed the dialog.");
+    key(ImGuiKey_Escape);
+    check(!dialogOpen(), "Escape did not cancel the incision dialog.");
+
+    grid.SetPlanetRadius(3000.0);
+    const InciseFlowSettings incisionSettings{8.0, 4.0, 0.6, 1.2, 2.0};
+    InciseFlowFilter incisionFilter;
+    incisionFilter.SetSettings(incisionSettings);
+    std::vector<float> incisionWeights(incisionTerrain.size(), 0.0F);
+    for (std::size_t i = 0; i < incisionWeights.size(); ++i) {
+        incisionWeights[i] = i % 5 == 0 ? 0.0F : i % 3 == 0 ? 0.5F : 1.0F;
+    }
+    for (const bool selected : {false, true}) {
+        grid.SetSelectionWeights(incisionWeights, selected);
+        grid.SetElevations(incisionTerrain);
+        renderer.UploadGrid(*grid.GetSnapshot());
+        const auto before = grid.GetSnapshot();
+        const auto expected = incisionFilter.Apply(*before, incisionTerrain);
+        selectErosionItem(1, "Incise flow...");
+        check(grid.GetSnapshot() == before, "Opening Incise Flow ran the filter before Apply.");
+        if (!selected) {
+            editInciseParameter(0, "Incision rate (m/pass)", "8");
+            editInciseParameter(1, "Reference area (runoff)", "4");
+            editInciseParameter(2, "Flow exponent (m)", "0.6");
+            editInciseParameter(3, "Slope exponent (n)", "1.2");
+            editInciseParameter(4, "Precipitation (per vertex)", "2");
+        }
+        inciseDialogButton(true);
+        check(!dialogOpen(), "Valid Incise Flow did not close the dialog.");
+        const auto checkIncision = [&](const std::vector<float>& values) {
+            const auto snapshot = grid.GetSnapshot();
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                check(snapshot->GetVertices()[i].elevation == values[i],
+                      "Incise Flow dialog, undo or redo produced incorrect elevations.");
+                check(snapshot->GetVertices()[i].selectionWeight == before->GetVertices()[i].selectionWeight,
+                      "Incise Flow changed selection weights.");
+            }
+            check(snapshot->HasSelection() == selected, "Incise Flow changed selection state.");
+        };
+        checkIncision(expected);
+        shortcut(ImGuiKey_Z);
+        checkIncision(incisionTerrain);
+        shortcut(ImGuiKey_Y);
+        checkIncision(expected);
+        renderer.Draw(256, 256);
+        check(glGetError() == GL_NO_ERROR, "Rendering incised flow produced an OpenGL error.");
+    }
+    grid.SetPlanetRadius(0.001);
+    const auto beforeOverflow = grid.GetSnapshot();
+    selectErosionItem(1, "Incise flow...");
+    editInciseParameter(0, "Incision rate (m/pass)", "1e308");
+    inciseDialogButton(true);
+    check(dialogOpen() && grid.GetSnapshot() == beforeOverflow,
+          "Failed incision did not keep its dialog open and leave terrain unchanged.");
+    key(ImGuiKey_Escape);
+    check(!dialogOpen(), "Could not dismiss incision after numeric overflow.");
+    grid.SetPlanetRadius(6371.0);
+
         std::vector<float> meshSelection(grid.GetSnapshot()->GetVertices().size(), 1.0F);
         std::vector<float> uniformTerrain(meshSelection.size(), 250.0F);
         grid.SetSelectionWeights(meshSelection, true);
@@ -761,7 +1044,13 @@ void testDialog() {
         frame();
         auto* dialog = ImGui::FindWindowByName(windowName);
         check(dialog && dialog->Active, "Expected project dialog is not active.");
-        const auto id = dialog->GetID(label);
+        auto id = dialog->GetID(label);
+        if (std::string_view(windowName) == "Planet" &&
+            std::string_view(label) != "Apply" && std::string_view(label) != "Cancel") {
+            const auto* tabs = ImGui::GetCurrentContext()->TabBars.GetByKey(dialog->GetID("PlanetTabs"));
+            check(tabs != nullptr, "Planet tabs were not rendered.");
+            id = ImHashStr(label, 0, tabs->SelectedTabId);
+        }
         const float x = dialog->DC.CursorStartPos.x + 12;
         const float firstY = dialog->DC.CursorStartPos.y;
         const float lastY = dialog->Pos.y + dialog->Size.y - 8;
@@ -784,22 +1073,64 @@ void testDialog() {
         frame();
         key(ImGuiKey_Tab);
     };
-    selectMenuItem(0, 4, "Metadata...");
-    auto* metadataDialog = ImGui::FindWindowByName("Project Metadata");
-    check(metadataDialog && metadataDialog->Active, "Metadata menu did not open its dialog.");
-    click(metadataDialog->DC.CursorStartPos.x + 20, metadataDialog->DC.CursorStartPos.y + 20);
-    ImGui::GetIO().AddInputCharactersUTF8("Project description");
-    frame();
-    replaceDialogText("Project Metadata", "Author", "Project author");
-    clickDialogItem("Project Metadata", "Apply");
+    const auto planetTab = [&](const char* label) {
+        frame();
+        auto* dialog = ImGui::FindWindowByName("Planet");
+        check(dialog && dialog->Active, "Planet menu did not open its dialog.");
+        const auto barId = dialog->GetID("PlanetTabs");
+        const auto tabId = ImHashStr(label, 0, barId);
+        const float y = dialog->DC.CursorStartPos.y + ImGui::GetFrameHeight() * 0.5F;
+        for (float x = dialog->DC.CursorStartPos.x + 4; x < dialog->InnerRect.Max.x; x += 4) {
+            ImGui::GetIO().AddMousePosEvent(x, y);
+            frame();
+            if (ImGui::GetCurrentContext()->HoveredId == tabId) {
+                click(x, y);
+                frame();
+                return;
+            }
+        }
+        throw std::runtime_error(std::string("Planet tab is not interactive: ") + label);
+    };
+    const auto beforePlanet = grid.GetSnapshot();
+    selectMenuItem(0, 4, "Planet...");
+    planetTab("Geometry");
+    replaceDialogText("Planet", "Planet radius (km)", "0");
+    clickDialogItem("Planet", "Apply");
+    check(dialogOpen() && grid.GetSnapshot() == beforePlanet,
+          "Invalid planet radius was accepted or changed terrain.");
+    replaceDialogText("Planet", "Planet radius (km)", "3000");
+    planetTab("Metadata");
+    replaceDialogText("Planet", "Description", "Project description");
+    replaceDialogText("Planet", "Author", "Project author");
+    clickDialogItem("Planet", "Apply");
     check(grid.GetMetadata().author == "Project author" &&
           grid.GetMetadata().description == "Project description" &&
           grid.GetMetadata().savedAt.empty(),
           "Metadata dialog did not apply author/description or changed the save date.");
-    selectMenuItem(0, 4, "Metadata...");
-    replaceDialogText("Project Metadata", "Author", "Cancelled author");
+    check(grid.GetSnapshot()->GetOptions().planetRadius == 3000.0 &&
+          grid.GetSnapshot()->GetTriangleIndices() == beforePlanet->GetTriangleIndices(),
+          "Planet geometry did not apply radius without regenerating the grid.");
+    for (std::size_t i = 0; i < beforePlanet->GetVertices().size(); ++i) {
+        const auto& before = beforePlanet->GetVertices()[i];
+        const auto& after = grid.GetSnapshot()->GetVertices()[i];
+        check(before.position == after.position && before.elevation == after.elevation &&
+              before.selectionWeight == after.selectionWeight,
+              "Changing planet radius modified terrain or selection.");
+    }
+    shortcut(ImGuiKey_Z);
+    check(grid.GetSnapshot()->GetOptions().planetRadius == 3000.0,
+          "Undoing a mesh edit reverted the planet radius.");
+    shortcut(ImGuiKey_Y);
+    check(grid.GetSnapshot()->GetOptions().planetRadius == 3000.0,
+          "Redoing a mesh edit reverted the planet radius.");
+    selectMenuItem(0, 4, "Planet...");
+    planetTab("Metadata");
+    replaceDialogText("Planet", "Author", "Cancelled author");
+    planetTab("Geometry");
+    replaceDialogText("Planet", "Planet radius (km)", "2000");
     key(ImGuiKey_Escape);
-    check(grid.GetMetadata().author == "Project author",
+    check(grid.GetMetadata().author == "Project author" &&
+          grid.GetSnapshot()->GetOptions().planetRadius == 3000.0,
           "Cancelling metadata edits changed the project.");
     shortcut(ImGuiKey_S);
     check(ImGui::FindWindowByName("Project File")->Active,
@@ -811,6 +1142,7 @@ void testDialog() {
     const auto savedSnapshot = grid.GetSnapshot();
     auto saved = ProjectFile::Load(temporary.path / "ui.oswald");
     check(saved->GetMetadata().author == "Project author" &&
+          saved->GetSnapshot()->GetOptions().planetRadius == 3000.0 &&
           !saved->GetMetadata().savedAt.empty(),
           "UI save failed to persist metadata and the save date.");
     grid.GetMetadata().author = "Updated author";
@@ -962,50 +1294,25 @@ void testDialog() {
     // Scripted brush library: load, save, overwrite, export and import.
     const auto library = temporary.path / "brushes";
     std::filesystem::create_directories(library);
-    BrushScriptFile{"ridges", "Ridged relief", "ridged(x, y, z, 3, 2, 0.5, 5, 1, 2)"}
+    BrushScriptFile{"ridges", "Ridged relief", "ridged(x, y, z, 3, 2, 0.5, 5)"}
         .Save(library / "ridges.toml");
     BrushScriptFile{"imported", "From elsewhere", "simplex(x, y, z)\n* 0.5",
                     ScriptedBrushSettings::Output::Elevation}
         .Save(temporary.path / "outside.toml");
     ui.SetBrushScriptDirectory(library);
-    selectMenuItem(3, 8, "Scripted Brush");
+    selectMenuItem(3, 8, "Custom");
     ImGui::SetWindowPos("###BrushParameters", ImVec2(40.0F, 40.0F));
     ImGui::SetWindowSize("###BrushParameters", ImVec2(560.0F, 720.0F));
-    const auto panelClick = [&](const char* label) {
-        frame();
-        auto* panel = ImGui::FindWindowByName("###BrushParameters");
-        check(panel != nullptr && panel->Active, "Scripted brush panel is not visible.");
-        ImGui::FocusWindow(panel);
-        const auto id = panel->GetID(label);
-        for (float scroll = 0.0F;; scroll += panel->InnerRect.GetHeight() * 0.5F) {
-            ImGui::SetScrollY(panel, std::min(scroll, panel->ScrollMax.y));
-            frame();
-            for (float y = panel->InnerRect.Min.y + 2.0F; y < panel->InnerRect.Max.y; y += 5.0F) {
-                for (float x = panel->InnerRect.Min.x + 10.0F; x < panel->InnerRect.Max.x; x += 14.0F) {
-                    ImGui::GetIO().AddMousePosEvent(x, y);
-                    frame();
-                    if (ImGui::GetCurrentContext()->HoveredId == id) {
-                        click(x, y);
-                        frame();
-                        frame();
-                        return;
-                    }
-                }
-            }
-            if (scroll >= panel->ScrollMax.y) {
-                break;
-            }
-        }
-        throw std::runtime_error(std::string("Scripted brush item was not interactive: ") + label);
-    };
-    const auto replacePanelText = [&](const char* label, const char* text) {
-        panelClick(label);
+    const auto replacePanelText = [&](const char* label, const char* text, int parameterIndex = -1) {
+        panelClick(label, parameterIndex);
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
         key(ImGuiKey_A);
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
         ImGui::GetIO().AddInputCharactersUTF8(text);
         frame();
-        key(ImGuiKey_Tab);
+        if (std::string_view(label) != "##BrushScript") {
+            key(ImGuiKey_Tab);
+        }
     };
     panelClick("##ScriptLibrary");
     frame();
@@ -1023,7 +1330,7 @@ void testDialog() {
     panelClick("Save to library");
     const auto copy = BrushScriptFile::Load(library / "ridges_copy.toml");
     check(copy.name == "ridges copy" && copy.description == "Ridged relief" &&
-          copy.script == "ridged(x, y, z, 3, 2, 0.5, 5, 1, 2)" &&
+          copy.script == "ridged(x, y, z, 3, 2, 0.5, 5)" &&
           copy.output == ScriptedBrushSettings::Output::Normalized,
           "Loading from the library and saving under a new name lost the script.");
     replacePanelText("Description", "Changed");
@@ -1050,6 +1357,232 @@ void testDialog() {
     check(imported.description == "From elsewhere" && imported.script == "simplex(x, y, z)\n* 0.5" &&
           imported.output == ScriptedBrushSettings::Output::Elevation,
           "Imported brush script did not replace the editor contents and output mode.");
+
+    const auto parameterized = BrushScriptFile::Parse(
+        "name='parameterized'\noutput='elevation'\nscript=\"frequency + octaves + offset\"\n"
+        "[[parameter]]\nname='frequency'\ntype='float'\ncontrol='slider'\n"
+        "min=0.1\nmax=100\nscale='log'\ndefault=4\n"
+        "[[parameter]]\nname='octaves'\ntype='integer'\ncontrol='spin'\n"
+        "min=0\nmax=30\ndefault=5\n"
+        "[[parameter]]\nname='mode'\ntype='choice'\nchoices=['one','two']\ndefault='one'\n"
+        "[[parameter]]\nname='offset'\ntype='float'\ncontrol='text'\n"
+        "min=-10\nmax=10\ndefault=0.25\n");
+    const auto importScript = [&](const BrushScriptFile& file) {
+        file.Save(temporary.path / "outside.toml");
+        panelClick("Import...");
+        replaceDialogText("Project File", "File name", (temporary.path / "outside.toml").string().c_str());
+        clickDialogItem("Project File", "Import");
+        check(!dialogOpen(), "Importing a parameterized script did not close the browser.");
+    };
+    importScript(parameterized);
+    const auto sliderPoint = panelClick("###ScriptParameter", 0);
+    auto* panel = ImGui::FindWindowByName("###BrushParameters");
+    const float midpoint = panel->DC.CursorStartPos.x + panel->ItemWidthDefault * 0.5F;
+    click(midpoint, sliderPoint.y);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+    click(midpoint, sliderPoint.y);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+    frame();
+    const int parameterIndex = 0;
+    const auto sliderId = ImHashStr("###ScriptParameter", 0,
+        ImHashData(&parameterIndex, sizeof(parameterIndex), panel->IDStack.back()));
+    const auto* sliderInput = ImGui::GetInputTextState(sliderId);
+    check(sliderInput != nullptr, "Parameterized slider did not allow numeric input.");
+    const auto midpointValue = std::stod(sliderInput->TextA.Data);
+    check(midpointValue > 2.8 && midpointValue < 3.6,
+          "Logarithmic slider midpoint was not the geometric mean of its bounds.");
+    key(ImGuiKey_Escape);
+    panelClick("###ScriptParameter", 1);
+    panelClick("###ScriptParameter", 2);
+    {
+        const auto& popups = ImGui::GetCurrentContext()->OpenPopupStack;
+        check(!popups.empty() && popups.back().Window != nullptr,
+              "Choice parameter did not open a dropdown.");
+        const auto* list = popups.back().Window;
+        click(list->DC.CursorStartPos.x + 10.0F,
+              list->DC.CursorStartPos.y + ImGui::GetTextLineHeightWithSpacing() +
+                  ImGui::GetTextLineHeight() * 0.5F);
+    }
+    replacePanelText("###ScriptParameter", "8", 3);
+    const char* editedScript = "mode == 'two' ? offset + octaves : frequency";
+    replacePanelText("##BrushScript", editedScript);
+    panelClick("Compile");
+    replacePanelText("##BrushScript", "unknownParameter");
+    panelClick("Compile");
+    panelClick("Revert");
+    panelClick("Save to library");
+    auto savedParameters = BrushScriptFile::Load(library / "parameterized.toml");
+    check(savedParameters.parameters == parameterized.parameters &&
+          savedParameters.script == editedScript,
+          "Editing/compiling/reverting the script lost definitions or changed file defaults.");
+
+    auto replacement = BrushScriptFile::Parse(
+        "name='parameterized'\nscript='replacement'\n"
+        "[[parameter]]\nname='replacement'\ntype='integer'\ncontrol='slider'\n"
+        "min=-2147483648\nmax=2147483647\ndefault=9\n"
+        "[[parameter]]\nname='amount'\ntype='float'\ncontrol='spin'\nmin=0\nmax=1\ndefault=0.5\n");
+    replacement.Save(library / "parameterized.toml");
+    panelClick("Load");
+    panelClick("###ScriptParameter", 0);
+    panelClick("###ScriptParameter", 1);
+    replacePanelText("Name", "reloaded");
+    panelClick("Save to library");
+    const auto reloaded = BrushScriptFile::Load(library / "reloaded.toml");
+    check(reloaded.parameters == replacement.parameters && reloaded.script == replacement.script,
+          "Reload did not replace custom controls using externally edited definitions.");
+
+    auto failed = parameterized;
+    failed.name = "failed";
+    failed.script = "unknownParameter";
+    importScript(failed);
+    panelClick("Revert");
+    panelClick("Save to library");
+    const auto reverted = BrushScriptFile::Load(library / "failed.toml");
+    check(reverted.parameters == reloaded.parameters && reverted.script == reloaded.script,
+          "Reverting a failed load did not restore the active script and parameter definitions.");
+
+    importScript(BrushScriptFile{"legacy", "", "1"});
+    panelClick("Save to library");
+    check(BrushScriptFile::Load(library / "legacy.toml").parameters.empty(),
+          "Loading a legacy script did not remove the previous custom controls.");
+
+    auto menuBrush = BrushScriptFile::Parse(
+        "name='File brush'\napplication='elevation'\nscript='amount'\n"
+        "[[parameter]]\nname='amount'\ntype='float'\ncontrol='slider'\nmin=0\nmax=100\ndefault=20");
+    menuBrush.Save(library / "menu.toml");
+    BrushScriptFile{"Broken expression", "", "unknownFunction(1)"}.Save(library / "bad_expression.toml");
+    BrushScriptFile{"Custom", "", "999"}.Save(library / "reserved.toml");
+    std::ofstream(library / "invalid.toml") << "name = ";
+    selectMenuItem(3, 0, "Refresh brushes");
+    selectMenuItem(3, 0, "File brush");
+    check(ImGui::FindWindowByName("###BrushParameters")->Active,
+          "A TOML-defined tool did not open its parameter panel.");
+    panelClick("###ScriptParameter", 0);
+    selectMenuItem(3, 0, "Custom");
+    panelClick("Export...");
+    replaceDialogText("Project File", "File name", (library / "custom_preserved.toml").string().c_str());
+    clickDialogItem("Project File", "Export");
+    const auto preserved = BrushScriptFile::Load(library / "custom_preserved.toml");
+    check(preserved.name == "legacy" && preserved.script == "1" && preserved.parameters.empty(),
+          "Refreshing the menu or using a preset replaced the Custom editor.");
+
+    menuBrush.name = "Renamed file brush";
+    menuBrush.Save(library / "menu.toml");
+    selectMenuItem(3, 0, "Refresh brushes");
+    selectMenuItem(3, 0, "Renamed file brush");
+    const auto toolsMenuHas = [&](const char* label) {
+        auto* bar = ImGui::FindWindowByName("##MainMenuBar");
+        float x = bar->DC.CursorStartPos.x + ImGui::GetStyle().ItemSpacing.x * 0.5F;
+        for (const auto* name : {"File", "Edit", "Select"}) {
+            x += ImGui::CalcTextSize(name).x + ImGui::GetStyle().ItemSpacing.x * 2.0F;
+        }
+        click(x + ImGui::CalcTextSize("Brushes").x * 0.5F, bar->Pos.y + bar->Size.y * 0.5F);
+        frame();
+        auto* popup = ImGui::GetCurrentContext()->OpenPopupStack.back().Window;
+        bool found = false;
+        for (float y = popup->InnerRect.Min.y + 1; y < popup->InnerRect.Max.y; y += 2) {
+            ImGui::GetIO().AddMousePosEvent(popup->DC.CursorStartPos.x + 20, y);
+            frame();
+            if (ImGui::GetCurrentContext()->HoveredId == popup->GetID(label)) {
+                found = true;
+                break;
+            }
+        }
+        ImGui::GetIO().AddMousePosEvent(1200, 750);
+        ImGui::ClosePopupsOverWindow(nullptr, false);
+        frame();
+        return found;
+    };
+    check(!toolsMenuHas("File brush") && !toolsMenuHas("Broken expression") &&
+          toolsMenuHas("Brush errors"),
+          "Brushes retained a removed name, exposed a broken script, or hid library errors.");
+
+    std::vector<float> original(grid.GetSnapshot()->GetVertices().size(), 100.0F);
+    std::vector<float> feather(original.size());
+    for (std::size_t i = 0; i < feather.size(); ++i) {
+        feather[i] = static_cast<float>(i % 5) / 4.0F;
+    }
+    grid.SetElevations(original);
+    grid.SetSelectionWeights(feather);
+    renderer.UploadGrid(*grid.GetSnapshot());
+    std::vector<std::vector<float>> otherLayers;
+    for (const auto& layer : grid.GetLayers()) {
+        if (layer.get() != &grid.GetElevationLayer()) {
+            const auto values = layer->GetValues();
+            otherLayers.emplace_back(values.begin(), values.end());
+        }
+    }
+    // The library brush must use current controls, not its file defaults.
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+    panelClick("###ScriptParameter", 0);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+    key(ImGuiKey_A);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+    ImGui::GetIO().AddInputCharactersUTF8("80");
+    key(ImGuiKey_Enter);
+    panelClick("Fill selection");
+    const auto filled = grid.GetSnapshot();
+    for (std::size_t i = 0; i < original.size(); ++i) {
+        check(filled->GetVertices()[i].elevation == 100.0F - 20.0F * feather[i] &&
+              filled->GetVertices()[i].selectionWeight == feather[i],
+              "Library fill did not use current parameters or preserve selection feathering.");
+    }
+    std::size_t otherIndex = 0;
+    for (const auto& layer : grid.GetLayers()) {
+        if (layer.get() != &grid.GetElevationLayer()) {
+            check(std::ranges::equal(layer->GetValues(), otherLayers[otherIndex++]),
+                  "Selection fill modified an inactive layer.");
+        }
+    }
+    shortcut(ImGuiKey_Z);
+    for (std::size_t i = 0; i < original.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == original[i],
+              "Selection fill was not undone in one action.");
+    }
+    shortcut(ImGuiKey_Y);
+    for (std::size_t i = 0; i < original.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == filled->GetVertices()[i].elevation,
+              "Redo did not restore the selection fill.");
+    }
+
+    selectMenuItem(3, 0, "Custom");
+    auto customFill = BrushScriptFile::Parse(
+        "name='Custom fill'\napplication='delta'\ncontinuous=true\nscript='rate * elapsed'");
+    importScript(customFill);
+    grid.SetSelectionWeights(feather, false);
+    grid.SetElevations(original);
+    renderer.UploadGrid(*grid.GetSnapshot());
+    panelClick("Fill selection");
+    for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+        check(vertex.elevation == 4196.0F,
+              "Custom fill without selection did not apply one second over the whole layer.");
+    }
+    shortcut(ImGuiKey_Z);
+    for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+        check(vertex.elevation == 100.0F, "Custom fill undo did not restore the layer.");
+    }
+    customFill.script = "sqrt(-1)";
+    importScript(customFill);
+    panelClick("Fill selection");
+    for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+        check(vertex.elevation == 100.0F, "Failed Custom fill changed the layer.");
+    }
+    selectMenuItem(0, 4, "Planet...");
+    planetTab("Geometry");
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+    clickDialogItem("Planet", "Point Count (N)");
+    key(ImGuiKey_A);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+    ImGui::GetIO().AddInputCharactersUTF8("1100");
+    frame();
+    key(ImGuiKey_Enter);
+    replaceDialogText("Planet", "Planet radius (km)", "4000");
+    clickDialogItem("Planet", "Apply");
+    check(!dialogOpen() && grid.GetSnapshot()->GetVertices().size() == 1100 &&
+          grid.GetSnapshot()->GetOptions().pointCount == 1100 &&
+          grid.GetSnapshot()->GetOptions().planetRadius == 4000.0,
+          "Planet Geometry did not regenerate the requested point count with its shared radius.");
 }
 
 } // namespace

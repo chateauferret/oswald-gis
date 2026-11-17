@@ -40,6 +40,45 @@ private:
     FillFilterSettings settings_;
 };
 
+class FillBasinsFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Fill basins"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+};
+
+class AbsoluteMagnitudeNoiseFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Absolute Magnitude Noise"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+    float GetAmplitudeFeet() const { return amplitudeFeet_; }
+    void SetAmplitudeFeet(float amplitude);
+
+private:
+    float amplitudeFeet_ = 100.0F;
+};
+
+struct InciseFlowSettings {
+    double incisionRate = 1.0;
+    double referenceArea = 1.0;
+    double flowExponent = 0.5;
+    double slopeExponent = 1.0;
+    double precipitation = 1.0;
+};
+
+class InciseFlowFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Incise flow"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+    const InciseFlowSettings& GetSettings() const { return settings_; }
+    void SetSettings(const InciseFlowSettings& settings);
+
+private:
+    InciseFlowSettings settings_;
+};
+
 class FilterManager {
 public:
     FilterManager();

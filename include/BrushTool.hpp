@@ -28,7 +28,16 @@ enum class BrushDistanceUnit {
     Miles
 };
 
+inline double PlanetRadiusInUnit(const SphericalGridSnapshot& grid, BrushDistanceUnit unit) {
+    const double radius = grid.GetOptions().planetRadius;
+    return unit == BrushDistanceUnit::Kilometres ? radius : radius / 1.609344;
+}
+
+enum class BrushCoverage { Footprint, Selection };
+
 struct BrushSettings {
+    // Selection coverage ignores the footprint and uses only selection feathering.
+    BrushCoverage coverage = BrushCoverage::Footprint;
     BrushOperation operation = BrushOperation::Replace;
     RaiseLowerOperation raiseLowerOperation = RaiseLowerOperation::Raise;
     BrushDistanceUnit distanceUnit = BrushDistanceUnit::Kilometres;
@@ -73,15 +82,10 @@ struct SimplexNoiseSettings : FractalNoiseSettings {
 };
 
 struct ValueNoiseSettings : FractalNoiseSettings {
-    using Interpolation = noise::Interpolation;
     float amplitude = 1.0F;
-    Interpolation interpolation = Interpolation::Quintic;
 };
 
-struct RidgeNoiseSettings : FractalNoiseSettings {
-    float ridgeOffset = 1.0F;
-    float gainExponent = 1.0F;
-};
+struct RidgeNoiseSettings : FractalNoiseSettings {};
 
 struct PowerLawNoiseSettings : NoiseSettings {
     float frequency = 4.0F;
@@ -107,18 +111,23 @@ struct NoiseSample {
     std::size_t index = 0;
     float elevation = 0.0F; // Value before this dab.
     double weight = 0.0; // Falloff multiplied by selection weight, in (0, 1].
-    double distance = 0.0; // Geodesic distance from the brush centre, in brush units.
+    double distance = 0.0; // Geodesic distance in brush units; zero for selection fills.
 };
 
 // Returns noise in [-1, 1]; values outside it are clamped.
 using NoiseSampler = std::function<double(const NoiseSample&)>;
+
+enum class BrushApplication { Noise, Elevation, Delta };
 
 // Applies a sampler with the noise brushes' operation, output range, domain warp,
 // falloff, and selection weighting. If sampling throws, elevations are unchanged.
 std::vector<std::size_t> ApplyNoiseSampler(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
-    const NoiseSampler& sample);
+    const NoiseSampler& sample, BrushApplication application = BrushApplication::Noise);
+
+double SampleGaussian(const SphericalGridSnapshot& grid, const std::vector<float>& source,
+                      std::size_t index, const GaussianBlurSettings& settings);
 
 class BrushTool {
 public:
@@ -199,6 +208,7 @@ private:
 
 class PowerLawNoiseBrushTool final : public BrushTool {
 public:
+    double Sample(glm::dvec3 position, const PowerLawNoiseSettings& parameters) const;
     std::string_view GetName() const override { return "Power-Law Spectral Noise"; }
     bool IsContinuous() const override { return false; }
     std::vector<std::size_t> Apply(
@@ -249,7 +259,9 @@ private:
 
 class BrushToolManager {
 public:
-    BrushToolManager();
+    BrushToolManager() = default;
+    // Retains the named tool instance (e.g. the Custom editor) after the replacement tools.
+    void ReplaceTools(std::vector<std::unique_ptr<BrushTool>> tools, std::string_view retain = {});
 
     void RegisterTool(std::unique_ptr<BrushTool> tool);
     bool SelectTool(std::string_view name);
@@ -258,8 +270,6 @@ public:
     BrushTool& GetSelectedTool() { return *tools_.at(selectedIndex_); }
     const BrushTool& GetSelectedTool() const { return *tools_.at(selectedIndex_); }
     const std::vector<std::unique_ptr<BrushTool>>& GetTools() const { return tools_; }
-    ElevationBrushTool& GetElevationBrush();
-    const ElevationBrushTool& GetElevationBrush() const;
     BrushSettings& GetSettings() { return settings_; }
     const BrushSettings& GetSettings() const { return settings_; }
 

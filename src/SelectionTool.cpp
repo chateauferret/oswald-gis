@@ -8,8 +8,6 @@
 
 namespace {
 
-constexpr double earthRadiusKilometres = 6371.0;
-constexpr double earthRadiusMiles = 3958.7613;
 
 glm::dvec3 unitDirection(glm::dvec3 direction) {
     const double length = glm::length(direction);
@@ -85,8 +83,7 @@ std::vector<std::size_t> RadiusSelectionTool::Apply(
         throw std::invalid_argument("Selection radius or falloff is invalid.");
     }
     center = unitDirection(center);
-    const double planetRadius = settings.distanceUnit == BrushDistanceUnit::Kilometres
-                                    ? earthRadiusKilometres : earthRadiusMiles;
+    const double planetRadius = PlanetRadiusInUnit(grid, settings.distanceUnit);
     const double innerRadius = settings.radius * (1.0 - settings.falloffPercent / 100.0);
     const auto candidates = grid.FindWithinRadius(center, settings.radius, planetRadius);
     std::vector<std::size_t> changed;

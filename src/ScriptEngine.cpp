@@ -1,10 +1,10 @@
 #include "ScriptEngine.hpp"
 
 #include "Noise.hpp"
+#include "BrushTool.hpp"
 
-// Restrict exprtk to numeric scripting: no strings, file or console I/O.
+// Allow string-valued parameters, but no file or console I/O.
 #define exprtk_disable_caseinsensitivity
-#define exprtk_disable_string_capabilities
 #define exprtk_disable_rtl_io
 #define exprtk_disable_rtl_io_file
 #define exprtk_disable_rtl_vecops
@@ -73,6 +73,7 @@ ScriptError::ScriptError(const std::string& message, std::vector<Diagnostic> dia
 struct ScriptEngine::Impl {
     SymbolTable symbols;
     std::deque<double> ownedVariables;
+    std::deque<std::string> ownedStrings;
     std::deque<FunctionAdapter> functions;
     // exprtk's symbol_exists() does not search variadic functions.
     std::unordered_set<std::string> functionNames;
@@ -123,11 +124,26 @@ struct ScriptEngine::Impl {
     }
 
     void addNoiseFunctions() {
+        auto spectral = std::make_shared<PowerLawNoiseBrushTool>();
+        addFunction("spectral", 6, 6, [this, spectral](std::span<const double> a) {
+            if (!std::isfinite(a[5]) || a[5] != std::floor(a[5]) || a[5] < 8 || a[5] > 128 ||
+                !std::isfinite(a[3]) || a[3] <= 0 || a[3] > 1e6 ||
+                !std::isfinite(a[4]) || a[4] < -4 || a[4] > 8) {
+                throw ScriptError("spectral() needs frequency in (0, 1e6], exponent in [-4, 8], "
+                                  "and a power-of-two resolution in [8, 128].");
+            }
+            PowerLawNoiseSettings settings;
+            settings.seed = noiseSeed;
+            settings.frequency = static_cast<float>(a[3]);
+            settings.spectralExponent = static_cast<float>(a[4]);
+            settings.gridResolution = static_cast<int>(a[5]);
+            return spectral->Sample({a[0], a[1], a[2]}, settings);
+        });
         addFunction("simplex", 3, 3, [this](std::span<const double> a) {
             return noise::Simplex({a[0], a[1], a[2]}, noiseSeed);
         });
         addFunction("valuenoise", 3, 3, [this](std::span<const double> a) {
-            return noise::Value({a[0], a[1], a[2]}, noiseSeed, noise::Interpolation::Quintic);
+            return noise::Value({a[0], a[1], a[2]}, noiseSeed);
         });
         addFunction("fbm", 7, 7, [this](std::span<const double> a) {
             return noise::SimplexFbm({a[0], a[1], a[2]}, noiseSeed, fractalArguments(a, "fbm"));
@@ -138,12 +154,10 @@ struct ScriptEngine::Impl {
             return 2.0 * std::abs(value) - 1.0;
         });
         addFunction("valuefbm", 7, 7, [this](std::span<const double> a) {
-            return noise::ValueFbm({a[0], a[1], a[2]}, noiseSeed, noise::Interpolation::Quintic,
-                                   fractalArguments(a, "valuefbm"));
+            return noise::ValueFbm({a[0], a[1], a[2]}, noiseSeed, fractalArguments(a, "valuefbm"));
         });
-        addFunction("ridged", 9, 9, [this](std::span<const double> a) {
-            return noise::Ridged({a[0], a[1], a[2]}, noiseSeed, fractalArguments(a, "ridged"),
-                                 a[7], a[8]);
+        addFunction("ridged", 7, 7, [this](std::span<const double> a) {
+            return noise::Ridged({a[0], a[1], a[2]}, noiseSeed, fractalArguments(a, "ridged"));
         });
     }
 };
@@ -194,6 +208,18 @@ void ScriptEngine::BindVariable(std::string_view name, double& storage) {
     if (!impl.symbols.add_variable(key, storage)) {
         Impl::invalidName(key);
     }
+}
+
+std::string& ScriptEngine::DefineStringVariable(std::string_view name, std::string initialValue) {
+    auto& impl = checked(impl_);
+    const std::string key(name);
+    impl.checkName(key);
+    auto& storage = impl.ownedStrings.emplace_back(std::move(initialValue));
+    if (!impl.symbols.add_stringvar(key, storage)) {
+        impl.ownedStrings.pop_back();
+        Impl::invalidName(key);
+    }
+    return storage;
 }
 
 void ScriptEngine::DefineConstant(std::string_view name, double value) {

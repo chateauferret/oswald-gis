@@ -1,0 +1,45 @@
+name = "Value Noise"
+description = "FastNoise2 cubic Value noise with fractal octaves and amplitude."
+output = "normalized"
+script = "clamp(-1, valuefbm(x, y, z, Frequency, Lacunarity, Persistence, Octaves) * Amplitude, 1)"
+
+[[parameter]]
+name = "Frequency"
+type = "float"
+control = "slider"
+min = 0.01
+max = 1000000
+scale = "log"
+default = 4
+
+[[parameter]]
+name = "Lacunarity"
+type = "float"
+control = "slider"
+min = 1
+max = 4
+default = 2
+
+[[parameter]]
+name = "Persistence"
+type = "float"
+control = "slider"
+min = 0
+max = 1
+default = 0.5
+
+[[parameter]]
+name = "Octaves"
+type = "integer"
+control = "slider"
+min = 1
+max = 16
+default = 4
+
+[[parameter]]
+name = "Amplitude"
+type = "float"
+control = "slider"
+min = 0
+max = 2
+default = 1

@@ -49,7 +49,7 @@ std::vector<char> readBytes(const std::filesystem::path& path) {
 void testProjects() {
     TemporaryDirectory temporary;
     const auto path = temporary.path / "roundtrip.oswald";
-    SphericalGrid source({1000, 0.6, 123, 1});
+    SphericalGrid source({1000, 0.6, 123, 1, 3000.0});
     source.GetMetadata().description = "A project\nwith multiple layers and adaptive geometry.";
     source.GetMetadata().author = "Test author";
     source.SetSelectionWeights(std::vector<float>(1000, 0.75F));
@@ -85,7 +85,8 @@ void testProjects() {
           after->GetOptions().seed == 123 &&
           after->GetOptions().pointCount == 1000 &&
           after->GetOptions().poissonVariability == 0.6 &&
-          after->GetOptions().relaxationIterations == 1,
+          after->GetOptions().relaxationIterations == 1 &&
+          after->GetOptions().planetRadius == 3000.0,
           "Project geometry or generation options changed on load.");
     for (std::size_t i = 0; i < count; ++i) {
         const auto& a = before->GetVertices()[i];
@@ -151,7 +152,7 @@ void testProjects() {
     bytes[0] = 'X';
     reject(bytes);
     bytes = validBytes;
-    bytes[8] = 2;
+    bytes[8] = 3;
     reject(bytes);
     bytes = validBytes;
     bytes.push_back('X');
@@ -171,12 +172,30 @@ void testProjects() {
         }
         reject(bytes);
     };
-    mutateU32(cursor + 20, 1'000'001);
-    mutateU32(cursor + 32, 0x7fc00000); // Non-finite first coordinate.
-    const auto firstIndex = cursor + 32 + count * 24;
+    mutateU32(cursor + 24, 0x7ff00000); // Non-finite radius (high double word).
+    bytes = validBytes;
+    std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 20),
+              bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 28), 0);
+    reject(bytes); // Zero radius.
+    mutateU32(cursor + 28, 1'000'001);
+    mutateU32(cursor + 40, 0x7fc00000); // Non-finite first coordinate.
+    const auto firstIndex = cursor + 40 + count * 24;
     mutateU32(firstIndex, static_cast<std::uint32_t>(count));
     const auto layersOffset = firstIndex + before->GetTriangleIndices().size() * 4;
     mutateU32(layersOffset + 4, 999);
+    bytes = validBytes;
+    bytes[8] = 1;
+    bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 20),
+                bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 28));
+    const auto legacy = temporary.path / "legacy.oswald";
+    {
+        std::ofstream output(legacy, std::ios::binary);
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto legacyGrid = ProjectFile::Load(legacy);
+    check(legacyGrid->GetSnapshot()->GetOptions().planetRadius == 6371.0 &&
+          legacyGrid->GetSnapshot()->GetTriangleIndices() == before->GetTriangleIndices(),
+          "Version 1 project did not load with the default Earth radius.");
     mutateU32(layersOffset + 8, 99);
     expectFailure([&] { ProjectFile::Load(temporary.path / "missing.oswald"); });
     for (const auto& entry : std::filesystem::directory_iterator(temporary.path)) {

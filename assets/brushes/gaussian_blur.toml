@@ -1,0 +1,33 @@
+name = "Gaussian Blur"
+description = "Smooth elevations using a Gaussian-weighted spherical neighbourhood."
+application = "elevation"
+output = "elevation"
+script = "gaussian(Range, Sigma, 0)"
+
+[[parameter]]
+name = "Units"
+label = "Blur distance unit"
+type = "choice"
+choices = ["Kilometres", "Miles"]
+default = "Kilometres"
+
+[[parameter]]
+name = "Range"
+label = "Blur range"
+units = "Units"
+type = "float"
+control = "slider"
+min = 0.1
+max = 20015.0868
+scale = "log"
+default = 100
+
+[[parameter]]
+name = "Sigma"
+units = "Units"
+type = "float"
+control = "slider"
+min = 0.01
+max = 20015.0868
+scale = "log"
+default = 25

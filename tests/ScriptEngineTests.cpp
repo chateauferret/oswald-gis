@@ -86,6 +86,20 @@ void testVariables() {
           "Invalid identifier was accepted.");
     check(throws<std::invalid_argument>([&] { engine.DefineConstant("fbm", 1.0); }),
           "Built-in noise name was redefined.");
+
+    auto& mode = engine.DefineStringVariable("mode", "one");
+    const auto choiceScript = engine.Compile("mode == 'one' ? 10 : 20");
+    check(choiceScript.Evaluate() == 10.0 && engine.HasSymbol("mode"),
+          "String parameter was not defined.");
+    for (int i = 0; i < 100; ++i) {
+        engine.DefineStringVariable("s" + std::to_string(i));
+    }
+    mode = "two";
+    check(choiceScript.Evaluate() == 20.0, "String parameter storage moved or did not update.");
+    check(throws<std::invalid_argument>([&] { engine.DefineVariable("mode"); }) &&
+          throws<std::invalid_argument>([&] { engine.DefineStringVariable("x"); }) &&
+          throws<std::invalid_argument>([&] { engine.DefineStringVariable("fbm"); }),
+          "String variables did not enforce symbol uniqueness.");
 }
 
 void testFunctions() {
@@ -152,7 +166,7 @@ void testNoiseFunctions() {
     const auto billow = engine.Compile("billow(x, y, z, 4, 2, 0.5, 5)");
     const auto value = engine.Compile("valuenoise(x, y, z)");
     const auto valueFbm = engine.Compile("valuefbm(x, y, z, 4, 2, 0.5, 5)");
-    const auto ridged = engine.Compile("ridged(x, y, z, 4, 2, 0.5, 5, 1, 1.5)");
+    const auto ridged = engine.Compile("ridged(x, y, z, 4, 2, 0.5, 5)");
     const noise::FractalParameters fractal{4.0, 2.0, 0.5, 5};
 
     for (const std::uint64_t seed : {0ULL, 42ULL, 0xfedcba9876543210ULL}) {
@@ -167,12 +181,12 @@ void testNoiseFunctions() {
             check(fbm.Evaluate() == noise::SimplexFbm(p, seed, fractal), "fbm() differs.");
             check(billow.Evaluate() == 2.0 * std::abs(noise::SimplexFbm(p, seed, fractal)) - 1.0,
                   "billow() differs.");
-            check(value.Evaluate() == noise::Value(p, seed, noise::Interpolation::Quintic),
+            check(value.Evaluate() == noise::Value(p, seed),
                   "valuenoise() differs.");
             check(valueFbm.Evaluate() ==
-                      noise::ValueFbm(p, seed, noise::Interpolation::Quintic, fractal),
+                      noise::ValueFbm(p, seed, fractal),
                   "valuefbm() differs.");
-            check(ridged.Evaluate() == noise::Ridged(p, seed, fractal, 1.0, 1.5),
+            check(ridged.Evaluate() == noise::Ridged(p, seed, fractal),
                   "ridged() differs.");
             for (const auto* script : {&simplex, &fbm, &billow, &value, &valueFbm, &ridged}) {
                 const double result = script->Evaluate();
@@ -202,6 +216,8 @@ void testNoiseFunctions() {
           "Infinite frequency was accepted.");
     check(throws<ScriptError>([&] { engine.Compile("simplex(x, y)"); }),
           "Noise call with missing arguments compiled.");
+    check(throws<ScriptError>([&] { engine.Compile("ridged(x, y, z, 4, 2, 0.5, 5, 1, 2)"); }),
+          "Removed ridge offset/gain arguments were silently accepted.");
 }
 
 void testCompileErrors() {
@@ -223,7 +239,11 @@ void testCompileErrors() {
     check(throws<ScriptError>([&] { engine.Compile("x + * 2"); }), "Syntax error compiled.");
     check(throws<ScriptError>([&] { engine.Compile("return [x];"); }),
           "Return statement compiled.");
-    check(throws<ScriptError>([&] { engine.Compile("'text'"); }), "String literal compiled.");
+    check(near(engine.Evaluate("'one' == 'two'"), 0.0), "String comparison failed.");
+    check(throws<ScriptError>([&] { engine.Compile("println('text')"); }),
+          "Console I/O was enabled.");
+    check(throws<ScriptError>([&] { engine.Compile("open('file')"); }),
+          "File I/O was enabled.");
 }
 
 void testLoopLimit() {

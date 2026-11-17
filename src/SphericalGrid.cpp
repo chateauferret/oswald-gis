@@ -30,6 +30,9 @@ glm::dvec3 unitDirection(glm::dvec3 direction) {
 }
 
 void validateOptions(const GridOptions& options) {
+    if (!std::isfinite(options.planetRadius) || options.planetRadius <= 0.0) {
+        throw std::invalid_argument("Planet radius must be finite and positive.");
+    }
     if (options.pointCount < 1000 || options.pointCount > 1'000'000) {
         throw std::invalid_argument("Point count must be between 1,000 and 1,000,000.");
     }
@@ -1016,6 +1019,24 @@ void SphericalGrid::InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot>
             layer->SetElevations(ValuesForLayer(*layer, *snapshot, *previous));
         }
     }
+    snapshot_.store(std::move(snapshot));
+}
+
+void SphericalGrid::SetPlanetRadius(double radiusKilometres) {
+    if (!std::isfinite(radiusKilometres) || radiusKilometres <= 0.0) {
+        throw std::invalid_argument("Planet radius must be finite and positive.");
+    }
+    const auto current = GetSnapshot();
+    if (current->GetOptions().planetRadius == radiusKilometres) {
+        return;
+    }
+    std::vector<float> elevations;
+    elevations.reserve(current->GetVertices().size());
+    for (const auto& vertex : current->GetVertices()) {
+        elevations.push_back(vertex.elevation);
+    }
+    auto snapshot = std::make_shared<SphericalGridSnapshot>(*current, elevations);
+    snapshot->options_.planetRadius = radiusKilometres;
     snapshot_.store(std::move(snapshot));
 }
 

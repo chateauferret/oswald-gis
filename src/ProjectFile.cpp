@@ -18,7 +18,7 @@ static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
 static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
 
 constexpr std::array<char, 8> magic{'O', 'S', 'W', 'A', 'L', 'D', '\r', '\n'};
-constexpr std::uint32_t version = 1;
+constexpr std::uint32_t version = 2;
 constexpr std::uint32_t maxString = 1'048'576;
 constexpr std::uint32_t maxLayers = 1024;
 constexpr auto noActiveLayer = std::numeric_limits<std::uint32_t>::max();
@@ -165,6 +165,7 @@ void ProjectFile::Save(const std::filesystem::path& path, SphericalGrid& grid) {
     writer.Double(options.poissonVariability);
     writer.U32(options.seed);
     writer.U32(options.relaxationIterations);
+    writer.Double(options.planetRadius);
     const auto& vertices = snapshot->GetVertices();
     writer.U32(static_cast<std::uint32_t>(vertices.size()));
     writer.U32(static_cast<std::uint32_t>(snapshot->GetTriangleIndices().size()));
@@ -212,7 +213,8 @@ std::unique_ptr<SphericalGrid> ProjectFile::Load(const std::filesystem::path& pa
     Reader reader(path);
     std::array<char, 8> header{};
     reader.Bytes(header.data(), header.size());
-    if (header != magic || reader.U32() != version) {
+    const auto fileVersion = reader.U32();
+    if (header != magic || (fileVersion != 1 && fileVersion != version)) {
         throw std::runtime_error("Not an Oswald project or unsupported project version.");
     }
     ProjectMetadata metadata{reader.String(), reader.String(), reader.String()};
@@ -221,9 +223,12 @@ std::unique_ptr<SphericalGrid> ProjectFile::Load(const std::filesystem::path& pa
     options.poissonVariability = reader.Double();
     options.seed = reader.U32();
     options.relaxationIterations = reader.U32();
+    if (fileVersion >= 2) {
+        options.planetRadius = reader.Double();
+    }
     if (options.pointCount < 1000 || options.pointCount > 1'000'000 ||
         options.poissonVariability < 0 || options.poissonVariability > 1 ||
-        options.relaxationIterations > 100) {
+        options.relaxationIterations > 100 || options.planetRadius <= 0.0) {
         throw std::runtime_error("Project grid options are invalid.");
     }
     const auto count = reader.U32();

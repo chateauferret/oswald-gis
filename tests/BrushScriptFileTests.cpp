@@ -97,6 +97,103 @@ void testOutputMode() {
           "An unset output mode was written.");
 }
 
+void testParameters() {
+    const auto file = BrushScriptFile::Parse(
+        "name='parameters'\nscript=\"mode == 'one' ? amount + count : 0\"\n"
+        "[[parameter]]\nname='amount'\ntype='float'\ncontrol='slider'\n"
+        "min='0.1'\nmax='100'\nscale='log'\ndefault='4'\n"
+        "[[parameter]]\nname='count'\ntype='integer'\ncontrol='spin'\n"
+        "min=0\nmax=30\ndefault=5\n"
+        "[[parameter]]\nname='mode'\ntype='choice'\nchoices=['one','two']\ndefault='one'\n"
+        "[[parameter]]\nname='offset'\ntype='float'\ncontrol='text'\n"
+        "min=-10.5\nmax=10.5\ndefault=0.25\n");
+    check(file.parameters.size() == 4 &&
+          file.parameters[0].scale == ScriptParameter::Scale::Log &&
+          std::get<double>(file.parameters[0].defaultValue) == 4.0 &&
+          file.parameters[1].type == ScriptParameter::Type::Integer &&
+          file.parameters[1].control == ScriptParameter::Control::Spin &&
+          file.parameters[2].choices == std::vector<std::string>{"one", "two"} &&
+          std::get<std::string>(file.parameters[2].defaultValue) == "one" &&
+          file.parameters[3].control == ScriptParameter::Control::Text &&
+          file.parameters[3].scale == ScriptParameter::Scale::Linear,
+          "Parameter definitions did not parse.");
+    const auto parsed = BrushScriptFile::Parse(file.ToToml());
+    check(parsed.parameters == file.parameters && parsed.script == file.script,
+          "Parameter definitions/defaults did not round-trip.");
+    check(BrushScriptFile::Parse("name='a'\nscript='1'").parameters.empty(),
+          "Legacy script unexpectedly acquired parameters.");
+
+    const std::string header = "name='bad'\nscript='1'\n";
+    const std::string number = "[[parameter]]\nname='amount'\ntype='float'\ncontrol='slider'\n";
+    for (const auto* invalid : {
+             "min=0\nmax=1\ndefault=2", "min=1\nmax=1\ndefault=1",
+             "min=2\nmax=1\ndefault=1", "min='no'\nmax=1\ndefault=0",
+             "min=nan\nmax=1\ndefault=0", "min=0\nmax=inf\ndefault=0",
+             "min=0\nmax=1.7e308\ndefault=0",
+             "min=0\nmax=1\ndefault='nan'", "min=0\nmax=1",
+             "max=1\ndefault=0", "min=0\nmax=1\ndefault=0\nscale='bad'",
+             "min=0\nmax=1\ndefault=0\nscale='log'",
+             "min=0\nmax=1\ndefault=0\nchoices=['one']"}) {
+        check(throws([&] { BrushScriptFile::Parse(header + number + invalid); }),
+              "Invalid numeric parameter accepted.");
+    }
+    const std::string integer = "[[parameter]]\nname='count'\ntype='integer'\ncontrol='text'\n";
+    for (const auto* invalid : {"min=0\nmax=5\ndefault=1.5", "min=0.5\nmax=5\ndefault=1",
+                               "min=0\nmax=2147483648\ndefault=1",
+                               "min=0\nmax=5\ndefault=1\nscale='linear'"}) {
+        check(throws([&] { BrushScriptFile::Parse(header + integer + invalid); }),
+              "Invalid integer parameter accepted.");
+    }
+    const std::string choice = "[[parameter]]\nname='mode'\ntype='choice'\n";
+    for (const auto* invalid : {"choices=[]\ndefault='one'", "choices=['one']\ndefault='two'",
+                               "choices=['one','one']\ndefault='one'",
+                               "choices=[1]\ndefault='one'", "default='one'",
+                               "choices=['one']\ndefault=0",
+                               "choices=['one']\ndefault='one'\ncontrol='text'"}) {
+        check(throws([&] { BrushScriptFile::Parse(header + choice + invalid); }),
+              "Invalid choice parameter accepted.");
+    }
+    for (const auto* name : {"x", "lat", "lower", "fbm", "sin", "pi", "while", "two words", "2x", ""}) {
+        check(throws([&] {
+            BrushScriptFile::Parse(header + "[[parameter]]\nname='" + name +
+                                   "'\ntype='integer'\ncontrol='slider'\nmin=0\nmax=5\ndefault=1");
+        }), "Invalid or reserved parameter name accepted.");
+    }
+    check(throws([&] { BrushScriptFile::Parse(header + number + "min=0\nmax=1\ndefault=0\n" +
+                                             number + "min=0\nmax=1\ndefault=0"); }),
+          "Duplicate parameter names accepted.");
+    for (const auto* invalid : {"parameter=1", "parameter=[1]",
+                               "[[parameter]]\nname='a'\ntype='unknown'",
+                               "[[parameter]]\nname='a'\ntype='float'\ncontrol='unknown'"}) {
+        check(throws([&] { BrushScriptFile::Parse(header + invalid); }),
+              "Invalid parameter structure accepted.");
+    }
+}
+
+void testBrushBehaviorMetadata() {
+    const auto file = BrushScriptFile::Parse(
+        "name='continuous'\napplication='delta'\ncontinuous=true\nscript='rate * elapsed'\n"
+        "[[parameter]]\nname='Units'\ntype='choice'\nchoices=['Kilometres','Miles']\ndefault='Miles'\n"
+        "[[parameter]]\nname='range_km'\nlabel='Blur range'\nunits='Units'\ntype='float'\n"
+        "control='slider'\nmin=0.1\nmax=20000\ndefault=100\n");
+    const auto parsed = BrushScriptFile::Parse(file.ToToml());
+    check(parsed.application == BrushApplication::Delta && parsed.continuous &&
+          parsed.parameters == file.parameters && parsed.parameters[1].label == "Blur range",
+          "Brush metadata, parameter labels or distance display units did not round-trip.");
+    check(BrushScriptFile::Parse("name='a'\nscript='1'").application == BrushApplication::Noise &&
+          !BrushScriptFile::Parse("name='a'\nscript='1'").continuous,
+          "Existing files no longer default to one-shot noise brushes.");
+    for (const auto* invalid : {"application='bad'", "application=1", "continuous='true'", "continuous=1"}) {
+        check(throws([&] { BrushScriptFile::Parse(std::string("name='a'\nscript='1'\n") + invalid); }),
+              "Invalid brush behavior metadata accepted.");
+    }
+    check(throws([] {
+        BrushScriptFile::Parse(
+            "name='a'\nscript='1'\n[[parameter]]\nname='range_km'\nunits='missing'\n"
+            "type='float'\ncontrol='slider'\nmin=0\nmax=1\ndefault=0");
+    }), "Invalid parameter unit reference accepted.");
+}
+
 void testFileNames() {
     check(BrushScriptFileName("fbm") == "fbm.toml", "Simple name changed.");
     check(BrushScriptFileName("my ridges/2") == "my_ridges_2.toml", "Unsafe name not sanitised.");
@@ -153,6 +250,8 @@ int main() {
         testRejectsInvalidFiles();
         testRoundTrip();
         testOutputMode();
+        testParameters();
+        testBrushBehaviorMetadata();
         testFileNames();
         testSaveLoadAndScan();
         testShippedLibrary();

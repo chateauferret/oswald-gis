@@ -1,0 +1,13 @@
+name="constant"
+description="Paint constant values"
+output="elevation"
+script="value"
+
+[[parameter]]
+name="value"
+type="float"
+control="slider"
+min="-32767.0"
+max="32767.0"
+scale="linear"
+default="0.0"

@@ -82,6 +82,9 @@ private:
     void RenderValueSelectionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderFillFilterDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderInciseFlowDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderPrecipitonDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderThermalWeatheringDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderGlacialErosionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderAbsoluteMagnitudeNoiseDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void ApplyTerrainFilter(const Filter& filter, SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer);
@@ -148,6 +151,15 @@ private:
     bool inciseFlowOpen_ = false;
     InciseFlowSettings pendingInciseFlowSettings_;
     std::string inciseFlowError_;
+    bool precipitonOpen_ = false;
+    PrecipitonSettings pendingPrecipitonSettings_;
+    std::string precipitonError_;
+    bool thermalWeatheringOpen_ = false;
+    ThermalWeatheringSettings pendingThermalWeatheringSettings_;
+    std::string thermalWeatheringError_;
+    bool glacialErosionOpen_ = false;
+    GlacialErosionSettings pendingGlacialErosionSettings_;
+    std::string glacialErosionError_;
     bool absoluteMagnitudeNoiseOpen_ = false;
     float pendingNoiseAmplitudeFeet_ = 100.0F;
     std::string absoluteMagnitudeNoiseError_;

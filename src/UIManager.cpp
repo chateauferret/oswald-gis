@@ -1348,6 +1348,147 @@ void UIManager::RenderInciseFlowDialog(SphericalGrid& grid, GlobeRenderer& rende
     ImGui::EndPopup();
 }
 
+void UIManager::RenderPrecipitonDialog(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (precipitonOpen_) {
+        ImGui::OpenPopup("Precipiton Diffusion");
+        precipitonOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Precipiton Diffusion", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputDouble("Diffusion coefficient (km/pass)",
+                       &pendingPrecipitonSettings_.diffusionCoefficient, 0.0, 0.0, "%.6g");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 560.0F);
+    ImGui::TextWrapped("One simultaneous pass applies k * sum((neighbor elevation - current elevation) / great-circle distance) over each vertex's Delaunay 1-ring. Distances use the planet radius in kilometres.");
+    ImGui::TextWrapped("The coefficient must be finite and non-negative. Sea-level/ocean sinks and unselected outlets remain fixed; when there are no outlets, global-minimum vertices are fixed. Selection weights blend the final diffusion, and elevations are limited to [-32767, 32767] m.");
+    if (!precipitonError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", precipitonError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<PrecipitonFilter&>(
+                filters_.GetFilter("Precipiton diffusion"));
+            filter.SetSettings(pendingPrecipitonSettings_);
+            ApplyTerrainFilter(filter, grid, renderer);
+            precipitonError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            precipitonError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        precipitonError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void UIManager::RenderThermalWeatheringDialog(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (thermalWeatheringOpen_) {
+        ImGui::OpenPopup("Thermal Weathering");
+        thermalWeatheringOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Thermal Weathering", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputDouble("Angle of repose (degrees)",
+                       &pendingThermalWeatheringSettings_.angleOfReposeDegrees,
+                       0.0, 0.0, "%.6g");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 560.0F);
+    ImGui::TextWrapped("One simultaneous pass transfers half the excess height across each Delaunay edge whose slope exceeds tan(theta): 0.5 * (high - low - distance * tan(theta)). Distances are great-circle kilometres and elevations are metres.");
+    ImGui::TextWrapped("The angle must be finite and in [0, 90) degrees; typical values are 30 to 40 degrees. Sea-level/ocean sinks and unselected outlets remain fixed. Selection weights blend the final displacement, and elevations are limited to [-32767, 32767] m.");
+    if (!thermalWeatheringError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", thermalWeatheringError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<ThermalWeatheringFilter&>(
+                filters_.GetFilter("Thermal weathering"));
+            filter.SetSettings(pendingThermalWeatheringSettings_);
+            ApplyTerrainFilter(filter, grid, renderer);
+            thermalWeatheringError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            thermalWeatheringError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        thermalWeatheringError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void UIManager::RenderGlacialErosionDialog(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (glacialErosionOpen_) {
+        ImGui::OpenPopup("Glacial Erosion");
+        glacialErosionOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Glacial Erosion", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputDouble("Equator ELA (m)",
+        &pendingGlacialErosionSettings_.equilibriumLineAltitude, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("ELA drop per latitude degree (m)",
+        &pendingGlacialErosionSettings_.elaLatitudeGradient, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Accumulation rate", &pendingGlacialErosionSettings_.accumulationRate,
+        0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Ablation rate", &pendingGlacialErosionSettings_.ablationRate,
+        0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Initial ice thickness (m)",
+        &pendingGlacialErosionSettings_.initialIceThickness, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Duration (years)", &pendingGlacialErosionSettings_.durationYears,
+        0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Glacial erodibility (Kg)",
+        &pendingGlacialErosionSettings_.glacialErodibility, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Ice viscosity factor (Bg)",
+        &pendingGlacialErosionSettings_.iceViscosityFactor, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Ice thickness exponent (a)",
+        &pendingGlacialErosionSettings_.thicknessExponent, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Velocity exponent (b)",
+        &pendingGlacialErosionSettings_.velocityExponent, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Trough half-width (km)",
+        &pendingGlacialErosionSettings_.troughHalfWidth, 0.0, 0.0, "%.6g");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 600.0F);
+    ImGui::TextWrapped("One pass computes latitude-dependent ELA, updates ice mass balance from the configured initial thickness, routes ice down every lower 1-ring neighbor, and applies Glen-law erosion. Erosion is distributed over the orthogonal 1-ring profile with normalized parabolic weights; isostatic depression uses ice/mantle densities 917/3300.");
+    ImGui::TextWrapped("All rates, thicknesses, exponents, and duration must be finite and non-negative; trough width must be finite and positive. Sea-level/ocean sinks and unselected outlets remain fixed; selection weights blend the final displacement. Updated elevations are limited to [-32767, 32767] m.");
+    if (!glacialErosionError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", glacialErosionError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<GlacialErosionFilter&>(
+                filters_.GetFilter("Glacial erosion"));
+            filter.SetSettings(pendingGlacialErosionSettings_);
+            ApplyTerrainFilter(filter, grid, renderer);
+            glacialErosionError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            glacialErosionError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        glacialErosionError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void UIManager::ApplyActiveLayerColorMaps(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (!grid.HasActiveLayer()) {
         renderer.ClearLayerStack();
@@ -2582,6 +2723,27 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                     inciseFlowError_.clear();
                     inciseFlowOpen_ = true;
                 }
+                if (ImGui::MenuItem("Precipiton diffusion...")) {
+                    const auto& filter = dynamic_cast<const PrecipitonFilter&>(
+                        filters_.GetFilter("Precipiton diffusion"));
+                    pendingPrecipitonSettings_ = filter.GetSettings();
+                    precipitonError_.clear();
+                    precipitonOpen_ = true;
+                }
+                if (ImGui::MenuItem("Thermal weathering...")) {
+                    const auto& filter = dynamic_cast<const ThermalWeatheringFilter&>(
+                        filters_.GetFilter("Thermal weathering"));
+                    pendingThermalWeatheringSettings_ = filter.GetSettings();
+                    thermalWeatheringError_.clear();
+                    thermalWeatheringOpen_ = true;
+                }
+                if (ImGui::MenuItem("Glacial erosion...")) {
+                    const auto& filter = dynamic_cast<const GlacialErosionFilter&>(
+                        filters_.GetFilter("Glacial erosion"));
+                    pendingGlacialErosionSettings_ = filter.GetSettings();
+                    glacialErosionError_.clear();
+                    glacialErosionOpen_ = true;
+                }
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Absolute Magnitude Noise...", nullptr, false,
@@ -2927,6 +3089,14 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     RenderFillFilterDialog(grid, renderer);
     const bool inciseFlowDialog = inciseFlowOpen_ || ImGui::IsPopupOpen("Incise Flow");
     RenderInciseFlowDialog(grid, renderer);
+    const bool precipitonDialog = precipitonOpen_ || ImGui::IsPopupOpen("Precipiton Diffusion");
+    RenderPrecipitonDialog(grid, renderer);
+    const bool thermalWeatheringDialog = thermalWeatheringOpen_ ||
+        ImGui::IsPopupOpen("Thermal Weathering");
+    RenderThermalWeatheringDialog(grid, renderer);
+    const bool glacialErosionDialog = glacialErosionOpen_ ||
+        ImGui::IsPopupOpen("Glacial Erosion");
+    RenderGlacialErosionDialog(grid, renderer);
     const bool noiseDialog = absoluteMagnitudeNoiseOpen_ ||
         ImGui::IsPopupOpen("Absolute Magnitude Noise");
     RenderAbsoluteMagnitudeNoiseDialog(grid, renderer);
@@ -2948,12 +3118,16 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     }
     if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings") &&
         !valueSelectionDialog && !fillFilterDialog && !fillBasinsDialog &&
-        !inciseFlowDialog && !noiseDialog && !projectModal) {
+        !inciseFlowDialog && !precipitonDialog && !thermalWeatheringDialog &&
+        !glacialErosionDialog &&
+        !noiseDialog && !projectModal) {
         RenderBrushPanel(grid, renderer);
         RenderSelectionPanel();
     }
     if (!valueSelectionDialog && !fillFilterDialog && !fillBasinsDialog &&
-        !inciseFlowDialog && !noiseDialog && !projectModal) {
+        !inciseFlowDialog && !precipitonDialog && !thermalWeatheringDialog &&
+        !glacialErosionDialog &&
+        !noiseDialog && !projectModal) {
         ProcessBrushInput(grid, renderer, modelMatrix, zoom);
         ProcessSelectionInput(grid, renderer, modelMatrix, zoom);
     }

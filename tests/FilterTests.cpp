@@ -104,10 +104,13 @@ void testValidationAndPluginRegistration() {
                   "Fill filter accepted a mismatched elevation buffer.");
 
     FilterManager manager;
-    check(manager.GetFilters().size() == 4 &&
+        check(manager.GetFilters().size() == 7 &&
           manager.GetFilter("Fill").GetName() == "Fill" &&
           manager.GetFilter("Fill basins").GetName() == "Fill basins" &&
           manager.GetFilter("Incise flow").GetName() == "Incise flow" &&
+            manager.GetFilter("Precipiton diffusion").GetName() == "Precipiton diffusion" &&
+              manager.GetFilter("Thermal weathering").GetName() == "Thermal weathering" &&
+              manager.GetFilter("Glacial erosion").GetName() == "Glacial erosion" &&
           manager.GetFilter("Absolute Magnitude Noise").GetName() == "Absolute Magnitude Noise",
           "Filter manager did not register or return the built-in plugins.");
     expectInvalid([&] { manager.RegisterFilter(std::make_unique<FillFilter>()); },
@@ -448,6 +451,405 @@ void testInciseFlowValidation() {
         check(overflow && elevations == original,
               "Incise flow failed to report numeric overflow without changing input.");
     }
+    }
+
+    void testPrecipitonDiffusion() {
+        SphericalGrid model({1000, 0.0, 96});
+        const auto size = model.GetSnapshot()->GetVertices().size();
+        model.SetPlanetRadius(1200.0);
+        std::vector<float> elevations(size);
+        for (std::size_t i = 0; i < size; ++i) {
+            elevations[i] = i % 23 == 0 ? -100.0F :
+                500.0F + static_cast<float>((i * 193) % 4000);
+        }
+        PrecipitonFilter filter;
+        const PrecipitonSettings settings{0.75};
+        filter.SetSettings(settings);
+
+        const auto verify = [&](const SphericalGridSnapshot& snapshot) {
+            const auto& vertices = snapshot.GetVertices();
+            std::vector<double> laplacian(size, 0.0);
+            const auto& edges = snapshot.GetHalfEdges();
+            for (const auto& edge : edges) {
+                const auto source = static_cast<std::size_t>(edge.originVertex);
+                if (elevations[source] <= 0.0F ||
+                    (snapshot.HasSelection() && vertices[source].selectionWeight == 0.0F)) {
+                    continue;
+                }
+                const auto target = static_cast<std::size_t>(
+                    edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+                const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+                const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+                const double distance = snapshot.GetOptions().planetRadius *
+                    std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
+                laplacian[source] += (static_cast<double>(elevations[target]) - elevations[source]) /
+                    distance;
+            }
+            const auto original = elevations;
+            const auto result = filter.Apply(snapshot, elevations);
+            bool raised = false;
+            bool lowered = false;
+            for (std::size_t i = 0; i < size; ++i) {
+                double expected = elevations[i];
+                if (elevations[i] > 0.0F &&
+                    (!snapshot.HasSelection() || vertices[i].selectionWeight > 0.0F)) {
+                    const double target = std::clamp(elevations[i] + settings.diffusionCoefficient * laplacian[i],
+                        -32767.0, 32767.0);
+                    const double weight = snapshot.HasSelection() ? vertices[i].selectionWeight : 1.0;
+                    expected += (target - elevations[i]) * weight;
+                }
+                check(std::abs(result[i] - static_cast<float>(expected)) < 0.001F,
+                      "Precipiton diffusion disagreed with the distance-weighted Laplacian.");
+                check(result[i] >= -32767.0F && result[i] <= 32767.0F,
+                      "Precipiton diffusion exceeded supported elevation limits.");
+                if (elevations[i] <= 0.0F ||
+                    (snapshot.HasSelection() && vertices[i].selectionWeight == 0.0F)) {
+                    check(result[i] == elevations[i], "Precipiton diffusion changed a fixed sink.");
+                }
+                raised |= result[i] > elevations[i];
+                lowered |= result[i] < elevations[i];
+            }
+            check(raised && lowered, "Precipiton diffusion fixture did not exercise smoothing.");
+            check(original == elevations, "Precipiton diffusion modified its input buffer.");
+        };
+
+        verify(*model.GetSnapshot());
+        std::vector<float> weights(size, 1.0F);
+        for (std::size_t i = 0; i < size; ++i) {
+            if (i % 5 == 0) weights[i] = 0.0F;
+            else if (i % 3 == 0) weights[i] = 0.25F;
+        }
+        model.SetSelectionWeights(weights);
+        verify(*model.GetSnapshot());
+
+        filter.SetSettings({0.0});
+        check(filter.Apply(*model.GetSnapshot(), elevations) == elevations,
+              "A zero precipiton coefficient changed terrain.");
+        for (const double invalid : {-1.0, std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::infinity()}) {
+            expectInvalid([&] { filter.SetSettings({invalid}); },
+                          "Precipiton diffusion accepted an invalid coefficient.");
+        }
+        filter.SetSettings({std::numeric_limits<double>::max()});
+        bool overflow = false;
+        try {
+            filter.Apply(*model.GetSnapshot(), elevations);
+        } catch (const std::overflow_error&) {
+            overflow = true;
+        }
+        check(overflow && elevations.size() == size,
+              "Precipiton diffusion failed to report numeric overflow.");
+}
+
+void testThermalWeathering() {
+    SphericalGrid model({1000, 0.0, 100});
+    model.SetPlanetRadius(1200.0);
+    const auto size = model.GetSnapshot()->GetVertices().size();
+    std::vector<float> elevations(size, 100.0F);
+    elevations[0] = -50.0F; // Fixed ocean sink.
+    const auto& edges = model.GetSnapshot()->GetHalfEdges();
+    std::vector<std::vector<std::size_t>> adjacency(size);
+    for (const auto& edge : edges) {
+        const auto first = static_cast<std::size_t>(edge.originVertex);
+        const auto second = static_cast<std::size_t>(
+            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+        adjacency[first].push_back(second);
+    }
+    for (const auto neighbor : adjacency[1]) {
+        elevations[1] = 1000.0F;
+        elevations[neighbor] = std::max(elevations[neighbor], 100.0F);
+    }
+
+    ThermalWeatheringFilter filter;
+    const ThermalWeatheringSettings settings{30.0};
+    filter.SetSettings(settings);
+    const auto verify = [&](const SphericalGridSnapshot& snapshot) {
+        const auto& vertices = snapshot.GetVertices();
+        const auto sinks = [&] {
+            std::vector<bool> fixed(size, false);
+            bool hasSink = false;
+            for (std::size_t i = 0; i < size; ++i) {
+                fixed[i] = elevations[i] <= 0.0F ||
+                    (snapshot.HasSelection() && vertices[i].selectionWeight == 0.0F);
+                hasSink |= fixed[i];
+            }
+            if (!hasSink) {
+                const auto minimum = *std::min_element(elevations.begin(), elevations.end());
+                for (std::size_t i = 0; i < size; ++i) fixed[i] = elevations[i] == minimum;
+            }
+            return fixed;
+        }();
+        std::vector<double> displacement(size, 0.0);
+        const double reposeSlope = std::tan(settings.angleOfReposeDegrees * std::acos(-1.0) / 180.0);
+        for (std::size_t first = 0; first < size; ++first) {
+            for (const auto second : adjacency[first]) {
+                if (first >= second || sinks[first] || sinks[second] ||
+                    elevations[first] == elevations[second]) continue;
+                const auto high = elevations[first] > elevations[second] ? first : second;
+                const auto low = high == first ? second : first;
+                const auto from = glm::normalize(glm::dvec3(vertices[high].position));
+                const auto to = glm::normalize(glm::dvec3(vertices[low].position));
+                const double distance = snapshot.GetOptions().planetRadius *
+                    std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
+                const double excess = elevations[high] - elevations[low] - distance * reposeSlope;
+                if (excess > 0.0) {
+                    const double transfer = 0.5 * excess;
+                    displacement[high] -= transfer;
+                    displacement[low] += transfer;
+                }
+            }
+        }
+        const auto original = elevations;
+        const auto result = filter.Apply(snapshot, elevations);
+        bool lowered = false;
+        bool raised = false;
+        for (std::size_t i = 0; i < size; ++i) {
+            double expected = elevations[i];
+            if (!sinks[i]) {
+                const double target = std::clamp(elevations[i] + displacement[i],
+                    -32767.0, 32767.0);
+                const double weight = snapshot.HasSelection() ? vertices[i].selectionWeight : 1.0;
+                expected += (target - elevations[i]) * weight;
+            }
+            check(std::abs(result[i] - static_cast<float>(expected)) < 0.001F,
+                  "Thermal weathering disagreed with pairwise repose transfer.");
+            check(result[i] >= -32767.0F && result[i] <= 32767.0F,
+                  "Thermal weathering exceeded supported elevation limits.");
+            if (sinks[i]) {
+                check(result[i] == elevations[i], "Thermal weathering changed a fixed sink.");
+            }
+            lowered |= result[i] < elevations[i];
+            raised |= result[i] > elevations[i];
+        }
+        check(lowered && raised, "Thermal weathering fixture did not transfer material.");
+        check(original == elevations, "Thermal weathering modified its input buffer.");
+    };
+
+    verify(*model.GetSnapshot());
+    std::vector<float> weights(size, 1.0F);
+    for (std::size_t i = 0; i < size; ++i) {
+        if (i % 5 == 0) weights[i] = 0.0F;
+        else if (i % 3 == 0) weights[i] = 0.5F;
+    }
+    model.SetSelectionWeights(weights);
+    verify(*model.GetSnapshot());
+
+    filter.SetSettings({89.0});
+    check(filter.Apply(*model.GetSnapshot(), elevations) == elevations,
+          "A high repose angle unexpectedly moved terrain.");
+    for (const double invalid : {-1.0, 90.0, std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::infinity()}) {
+        expectInvalid([&] { filter.SetSettings({invalid}); },
+                      "Thermal weathering accepted an invalid repose angle.");
+    }
+    const auto snapshot = model.GetSnapshot();
+    expectInvalid([&] { filter.Apply(*snapshot, std::span<const float>(elevations).first(1)); },
+                  "Thermal weathering accepted a mismatched elevation count.");
+}
+
+void testGlacialErosion() {
+    SphericalGrid model({1000, 0.0, 100});
+    model.SetPlanetRadius(900.0);
+    const auto size = model.GetSnapshot()->GetVertices().size();
+    std::vector<float> elevations(size);
+    for (std::size_t i = 0; i < size; ++i) {
+        elevations[i] = i % 19 == 0 ? -100.0F :
+            300.0F + static_cast<float>((i * 193) % 2600);
+    }
+    GlacialErosionSettings settings;
+    settings.equilibriumLineAltitude = 1200.0;
+    settings.elaLatitudeGradient = 8.0;
+    settings.accumulationRate = 0.015;
+    settings.ablationRate = 0.025;
+    settings.initialIceThickness = 20.0;
+    settings.durationYears = 3.0;
+    settings.glacialErodibility = 0.0002;
+    settings.iceViscosityFactor = 0.003;
+    settings.thicknessExponent = 1.0;
+    settings.velocityExponent = 2.0;
+    settings.troughHalfWidth = 1500.0;
+    GlacialErosionFilter filter;
+    filter.SetSettings(settings);
+
+    const auto verify = [&](const SphericalGridSnapshot& snapshot) {
+        const auto& vertices = snapshot.GetVertices();
+        std::vector<bool> sinks(size, false);
+        bool hasSink = false;
+        for (std::size_t i = 0; i < size; ++i) {
+            sinks[i] = elevations[i] <= 0.0F ||
+                (snapshot.HasSelection() && vertices[i].selectionWeight == 0.0F);
+            hasSink |= sinks[i];
+        }
+        if (!hasSink) {
+            const auto minimum = *std::min_element(elevations.begin(), elevations.end());
+            for (std::size_t i = 0; i < size; ++i) sinks[i] = elevations[i] == minimum;
+        }
+        struct TestNeighbor {
+            std::size_t index;
+            double distance;
+            glm::dvec3 tangent;
+        };
+        std::vector<std::vector<TestNeighbor>> adjacency(size);
+        const auto& edges = snapshot.GetHalfEdges();
+        for (const auto& edge : edges) {
+            const auto source = static_cast<std::size_t>(edge.originVertex);
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+            const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+            const auto cosine = std::clamp(glm::dot(from, to), -1.0, 1.0);
+            const double distance = snapshot.GetOptions().planetRadius * std::acos(cosine);
+            const auto tangent = to - cosine * from;
+            adjacency[source].push_back({target, distance, glm::normalize(tangent)});
+        }
+        std::vector<double> thickness(size, settings.initialIceThickness);
+        std::vector<double> surface(size);
+        for (std::size_t i = 0; i < size; ++i) {
+            const auto position = glm::normalize(glm::dvec3(vertices[i].position));
+            const double latitude = std::asin(std::clamp(position.z, -1.0, 1.0)) *
+                (180.0 / std::acos(-1.0));
+            const double ela = settings.equilibriumLineAltitude -
+                settings.elaLatitudeGradient * std::abs(latitude);
+            const double initialSurface = elevations[i] + thickness[i];
+            const double balance = settings.accumulationRate *
+                    std::max(0.0, initialSurface - ela) -
+                settings.ablationRate * std::max(0.0, ela - initialSurface);
+            thickness[i] = std::max(0.0, thickness[i] + settings.durationYears * balance);
+            surface[i] = elevations[i] + thickness[i];
+        }
+        std::vector<double> rates(size, 0.0);
+        std::vector<glm::dvec3> directions(size, glm::dvec3(0.0));
+        for (std::size_t i = 0; i < size; ++i) {
+            if (sinks[i] || thickness[i] <= 0.0) continue;
+            double maxSlope = 0.0;
+            double fallbackSlope = 0.0;
+            glm::dvec3 flow(0.0), fallback(0.0);
+            for (const auto& neighbor : adjacency[i]) {
+                if (surface[i] <= surface[neighbor.index]) continue;
+                const double slope = (surface[i] - surface[neighbor.index]) / neighbor.distance;
+                flow += neighbor.tangent * slope;
+                if (slope > fallbackSlope) {
+                    fallbackSlope = slope;
+                    fallback = neighbor.tangent;
+                }
+                maxSlope = std::max(maxSlope, slope);
+            }
+            if (maxSlope == 0.0) continue;
+            const double flowLength = glm::length(flow);
+            directions[i] = flowLength > 1.0e-12 ? flow / flowLength : fallback;
+            const double velocity = settings.iceViscosityFactor * thickness[i] *
+                maxSlope * maxSlope * maxSlope;
+            rates[i] = settings.glacialErodibility * std::pow(thickness[i], settings.thicknessExponent) *
+                std::pow(velocity, settings.velocityExponent);
+        }
+        std::vector<double> erosion(size, 0.0);
+        for (std::size_t source = 0; source < size; ++source) {
+            const double depth = rates[source] * settings.durationYears;
+            if (depth <= 0.0) continue;
+            std::vector<std::pair<std::size_t, double>> weights{{source, 1.0}};
+            double sum = 1.0;
+            for (const auto& neighbor : adjacency[source]) {
+                if (sinks[neighbor.index]) continue;
+                const double along = glm::dot(directions[source], neighbor.tangent);
+                if (std::abs(along) > std::sqrt(0.5)) continue;
+                const double perpendicular = neighbor.distance *
+                    std::sqrt(std::max(0.0, 1.0 - along * along));
+                const double ratio = perpendicular / settings.troughHalfWidth;
+                const double weight = std::max(0.0, 1.0 - ratio * ratio);
+                if (weight > 0.0) {
+                    weights.emplace_back(neighbor.index, weight);
+                    sum += weight;
+                }
+            }
+            for (const auto& [target, weight] : weights) {
+                erosion[target] += depth * weight / sum;
+            }
+        }
+        const auto original = elevations;
+        const auto result = filter.Apply(snapshot, elevations);
+        bool changedByErosion = false;
+        bool changedByLoad = false;
+        for (std::size_t i = 0; i < size; ++i) {
+            double expected = elevations[i];
+            if (!sinks[i]) {
+                const double target = std::clamp(elevations[i] - erosion[i] -
+                    (917.0 / 3300.0) * thickness[i], -32767.0, 32767.0);
+                const double weight = snapshot.HasSelection() ? vertices[i].selectionWeight : 1.0;
+                expected += (target - elevations[i]) * weight;
+            }
+            check(std::abs(result[i] - static_cast<float>(expected)) < 0.002F,
+                  "Glacial erosion disagreed with the mass-balance, Glen-law, trough, and load formulas.");
+            check(result[i] >= -32767.0F && result[i] <= 32767.0F,
+                  "Glacial erosion exceeded the supported elevation limits.");
+            if (sinks[i]) {
+                check(result[i] == elevations[i], "Glacial erosion changed a fixed sink.");
+            }
+            changedByLoad |= !sinks[i] && thickness[i] > 0.0;
+            changedByErosion |= !sinks[i] && erosion[i] > 0.0;
+        }
+        check(changedByLoad && changedByErosion,
+              "Glacial fixture did not exercise ice loading and bedrock erosion.");
+        check(original == elevations, "Glacial erosion modified its input buffer.");
+    };
+
+    verify(*model.GetSnapshot());
+    std::vector<float> selection(size, 1.0F);
+    for (std::size_t i = 0; i < size; ++i) {
+        selection[i] = i % 5 == 0 ? 0.0F : i % 3 == 0 ? 0.5F : 1.0F;
+    }
+    model.SetSelectionWeights(selection);
+    verify(*model.GetSnapshot());
+
+    auto loadOnly = settings;
+    loadOnly.durationYears = 0.0;
+    loadOnly.accumulationRate = 0.0;
+    loadOnly.ablationRate = 0.0;
+    loadOnly.glacialErodibility = 0.0;
+    filter.SetSettings(loadOnly);
+    const auto selectedSnapshot = model.GetSnapshot();
+    const auto loaded = filter.Apply(*selectedSnapshot, elevations);
+    for (std::size_t i = 0; i < size; ++i) {
+        const double weight = selectedSnapshot->HasSelection()
+            ? selectedSnapshot->GetVertices()[i].selectionWeight : 1.0;
+        const double expected = elevations[i] - (917.0 / 3300.0) * loadOnly.initialIceThickness * weight;
+        if (elevations[i] > 0.0F && weight > 0.0) {
+            check(std::abs(loaded[i] - static_cast<float>(expected)) < 0.001F,
+                  "A zero-duration glacial pass did not preserve initial ice loading.");
+        } else {
+            check(loaded[i] == elevations[i],
+                  "A zero-duration glacial pass changed a fixed sink.");
+        }
+    }
+
+    const auto defaults = GlacialErosionSettings{};
+    const std::vector<double GlacialErosionSettings::*> nonnegativeParameters{
+        &GlacialErosionSettings::elaLatitudeGradient,
+        &GlacialErosionSettings::accumulationRate,
+        &GlacialErosionSettings::ablationRate,
+        &GlacialErosionSettings::initialIceThickness,
+        &GlacialErosionSettings::durationYears,
+        &GlacialErosionSettings::glacialErodibility,
+        &GlacialErosionSettings::iceViscosityFactor,
+        &GlacialErosionSettings::thicknessExponent,
+        &GlacialErosionSettings::velocityExponent
+    };
+    for (const auto member : nonnegativeParameters) {
+        auto invalid = defaults;
+        invalid.*member = -1.0;
+        expectInvalid([&] { filter.SetSettings(invalid); },
+                      "Glacial erosion accepted a negative rate, thickness, duration, or exponent.");
+        invalid.*member = std::numeric_limits<double>::quiet_NaN();
+        expectInvalid([&] { filter.SetSettings(invalid); },
+                      "Glacial erosion accepted a non-finite parameter.");
+    }
+    auto invalidWidth = defaults;
+    invalidWidth.troughHalfWidth = 0.0;
+    expectInvalid([&] { filter.SetSettings(invalidWidth); },
+                  "Glacial erosion accepted a zero trough width.");
+    filter.SetSettings({});
+    const auto snapshot = model.GetSnapshot();
+    expectInvalid([&] { filter.Apply(*snapshot, std::span<const float>(elevations).first(1)); },
+                  "Glacial erosion accepted a mismatched elevation count.");
 }
 
 void testAbsoluteMagnitudeNoise() {
@@ -534,6 +936,9 @@ int main() {
         testInciseFlowFormulaAndSelection();
         testInciseFlowSinksAndParameterScaling();
         testInciseFlowValidation();
+        testPrecipitonDiffusion();
+        testThermalWeathering();
+        testGlacialErosion();
         testAbsoluteMagnitudeNoise();
         std::cout << "Filter tests passed.\n";
         return 0;

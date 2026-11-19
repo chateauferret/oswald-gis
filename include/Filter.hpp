@@ -79,6 +79,64 @@ private:
     InciseFlowSettings settings_;
 };
 
+struct PrecipitonSettings {
+    double diffusionCoefficient = 1.0;
+};
+
+class PrecipitonFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Precipiton diffusion"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+    const PrecipitonSettings& GetSettings() const { return settings_; }
+    void SetSettings(const PrecipitonSettings& settings);
+
+private:
+    PrecipitonSettings settings_;
+};
+
+struct ThermalWeatheringSettings {
+    double angleOfReposeDegrees = 35.0;
+};
+
+class ThermalWeatheringFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Thermal weathering"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+    const ThermalWeatheringSettings& GetSettings() const { return settings_; }
+    void SetSettings(const ThermalWeatheringSettings& settings);
+
+private:
+    ThermalWeatheringSettings settings_;
+};
+
+struct GlacialErosionSettings {
+    double equilibriumLineAltitude = 2500.0;
+    double elaLatitudeGradient = 20.0;
+    double accumulationRate = 0.01;
+    double ablationRate = 0.01;
+    double initialIceThickness = 0.0;
+    double durationYears = 1.0;
+    double glacialErodibility = 0.001;
+    double iceViscosityFactor = 0.01;
+    double thicknessExponent = 1.0;
+    double velocityExponent = 2.0;
+    double troughHalfWidth = 100.0;
+};
+
+class GlacialErosionFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Glacial erosion"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+    const GlacialErosionSettings& GetSettings() const { return settings_; }
+    void SetSettings(const GlacialErosionSettings& settings);
+
+private:
+    GlacialErosionSettings settings_;
+};
+
 class FilterManager {
 public:
     FilterManager();

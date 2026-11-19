@@ -676,6 +676,70 @@ blending, consistent with the Fill filter. Invalid parameters or numeric overflo
 are reported in the dialog without changing terrain. Apply records one undoable
 edit on the active elevation layer; Cancel leaves terrain untouched.
 
+### 9.4 Precipiton Diffusion
+
+`Filter -> Erosion -> Precipiton diffusion...` opens a parameter dialog for a
+single pass of Section 2.3 of the erosion functional spec. The diffusion
+coefficient defaults to `k = 1 km/pass`, may be zero, and must be finite and
+non-negative. Great-circle neighbor distances use the planet radius set in
+`File -> Planet... -> Geometry`.
+
+For every non-sink vertex, the filter computes the distance-weighted Laplacian
+from the original elevations across its Delaunay 1-ring and applies
+`k * sum((z_neighbor - z_current) / distance)` simultaneously. Ocean-level or
+underwater vertices and unselected vertices are fixed; when no such outlets
+exist, tied global minima are fixed. Feathered selections blend the final
+diffusion. Updated elevations are clamped to `[-32767, 32767] m`. Invalid
+parameters or numeric overflow leave terrain unchanged; Apply creates one
+undoable active-layer edit and Cancel has no effect.
+
+### 9.5 Thermal Weathering
+
+`Filter -> Erosion -> Thermal weathering...` opens a parameter dialog for a
+single pass of Section 2.4 of the erosion functional spec. The angle of repose
+defaults to `35 degrees`, accepts finite values in `[0, 90)`, and is typically
+between `30 and 40 degrees`. Neighbor edge lengths use great-circle kilometres
+from the configured planet radius.
+
+Each Delaunay edge is considered once using the original elevations. For an
+edge whose gradient exceeds `tan(theta)`, the filter transfers half the excess
+height from the higher vertex to the lower vertex:
+`0.5 * (high - low - distance * tan(theta))`. Per-vertex transfers accumulate
+and apply simultaneously. Sea-level/ocean sinks, unselected vertices, and
+global-minimum sinks when no other outlets exist remain fixed. Feathered
+selections blend the resulting displacement; elevations are clamped to
+`[-32767, 32767] m`. Invalid settings or numeric overflow leave terrain
+unchanged; Apply creates one undoable active-layer edit and Cancel has no effect.
+
+### 9.6 Glacial Erosion
+
+`Filter -> Erosion -> Glacial erosion...` runs one configured glacial pass for
+Sections 3.1–3.3 of the erosion functional spec. The ELA is
+`equator ELA - latitude gradient * abs(latitude in degrees)` using the grid's
+unit-sphere Z coordinate as latitude. The pass starts from the configured ice
+thickness and applies the mass-balance equation over the selected duration;
+ice thickness is clamped at zero. Defaults include a 1-year duration, no
+initial ice, and the specified ice/mantle densities of 917/3300 kg/m³.
+
+Ice surface slopes use great-circle Delaunay 1-ring distances in kilometres.
+All lower neighbors contribute to the local downslope direction, while the
+maximum positive slope drives Glen-law velocity and bedrock erosion. The flow
+direction defines a local transverse cross-section: erosion is distributed
+over the center and near-orthogonal 1-ring neighbors with the parabolic
+`max(0, 1 - (r_perp / trough_half_width)^2)` weights, normalized per source
+vertex. Isostatic depression is applied as `-(917 / 3300) * ice thickness`.
+Mass balance, erosion, and load displacement use the original terrain and are
+applied simultaneously.
+
+All configurable rates, thicknesses, duration, and exponents must be finite
+and non-negative; trough half-width must be finite and positive. As with the
+other terrain erosion filters, sea-level/ocean sinks and unselected outlets
+remain fixed, global-minimum sinks are used when no outlets exist, and
+selection weights blend the final displacement. Elevations are clamped to
+`[-32767, 32767] m`; invalid parameters or numeric overflow leave terrain
+unchanged. Apply records one undoable active-layer edit; Cancel leaves terrain
+untouched.
+
 ---
 
 ## 10. CMake Configuration & Directory Layout

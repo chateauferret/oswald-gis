@@ -987,6 +987,90 @@ void testDialog() {
         renderer.Draw(256, 256);
         check(glGetError() == GL_NO_ERROR, "Rendering incised flow produced an OpenGL error.");
     }
+
+        const auto precipitonDialog = [&] {
+          auto* dialog = ImGui::FindWindowByName("Precipiton Diffusion");
+          check(dialog != nullptr && dialog->Active,
+              "Precipiton diffusion parameter dialog did not open.");
+          return dialog;
+        };
+        const auto editPrecipitonCoefficient = [&](const char* text) {
+          auto* dialog = precipitonDialog();
+          click(dialog->DC.CursorStartPos.x + 30.0F,
+              dialog->DC.CursorStartPos.y + ImGui::GetFrameHeight() * 0.5F);
+          check(ImGui::GetCurrentContext()->ActiveId ==
+                dialog->GetID("Diffusion coefficient (km/pass)"),
+              "Precipiton coefficient is not an editable numeric input.");
+          shortcut(ImGuiKey_A);
+          ImGui::GetIO().AddInputCharactersUTF8(text);
+          frame();
+          key(ImGuiKey_Enter);
+        };
+        const auto precipitonDialogButton = [&](bool apply) {
+          frame();
+          frame();
+          auto* dialog = precipitonDialog();
+          const float applyWidth = ImGui::CalcTextSize("Apply").x +
+                           ImGui::GetStyle().FramePadding.x * 2.0F;
+          const float x = apply ? applyWidth * 0.5F :
+            applyWidth + ImGui::GetStyle().ItemSpacing.x +
+                ImGui::CalcTextSize("Cancel").x * 0.5F + ImGui::GetStyle().FramePadding.x;
+          click(dialog->DC.CursorStartPos.x + x,
+              dialog->DC.CursorPosPrevLine.y + ImGui::GetFrameHeight() * 0.5F);
+        };
+        grid.SetSelectionWeights(incisionWeights, false);
+        grid.SetElevations(incisionTerrain);
+        renderer.UploadGrid(*grid.GetSnapshot());
+        const auto beforePrecipitonDialog = grid.GetSnapshot();
+        selectErosionItem(2, "Precipiton diffusion...");
+        editPrecipitonCoefficient("8");
+        precipitonDialogButton(false);
+        check(!dialogOpen() && grid.GetSnapshot() == beforePrecipitonDialog,
+            "Cancelling Precipiton diffusion changed terrain or left the dialog open.");
+        selectErosionItem(2, "Precipiton diffusion...");
+        editPrecipitonCoefficient("-1");
+        precipitonDialogButton(true);
+        check(dialogOpen() && grid.GetSnapshot() == beforePrecipitonDialog,
+            "Invalid Precipiton diffusion parameters changed terrain or closed the dialog.");
+        key(ImGuiKey_Escape);
+        check(!dialogOpen(), "Escape did not cancel the Precipiton diffusion dialog.");
+
+        grid.SetPlanetRadius(3000.0);
+        PrecipitonFilter precipitonFilter;
+        precipitonFilter.SetSettings({0.75});
+        for (const bool selected : {false, true}) {
+          grid.SetSelectionWeights(incisionWeights, selected);
+          grid.SetElevations(incisionTerrain);
+          renderer.UploadGrid(*grid.GetSnapshot());
+          const auto before = grid.GetSnapshot();
+          const auto expected = precipitonFilter.Apply(*before, incisionTerrain);
+          selectErosionItem(2, "Precipiton diffusion...");
+          check(grid.GetSnapshot() == before,
+              "Opening Precipiton diffusion ran the filter before Apply.");
+          editPrecipitonCoefficient("0.75");
+          precipitonDialogButton(true);
+          check(!dialogOpen(), "Valid Precipiton diffusion did not close the dialog.");
+          const auto checkPrecipiton = [&](const std::vector<float>& values) {
+            const auto snapshot = grid.GetSnapshot();
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                check(snapshot->GetVertices()[i].elevation == values[i],
+                    "Precipiton diffusion dialog, undo or redo produced incorrect elevations.");
+                check(snapshot->GetVertices()[i].selectionWeight ==
+                      before->GetVertices()[i].selectionWeight,
+                    "Precipiton diffusion changed selection weights.");
+            }
+            check(snapshot->HasSelection() == selected,
+                "Precipiton diffusion changed selection state.");
+          };
+          checkPrecipiton(expected);
+          shortcut(ImGuiKey_Z);
+          checkPrecipiton(incisionTerrain);
+          shortcut(ImGuiKey_Y);
+          checkPrecipiton(expected);
+          renderer.Draw(256, 256);
+          check(glGetError() == GL_NO_ERROR,
+              "Rendering precipiton diffusion produced an OpenGL error.");
+        }
     grid.SetPlanetRadius(0.001);
     const auto beforeOverflow = grid.GetSnapshot();
     selectErosionItem(1, "Incise flow...");

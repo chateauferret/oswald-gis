@@ -1,7 +1,9 @@
 #include "Filter.hpp"
+#include "ParallelFor.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -15,6 +17,41 @@ namespace {
 
 constexpr float minimumElevation = -32767.0F;
 constexpr float maximumElevation = 32767.0F;
+
+struct IncidentEdges {
+    std::vector<std::size_t> offsets;
+    std::vector<std::uint32_t> indices;
+
+    IncidentEdges(const SphericalGridSnapshot& grid, bool undirected = false)
+        : offsets(grid.GetVertices().size() + 1, 0) {
+        const auto& edges = grid.GetHalfEdges();
+        for (const auto& edge : edges) {
+            const auto source = static_cast<std::size_t>(edge.originVertex);
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            if (undirected && source >= target) continue;
+            ++offsets[source + 1];
+            if (undirected) ++offsets[target + 1];
+        }
+        std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+        indices.resize(offsets.back());
+        // Preserve the original half-edge order within each vertex's list.
+        auto cursor = offsets;
+        for (std::size_t i = 0; i < edges.size(); ++i) {
+            const auto source = static_cast<std::size_t>(edges[i].originVertex);
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edges[i].nextEdge)].originVertex);
+            if (undirected && source >= target) continue;
+            indices[cursor[source]++] = static_cast<std::uint32_t>(i);
+            if (undirected) indices[cursor[target]++] = static_cast<std::uint32_t>(i);
+        }
+    }
+
+    std::span<const std::uint32_t> operator[](std::size_t vertex) const {
+        return std::span<const std::uint32_t>(indices).subspan(
+            offsets[vertex], offsets[vertex + 1] - offsets[vertex]);
+    }
+};
 
 bool validOperation(FillOperation operation) {
     switch (operation) {
@@ -307,29 +344,33 @@ std::vector<float> InciseFlowFilter::Apply(const SphericalGridSnapshot& grid,
     const std::size_t noReceiver = vertices.size();
     std::vector<std::size_t> receivers(vertices.size(), noReceiver);
     std::vector<double> slopes(vertices.size(), 0.0);
-    for (const auto& edge : edges) {
-        const auto source = static_cast<std::size_t>(edge.originVertex);
-        const auto target = static_cast<std::size_t>(
-            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
-        if (sinks[source] || elevations[source] <= elevations[target]) {
-            continue;
+    const IncidentEdges incident(grid);
+    parallelFor(vertices.size(), 1024, [&](std::size_t vertex) {
+        for (const auto edgeIndex : incident[vertex]) {
+            const auto& edge = edges[edgeIndex];
+            const auto source = static_cast<std::size_t>(edge.originVertex);
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            if (sinks[source] || elevations[source] <= elevations[target]) {
+                continue;
+            }
+            const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+            const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+            const double distance = grid.GetOptions().planetRadius *
+                std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
+            if (!std::isfinite(distance) || distance <= 0.0) {
+                throw std::runtime_error("Incise flow encountered an invalid geodesic edge distance.");
+            }
+            const double slope = (static_cast<double>(elevations[source]) - elevations[target]) / distance;
+            if (!std::isfinite(slope)) {
+                throw std::overflow_error("Incise flow slope exceeds the supported numeric range.");
+            }
+            if (slope > slopes[source] || (slope == slopes[source] && target < receivers[source])) {
+                slopes[source] = slope;
+                receivers[source] = target;
+            }
         }
-        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
-        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
-        const double distance = grid.GetOptions().planetRadius *
-            std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
-        if (!std::isfinite(distance) || distance <= 0.0) {
-            throw std::runtime_error("Incise flow encountered an invalid geodesic edge distance.");
-        }
-        const double slope = (static_cast<double>(elevations[source]) - elevations[target]) / distance;
-        if (!std::isfinite(slope)) {
-            throw std::overflow_error("Incise flow slope exceeds the supported numeric range.");
-        }
-        if (slope > slopes[source] || (slope == slopes[source] && target < receivers[source])) {
-            slopes[source] = slope;
-            receivers[source] = target;
-        }
-    }
+    });
 
     std::vector<std::size_t> order(vertices.size());
     std::iota(order.begin(), order.end(), 0);
@@ -347,9 +388,9 @@ std::vector<float> InciseFlowFilter::Apply(const SphericalGridSnapshot& grid,
         }
     }
 
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
+    parallelFor(vertices.size(), 1024, [&](std::size_t i) {
         if (receivers[i] == noReceiver) {
-            continue;
+            return;
         }
         const double incision = settings_.incisionRate *
             std::pow(area[i] / settings_.referenceArea, settings_.flowExponent) *
@@ -361,7 +402,7 @@ std::vector<float> InciseFlowFilter::Apply(const SphericalGridSnapshot& grid,
             static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
         const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
         result[i] = static_cast<float>(elevations[i] + (target - elevations[i]) * weight);
-    }
+    });
     return result;
 }
 
@@ -383,37 +424,41 @@ std::vector<float> PrecipitonFilter::Apply(const SphericalGridSnapshot& grid,
     const auto sinks = erosionSinks(grid, elevations);
     std::vector<double> laplacian(elevations.size(), 0.0);
     const auto& edges = grid.GetHalfEdges();
-    for (const auto& edge : edges) {
-        const auto source = static_cast<std::size_t>(edge.originVertex);
-        if (sinks[source]) {
-            continue;
+    const IncidentEdges incident(grid);
+    parallelFor(vertices.size(), 1024, [&](std::size_t vertex) {
+        for (const auto edgeIndex : incident[vertex]) {
+            const auto& edge = edges[edgeIndex];
+            const auto source = static_cast<std::size_t>(edge.originVertex);
+            if (sinks[source]) {
+                continue;
+            }
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+            const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+            const double distance = grid.GetOptions().planetRadius *
+                std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
+            if (!std::isfinite(distance) || distance <= 0.0) {
+                throw std::runtime_error(
+                    "Precipiton diffusion encountered an invalid geodesic edge distance.");
+            }
+            const double contribution =
+                (static_cast<double>(elevations[target]) - elevations[source]) / distance;
+            if (!std::isfinite(contribution)) {
+                throw std::overflow_error(
+                    "Precipiton diffusion Laplacian exceeds the supported numeric range.");
+            }
+            laplacian[source] += contribution;
+            if (!std::isfinite(laplacian[source])) {
+                throw std::overflow_error(
+                    "Precipiton diffusion Laplacian exceeds the supported numeric range.");
+            }
         }
-        const auto target = static_cast<std::size_t>(
-            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
-        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
-        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
-        const double distance = grid.GetOptions().planetRadius *
-            std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
-        if (!std::isfinite(distance) || distance <= 0.0) {
-            throw std::runtime_error(
-                "Precipiton diffusion encountered an invalid geodesic edge distance.");
-        }
-        const double contribution =
-            (static_cast<double>(elevations[target]) - elevations[source]) / distance;
-        if (!std::isfinite(contribution)) {
-            throw std::overflow_error(
-                "Precipiton diffusion Laplacian exceeds the supported numeric range.");
-        }
-        laplacian[source] += contribution;
-        if (!std::isfinite(laplacian[source])) {
-            throw std::overflow_error(
-                "Precipiton diffusion Laplacian exceeds the supported numeric range.");
-        }
-    }
+    });
 
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
+    parallelFor(vertices.size(), 1024, [&](std::size_t i) {
         if (sinks[i]) {
-            continue;
+            return;
         }
         const double change = settings_.diffusionCoefficient * laplacian[i];
         if (!std::isfinite(change)) {
@@ -424,7 +469,7 @@ std::vector<float> PrecipitonFilter::Apply(const SphericalGridSnapshot& grid,
             static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
         const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
         result[i] = static_cast<float>(elevations[i] + (target - elevations[i]) * weight);
-    }
+    });
     return result;
 }
 
@@ -453,57 +498,63 @@ std::vector<float> ThermalWeatheringFilter::Apply(
     const auto sinks = erosionSinks(grid, elevations);
     std::vector<double> displacement(elevations.size(), 0.0);
     const auto& edges = grid.GetHalfEdges();
-    for (const auto& edge : edges) {
-        const auto first = static_cast<std::size_t>(edge.originVertex);
-        const auto second = static_cast<std::size_t>(
-            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
-        // Each Delaunay edge is visited once, regardless of half-edge orientation.
-        if (first >= second || sinks[first] || sinks[second]) {
-            continue;
+    const IncidentEdges incident(grid, true);
+    parallelFor(vertices.size(), 1024, [&](std::size_t vertex) {
+        for (const auto edgeIndex : incident[vertex]) {
+            const auto& edge = edges[edgeIndex];
+            const auto first = static_cast<std::size_t>(edge.originVertex);
+            const auto second = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            if (sinks[first] || sinks[second]) {
+                continue;
+            }
+            const double firstHeight = elevations[first];
+            const double secondHeight = elevations[second];
+            if (firstHeight == secondHeight) {
+                continue;
+            }
+            const std::size_t high = firstHeight > secondHeight ? first : second;
+            const std::size_t low = firstHeight > secondHeight ? second : first;
+            const auto from = glm::normalize(glm::dvec3(vertices[high].position));
+            const auto to = glm::normalize(glm::dvec3(vertices[low].position));
+            const double distance = grid.GetOptions().planetRadius *
+                std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
+            if (!std::isfinite(distance) || distance <= 0.0) {
+                throw std::runtime_error(
+                    "Thermal weathering encountered an invalid geodesic edge distance.");
+            }
+            const double excess = (static_cast<double>(elevations[high]) - elevations[low]) -
+                distance * reposeSlope;
+            if (!std::isfinite(excess)) {
+                throw std::overflow_error(
+                    "Thermal weathering slope excess exceeds the supported numeric range.");
+            }
+            if (excess <= 0.0) {
+                continue;
+            }
+            const double transfer = 0.5 * excess;
+            if (vertex == high) {
+                displacement[vertex] -= transfer;
+            } else {
+                displacement[vertex] += transfer;
+            }
+            if (!std::isfinite(displacement[vertex])) {
+                throw std::overflow_error(
+                    "Thermal weathering displacement exceeds the supported numeric range.");
+            }
         }
-        const double firstHeight = elevations[first];
-        const double secondHeight = elevations[second];
-        if (firstHeight == secondHeight) {
-            continue;
-        }
-        const std::size_t high = firstHeight > secondHeight ? first : second;
-        const std::size_t low = firstHeight > secondHeight ? second : first;
-        const auto from = glm::normalize(glm::dvec3(vertices[high].position));
-        const auto to = glm::normalize(glm::dvec3(vertices[low].position));
-        const double distance = grid.GetOptions().planetRadius *
-            std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
-        if (!std::isfinite(distance) || distance <= 0.0) {
-            throw std::runtime_error(
-                "Thermal weathering encountered an invalid geodesic edge distance.");
-        }
-        const double excess = (static_cast<double>(elevations[high]) - elevations[low]) -
-            distance * reposeSlope;
-        if (!std::isfinite(excess)) {
-            throw std::overflow_error(
-                "Thermal weathering slope excess exceeds the supported numeric range.");
-        }
-        if (excess <= 0.0) {
-            continue;
-        }
-        const double transfer = 0.5 * excess;
-        displacement[high] -= transfer;
-        displacement[low] += transfer;
-        if (!std::isfinite(displacement[high]) || !std::isfinite(displacement[low])) {
-            throw std::overflow_error(
-                "Thermal weathering displacement exceeds the supported numeric range.");
-        }
-    }
+    });
 
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
+    parallelFor(vertices.size(), 1024, [&](std::size_t i) {
         if (sinks[i] || displacement[i] == 0.0) {
-            continue;
+            return;
         }
         const double target = std::clamp(
             static_cast<double>(elevations[i]) + displacement[i],
             static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
         const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
         result[i] = static_cast<float>(elevations[i] + (target - elevations[i]) * weight);
-    }
+    });
     return result;
 }
 
@@ -535,28 +586,32 @@ std::vector<float> GlacialErosionFilter::Apply(
     };
     std::vector<std::vector<Neighbor>> neighbors(count);
     const auto& edges = grid.GetHalfEdges();
-    for (const auto& edge : edges) {
-        const auto source = static_cast<std::size_t>(edge.originVertex);
-        const auto target = static_cast<std::size_t>(
-            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
-        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
-        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
-        const double distance = grid.GetOptions().planetRadius *
-            std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
-        if (!std::isfinite(distance) || distance <= 0.0) {
-            throw std::runtime_error(
-                "Glacial erosion encountered an invalid geodesic edge distance.");
+    const IncidentEdges incident(grid);
+    parallelFor(count, 1024, [&](std::size_t vertex) {
+        for (const auto edgeIndex : incident[vertex]) {
+            const auto& edge = edges[edgeIndex];
+            const auto source = static_cast<std::size_t>(edge.originVertex);
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+            const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+            const double distance = grid.GetOptions().planetRadius *
+                std::acos(std::clamp(glm::dot(from, to), -1.0, 1.0));
+            if (!std::isfinite(distance) || distance <= 0.0) {
+                throw std::runtime_error(
+                    "Glacial erosion encountered an invalid geodesic edge distance.");
+            }
+            const glm::dvec3 tangentVector = to - glm::dot(from, to) * from;
+            const double tangentLength = glm::length(tangentVector);
+            if (!std::isfinite(tangentLength) || tangentLength <= 0.0) {
+                throw std::runtime_error("Glacial erosion encountered an invalid edge direction.");
+            }
+            neighbors[source].push_back({target, distance, tangentVector / tangentLength});
         }
-        const glm::dvec3 tangentVector = to - glm::dot(from, to) * from;
-        const double tangentLength = glm::length(tangentVector);
-        if (!std::isfinite(tangentLength) || tangentLength <= 0.0) {
-            throw std::runtime_error("Glacial erosion encountered an invalid edge direction.");
-        }
-        neighbors[source].push_back({target, distance, tangentVector / tangentLength});
-    }
+    });
 
     std::vector<double> iceThickness(count, settings_.initialIceThickness);
-    for (std::size_t i = 0; i < count; ++i) {
+    parallelFor(count, 1024, [&](std::size_t i) {
         const auto position = glm::normalize(glm::dvec3(vertices[i].position));
         const double latitude = std::asin(std::clamp(position.z, -1.0, 1.0)) * metresToDegrees;
         const double ela = settings_.equilibriumLineAltitude -
@@ -571,21 +626,21 @@ std::vector<float> GlacialErosionFilter::Apply(
                 "Glacial ice mass balance exceeds the supported numeric range.");
         }
         iceThickness[i] = updatedThickness;
-    }
+    });
 
     std::vector<double> surface(count);
-    for (std::size_t i = 0; i < count; ++i) {
+    parallelFor(count, 1024, [&](std::size_t i) {
         surface[i] = static_cast<double>(elevations[i]) + iceThickness[i];
         if (!std::isfinite(surface[i])) {
             throw std::overflow_error("Glacial ice surface exceeds the supported numeric range.");
         }
-    }
+    });
 
     std::vector<double> erosionRate(count, 0.0);
     std::vector<glm::dvec3> flowDirection(count, glm::dvec3(0.0));
-    for (std::size_t i = 0; i < count; ++i) {
+    parallelFor(count, 1024, [&](std::size_t i) {
         if (sinks[i] || iceThickness[i] <= 0.0) {
-            continue;
+            return;
         }
         double maximumSlope = 0.0;
         double fallbackSlope = 0.0;
@@ -607,7 +662,7 @@ std::vector<float> GlacialErosionFilter::Apply(
             maximumSlope = std::max(maximumSlope, slope);
         }
         if (maximumSlope <= 0.0) {
-            continue;
+            return;
         }
         const double flowLength = glm::length(weightedFlow);
         if (!std::isfinite(flowLength)) {
@@ -623,50 +678,74 @@ std::vector<float> GlacialErosionFilter::Apply(
             throw std::overflow_error("Glacial erosion rate exceeds the supported numeric range.");
         }
         erosionRate[i] = rate;
-    }
+    });
 
-    std::vector<double> erosionDepth(count, 0.0);
     constexpr double crossTrackLimit = 0.70710678118654752440;
-    for (std::size_t source = 0; source < count; ++source) {
-        const double depth = erosionRate[source] * settings_.durationYears;
-        if (!std::isfinite(depth)) {
+    const auto spreadWeight = [&](std::size_t source, const Neighbor& neighbor) {
+        if (sinks[neighbor.index]) {
+            return 0.0;
+        }
+        const double alongFlow = glm::dot(flowDirection[source], neighbor.tangent);
+        if (std::abs(alongFlow) > crossTrackLimit) {
+            return 0.0;
+        }
+        const double perpendicularDistance = neighbor.distance *
+            std::sqrt(std::max(0.0, 1.0 - alongFlow * alongFlow));
+        const double ratio = perpendicularDistance / settings_.troughHalfWidth;
+        return std::max(0.0, 1.0 - ratio * ratio);
+    };
+    std::vector<double> depth(count, 0.0);
+    std::vector<double> weightSums(count, 1.0);
+    parallelFor(count, 1024, [&](std::size_t source) {
+        depth[source] = erosionRate[source] * settings_.durationYears;
+        if (!std::isfinite(depth[source])) {
             throw std::overflow_error("Glacial erosion depth exceeds the supported numeric range.");
         }
-        if (depth <= 0.0) {
-            continue;
+        if (depth[source] <= 0.0) {
+            return;
         }
-        std::vector<std::pair<std::size_t, double>> weights{{source, 1.0}};
-        double weightSum = 1.0;
         for (const auto& neighbor : neighbors[source]) {
-            if (sinks[neighbor.index]) {
-                continue;
-            }
-            const double alongFlow = glm::dot(flowDirection[source], neighbor.tangent);
-            if (std::abs(alongFlow) > crossTrackLimit) {
-                continue;
-            }
-            const double perpendicularDistance = neighbor.distance *
-                std::sqrt(std::max(0.0, 1.0 - alongFlow * alongFlow));
-            const double ratio = perpendicularDistance / settings_.troughHalfWidth;
-            const double weight = std::max(0.0, 1.0 - ratio * ratio);
+            const double weight = spreadWeight(source, neighbor);
             if (weight > 0.0) {
-                weights.emplace_back(neighbor.index, weight);
-                weightSum += weight;
+                weightSums[source] += weight;
             }
         }
-        for (const auto& [target, weight] : weights) {
-            erosionDepth[target] += depth * (weight / weightSum);
+    });
+
+    std::vector<double> erosionDepth(count, 0.0);
+    parallelFor(count, 1024, [&](std::size_t target) {
+        std::vector<std::size_t> sources{target};
+        sources.reserve(neighbors[target].size() + 1);
+        for (const auto& neighbor : neighbors[target]) {
+            sources.push_back(neighbor.index);
+        }
+        // Match the source order of the original scatter accumulation.
+        std::sort(sources.begin(), sources.end());
+        for (const auto source : sources) {
+            if (depth[source] <= 0.0) continue;
+            double weight = 1.0;
+            if (source != target) {
+                const auto& sourceNeighbors = neighbors[source];
+                const auto found = std::find_if(sourceNeighbors.begin(), sourceNeighbors.end(),
+                    [&](const Neighbor& neighbor) { return neighbor.index == target; });
+                if (found == sourceNeighbors.end()) {
+                    throw std::runtime_error("Glacial erosion encountered an asymmetric edge.");
+                }
+                weight = spreadWeight(source, *found);
+                if (weight <= 0.0) continue;
+            }
+            erosionDepth[target] += depth[source] * (weight / weightSums[source]);
             if (!std::isfinite(erosionDepth[target])) {
                 throw std::overflow_error(
                     "Glacial trough erosion exceeds the supported numeric range.");
             }
         }
-    }
+    });
 
     const double reboundRatio = iceDensity / mantleDensity;
-    for (std::size_t i = 0; i < count; ++i) {
+    parallelFor(count, 1024, [&](std::size_t i) {
         if (sinks[i]) {
-            continue;
+            return;
         }
         const double subsidence = reboundRatio * iceThickness[i];
         const double target = static_cast<double>(elevations[i]) - erosionDepth[i] - subsidence;
@@ -678,7 +757,7 @@ std::vector<float> GlacialErosionFilter::Apply(
             static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
         const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
         result[i] = static_cast<float>(elevations[i] + (clamped - elevations[i]) * weight);
-    }
+    });
     return result;
 }
 
@@ -703,39 +782,43 @@ std::vector<float> CratonicGroovingFilter::Apply(
     std::vector<double> parallelDistanceSum(vertices.size(), 0.0);
     std::vector<std::size_t> neighborCounts(vertices.size(), 0);
     const auto& edges = grid.GetHalfEdges();
-    for (const auto& edge : edges) {
-        const auto source = static_cast<std::size_t>(edge.originVertex);
-        const auto target = static_cast<std::size_t>(
-            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
-        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
-        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
-        const double dot = std::clamp(glm::dot(from, to), -1.0, 1.0);
-        const double distance = grid.GetOptions().planetRadius * std::acos(dot);
-        const glm::dvec3 tangent = to - dot * from;
-        const double tangentLength = glm::length(tangent);
-        if (!std::isfinite(distance) || distance <= 0.0 ||
-            !std::isfinite(tangentLength) || tangentLength <= 0.0) {
-            throw std::runtime_error(
-                "Cratonic grooving encountered an invalid geodesic edge direction.");
-        }
-        glm::dvec3 localFlow = flowDirection - glm::dot(flowDirection, from) * from;
-        const double flowLength = glm::length(localFlow);
-        if (flowLength > 0.0) {
-            localFlow /= flowLength;
-            const double parallelDistance = std::abs(
-                glm::dot(tangent / tangentLength * distance, localFlow));
-            parallelDistanceSum[source] += parallelDistance;
-            if (!std::isfinite(parallelDistanceSum[source])) {
-                throw std::overflow_error(
-                    "Cratonic groove alignment exceeds the supported numeric range.");
+    const IncidentEdges incident(grid);
+    parallelFor(vertices.size(), 1024, [&](std::size_t vertex) {
+        for (const auto edgeIndex : incident[vertex]) {
+            const auto& edge = edges[edgeIndex];
+            const auto source = static_cast<std::size_t>(edge.originVertex);
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+            const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+            const double dot = std::clamp(glm::dot(from, to), -1.0, 1.0);
+            const double distance = grid.GetOptions().planetRadius * std::acos(dot);
+            const glm::dvec3 tangent = to - dot * from;
+            const double tangentLength = glm::length(tangent);
+            if (!std::isfinite(distance) || distance <= 0.0 ||
+                !std::isfinite(tangentLength) || tangentLength <= 0.0) {
+                throw std::runtime_error(
+                    "Cratonic grooving encountered an invalid geodesic edge direction.");
             }
+            glm::dvec3 localFlow = flowDirection - glm::dot(flowDirection, from) * from;
+            const double flowLength = glm::length(localFlow);
+            if (flowLength > 0.0) {
+                localFlow /= flowLength;
+                const double parallelDistance = std::abs(
+                    glm::dot(tangent / tangentLength * distance, localFlow));
+                parallelDistanceSum[source] += parallelDistance;
+                if (!std::isfinite(parallelDistanceSum[source])) {
+                    throw std::overflow_error(
+                        "Cratonic groove alignment exceeds the supported numeric range.");
+                }
+            }
+            ++neighborCounts[source];
         }
-        ++neighborCounts[source];
-    }
+    });
 
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
+    parallelFor(vertices.size(), 1024, [&](std::size_t i) {
         if (sinks[i] || neighborCounts[i] == 0) {
-            continue;
+            return;
         }
         const double meanParallelDistance =
             parallelDistanceSum[i] / static_cast<double>(neighborCounts[i]);
@@ -749,7 +832,7 @@ std::vector<float> CratonicGroovingFilter::Apply(
             static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
         const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
         result[i] = static_cast<float>(elevations[i] + (target - elevations[i]) * weight);
-    }
+    });
     return result;
 }
 
@@ -774,37 +857,41 @@ std::vector<float> CratonicScourFilter::Apply(
     std::vector<glm::dvec3> gradient(vertices.size(), glm::dvec3(0.0));
     std::vector<std::size_t> neighborCounts(vertices.size(), 0);
     const auto& edges = grid.GetHalfEdges();
-    for (const auto& edge : edges) {
-        const auto source = static_cast<std::size_t>(edge.originVertex);
-        const auto target = static_cast<std::size_t>(
-            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
-        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
-        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
-        const double dot = std::clamp(glm::dot(from, to), -1.0, 1.0);
-        const double distance = grid.GetOptions().planetRadius * std::acos(dot);
-        const glm::dvec3 tangent = to - dot * from;
-        const double tangentLength = glm::length(tangent);
-        if (!std::isfinite(distance) || distance <= 0.0 ||
-            !std::isfinite(tangentLength) || tangentLength <= 0.0) {
-            throw std::runtime_error(
-                "Cratonic scour encountered an invalid geodesic edge direction.");
+    const IncidentEdges incident(grid);
+    parallelFor(vertices.size(), 1024, [&](std::size_t vertex) {
+        for (const auto edgeIndex : incident[vertex]) {
+            const auto& edge = edges[edgeIndex];
+            const auto source = static_cast<std::size_t>(edge.originVertex);
+            const auto target = static_cast<std::size_t>(
+                edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+            const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+            const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+            const double dot = std::clamp(glm::dot(from, to), -1.0, 1.0);
+            const double distance = grid.GetOptions().planetRadius * std::acos(dot);
+            const glm::dvec3 tangent = to - dot * from;
+            const double tangentLength = glm::length(tangent);
+            if (!std::isfinite(distance) || distance <= 0.0 ||
+                !std::isfinite(tangentLength) || tangentLength <= 0.0) {
+                throw std::runtime_error(
+                    "Cratonic scour encountered an invalid geodesic edge direction.");
+            }
+            const double elevationDifference =
+                static_cast<double>(elevations[target]) - elevations[source];
+            laplacian[source] += elevationDifference;
+            gradient[source] += (elevationDifference / distance) * (tangent / tangentLength);
+            ++neighborCounts[source];
+            if (!std::isfinite(laplacian[source]) ||
+                !std::isfinite(gradient[source].x) || !std::isfinite(gradient[source].y) ||
+                !std::isfinite(gradient[source].z)) {
+                throw std::overflow_error(
+                    "Cratonic stoss/lee gradient exceeds the supported numeric range.");
+            }
         }
-        const double elevationDifference =
-            static_cast<double>(elevations[target]) - elevations[source];
-        laplacian[source] += elevationDifference;
-        gradient[source] += (elevationDifference / distance) * (tangent / tangentLength);
-        ++neighborCounts[source];
-        if (!std::isfinite(laplacian[source]) ||
-            !std::isfinite(gradient[source].x) || !std::isfinite(gradient[source].y) ||
-            !std::isfinite(gradient[source].z)) {
-            throw std::overflow_error(
-                "Cratonic stoss/lee gradient exceeds the supported numeric range.");
-        }
-    }
+    });
 
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
+    parallelFor(vertices.size(), 1024, [&](std::size_t i) {
         if (sinks[i] || neighborCounts[i] == 0) {
-            continue;
+            return;
         }
         const auto position = glm::normalize(glm::dvec3(vertices[i].position));
         glm::dvec3 localFlow = flowDirection - glm::dot(flowDirection, position) * position;
@@ -838,7 +925,7 @@ std::vector<float> CratonicScourFilter::Apply(
             static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
         const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
         result[i] = static_cast<float>(elevations[i] + (target - elevations[i]) * weight);
-    }
+    });
     return result;
 }
 

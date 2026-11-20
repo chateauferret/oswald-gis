@@ -9,7 +9,8 @@
 #include <vector>
 
 // A brush script stored as a TOML file with string keys "name", "description", "output"
-// ("normalized" or "elevation") and "script", followed by optional [[parameter]] tables.
+// ("normalized" or "elevation"), "script", and optional "gpu_script", followed by
+// optional [[parameter]] tables.
 // application selects noise mapping, direct elevation blending, or weighted delta;
 // continuous controls whether a held brush accumulates. Defaults preserve old scripts.
 struct BrushScriptFile {
@@ -21,10 +22,11 @@ struct BrushScriptFile {
     std::vector<ScriptParameter> parameters;
     BrushApplication application = BrushApplication::Noise;
     bool continuous = false;
+    std::optional<std::string> gpuScript;
 
     // Throws std::runtime_error when the file cannot be read, is not valid TOML, or lacks a
-    // non-empty string "name" and a string "script". "description" is optional; "output" is
-    // optional but must be "normalized" (or "normalised") or "elevation" when present.
+    // non-empty string "name" and a string "script". "description", "gpu_script", and "output"
+    // are optional; output must be "normalized" (or "normalised") or "elevation" when present.
     // Parameter definitions and defaults are validated; script compilation is separate.
     static BrushScriptFile Load(const std::filesystem::path& path);
     // Throws std::invalid_argument for an empty name or invalid parameters, and

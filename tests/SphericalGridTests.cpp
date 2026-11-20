@@ -183,10 +183,16 @@ void verifyQueries(const SphericalGridSnapshot& snapshot) {
 }
 
 void verifyValidationAndRegeneration() {
+    check(GridOptions{}.pointCount == GridOptions::defaultPointCount &&
+          GridOptions::defaultPointCount == GridOptions::minimumPointCount &&
+          GridOptions::minimumPointCount == 100'000 &&
+          GridOptions::maximumPointCount == 10'000'000,
+          "Grid point-count defaults or bounds are incorrect.");
     SphericalGrid grid({1000, 0.0, 1});
     const auto original = grid.GetSnapshot();
     const double nan = std::numeric_limits<double>::quiet_NaN();
-    for (const auto count : {std::size_t{0}, std::size_t{999}, std::size_t{1'000'001}}) {
+    for (const auto count : {std::size_t{0}, std::size_t{999},
+                             GridOptions::maximumPointCount + 1}) {
         expectInvalid([&] { grid.GenerateGrid({count, 0.0, 1}); });
     }
     for (const auto variability : {-1.0, 1.1, nan}) {
@@ -428,7 +434,9 @@ void verifyAdaptiveRefinementAndCoarsening() {
         check(sparseRefinement != nullptr &&
                     sparseRefinement->GetVertices().size() == unselected->GetVertices().size() + 1,
                     "A localized single-vertex selection did not seed regional refinement.");
-    expectInvalid([&] { selected->RefineSelectedRegion(1'000'001); });
+    expectInvalid([&] {
+        selected->RefineSelectedRegion(GridOptions::maximumPointCount + 1);
+    });
     expectInvalid([&] { selected->CoarsenSelectedRegion(-1.0F); });
 }
 

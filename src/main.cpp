@@ -189,7 +189,7 @@ int runApplication() {
         glClearColor(0.06F, 0.08F, 0.12F, 1.0F);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         renderer.Draw(framebufferWidth, framebufferHeight, camera.GetModelMatrix(), camera.GetZoom());
-        memoryStatusBar.Render(glfwGetTime(), ui.GetUndoStack(), &renderer);
+        memoryStatusBar.Render(ui.GetUndoStack(), &renderer);
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 

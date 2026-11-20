@@ -9,6 +9,13 @@ else if (Resolution == '64') resolution := 64;
 else if (Resolution == '128') resolution := 128;
 spectral(x, y, z, Frequency, Exponent, resolution)
 '''
+gpu_script = '''
+float resolution = param_Resolution < 0.5 ? 8.0 :
+                   param_Resolution < 1.5 ? 16.0 :
+                   param_Resolution < 2.5 ? 32.0 :
+                   param_Resolution < 3.5 ? 64.0 : 128.0;
+return spectral(x, y, z, param_Frequency, param_Exponent, resolution);
+'''
 
 [[parameter]]
 name = "Exponent"

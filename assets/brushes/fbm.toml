@@ -2,6 +2,7 @@ name="fbm"
 description="fractal Brownian motion"
 output="normalized"
 script="fbm(x, y, z, frequency, lacunarity, persistence, octaves)"
+gpu_script = "return fbm(x, y, z, param_frequency, param_lacunarity, param_persistence, int(param_octaves));"
 
 [[parameter]]
 name="frequency"

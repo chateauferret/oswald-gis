@@ -144,7 +144,7 @@ add_library(oswald_model STATIC src/Layer.cpp src/ColorMap.cpp src/SphericalGrid
     src/SelectionTool.cpp src/Filter.cpp src/Noise.cpp)
 target_include_directories(oswald_model PUBLIC include)
 target_include_directories(oswald_model PRIVATE "${stb_SOURCE_DIR}")
-target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r TIFF::TIFF FastNoise)
+target_link_libraries(oswald_model PUBLIC glm::glm nanoflann::nanoflann PRIVATE qhullstatic_r TIFF::TIFF FastNoise Threads::Threads)
 
 # exprtk is only included by ScriptEngine.cpp, keeping its compile cost in one unit.
 add_library(oswald_scripting STATIC src/ScriptEngine.cpp src/ScriptedBrushTool.cpp
@@ -161,13 +161,19 @@ add_library(oswald_controller STATIC src/CameraController.cpp)
 target_include_directories(oswald_controller PUBLIC include)
 target_link_libraries(oswald_controller PUBLIC glm::glm)
 
-add_library(oswald_view STATIC src/GlobeRenderer.cpp)
+add_library(oswald_view STATIC src/GlobeRenderer.cpp src/ComputeContext.cpp)
 target_include_directories(oswald_view PUBLIC include)
 target_link_libraries(oswald_view PUBLIC oswald_model glad_gl_core_45)
 
 set(OSWALD_RESOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/resources")
 foreach(resource shaders/globe.vert shaders/globe.geom shaders/globe.frag shaders/wire.vert
                  shaders/wire.geom shaders/wire.frag shaders/elevation.comp)
+    configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
+endforeach()
+file(MAKE_DIRECTORY "${OSWALD_RESOURCE_DIR}/shaders/compute")
+foreach(resource shaders/compute/terrain.comp shaders/compute/selection.comp
+                 shaders/compute/histogram.comp shaders/compute/glacial.comp
+                 shaders/compute/raster_sample.comp shaders/compute/raster_export.comp)
     configure_file("${resource}" "${OSWALD_RESOURCE_DIR}/${resource}" COPYONLY)
 endforeach()
 file(GLOB OSWALD_COLORMAP_FILES CONFIGURE_DEPENDS
@@ -200,8 +206,28 @@ target_link_libraries(oswald_gis PRIVATE
 )
 
 include(CTest)
+add_executable(compute_benchmarks tests/ComputeBenchmarks.cpp)
+target_link_libraries(compute_benchmarks PRIVATE oswald_model oswald_scripting)
+target_compile_definitions(compute_benchmarks PRIVATE
+    OSWALD_BENCHMARK_COLORMAP="${CMAKE_CURRENT_SOURCE_DIR}/assets/colormaps/default.map")
 if(BUILD_TESTING)
     find_package(Threads REQUIRED)
+    foreach(benchmark_case grid_generation lloyd_generation regrid refine coarsen
+            precipiton thermal grooving scour glacial incise fill_basins fill fill_raise
+            fill_minimum fill_maximum absolute_noise select_value select_radius select_clear
+            select_invert select_polygon histogram
+            export_data export_image import_raster simplex value_noise ridge_noise
+            spectral_noise gaussian scripted clamp hover)
+        add_test(NAME "benchmark_${benchmark_case}" COMMAND compute_benchmarks
+                 --vertices 1000 --case "${benchmark_case}")
+        set_tests_properties("benchmark_${benchmark_case}" PROPERTIES
+            LABELS benchmark_smoke TIMEOUT 120
+            PASS_REGULAR_EXPRESSION "${benchmark_case},1000,0,[0-9.eE+-]+,[0-9.eE+-]+")
+    endforeach()
+    add_test(NAME benchmark_grouped COMMAND compute_benchmarks --vertices 1000
+             --case fill --case precipiton --case fill_raise --iterations 2)
+    set_tests_properties(benchmark_grouped PROPERTIES LABELS benchmark_smoke TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "fill_raise,1000,1,[0-9.eE+-]+,[0-9.eE+-]+")
     add_executable(spherical_grid_tests tests/SphericalGridTests.cpp)
     target_link_libraries(spherical_grid_tests PRIVATE oswald_model Threads::Threads)
     add_test(NAME spherical_grid COMMAND spherical_grid_tests)
@@ -282,9 +308,10 @@ if(BUILD_TESTING)
     set_tests_properties(planet_density PROPERTIES LABELS gpu TIMEOUT 30)
 
     add_executable(globe_renderer_tests tests/GlobeRendererTests.cpp)
-    target_link_libraries(globe_renderer_tests PRIVATE oswald_view glfw)
+    target_link_libraries(globe_renderer_tests PRIVATE oswald_view oswald_scripting glfw)
     target_compile_definitions(globe_renderer_tests PRIVATE
         GLFW_INCLUDE_NONE
+        OSWALD_BRUSH_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/brushes"
         OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
     )
     add_test(NAME color_map COMMAND globe_renderer_tests)

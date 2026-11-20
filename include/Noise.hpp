@@ -18,11 +18,21 @@ struct FractalParameters {
     int octaves = 1;
 };
 
+struct DomainWarpParameters {
+    double frequency = 4.0;
+    double strength = 1.25;
+    double lacunarity = 2.0;
+    double persistence = 0.5;
+    int octaves = 3;
+};
+
 // FastNoise2 white noise sampled at integer positions, used to seed spectral fields.
 double HashValue(std::int64_t x, std::int64_t y, std::int64_t z, std::uint64_t seed);
 
 double Simplex(glm::dvec3 point, std::uint64_t seed);
 double Value(glm::dvec3 point, std::uint64_t seed);
+glm::dvec3 DomainWarp(glm::dvec3 point, std::uint64_t seed,
+                      const DomainWarpParameters& parameters);
 
 // Fractal sums are normalized by the total octave amplitude.
 double SimplexFbm(glm::dvec3 point, std::uint64_t seed, const FractalParameters& fractal);

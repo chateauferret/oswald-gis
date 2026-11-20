@@ -1,6 +1,7 @@
 #include "BrushTool.hpp"
 
 #include "Noise.hpp"
+#include "ParallelFor.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -163,24 +164,9 @@ glm::dvec3 warpedPosition(glm::dvec3 position, const NoiseSettings& settings) {
     if (!settings.domainWarpEnabled || settings.warpStrength == 0.0F) {
         return position;
     }
-    glm::dvec3 displacement(0.0);
-    double frequency = settings.warpFrequency;
-    double amplitude = 1.0;
-    double totalAmplitude = 0.0;
-    for (int octave = 0; octave < settings.warpOctaves; ++octave) {
-        const glm::dvec3 domain = position * frequency;
-        const auto octaveSeed = settings.seed +
-            (0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(octave + 1));
-        displacement += glm::dvec3(
-            noise::Simplex(domain, octaveSeed ^ 0x9e3779b97f4a7c15ULL),
-            noise::Simplex(domain, octaveSeed ^ 0xbf58476d1ce4e5b9ULL),
-            noise::Simplex(domain, octaveSeed ^ 0x94d049bb133111ebULL)) * amplitude;
-        totalAmplitude += amplitude;
-        frequency *= settings.warpLacunarity;
-        amplitude *= settings.warpPersistence;
-    }
-    displacement /= totalAmplitude;
-    return position + displacement * static_cast<double>(settings.warpStrength);
+    return noise::DomainWarp(position, settings.seed,
+        {settings.warpFrequency, settings.warpStrength, settings.warpLacunarity,
+         settings.warpPersistence, settings.warpOctaves});
 }
 
 float destinationForNoise(NoiseSettings::Operation operation, double noise,
@@ -199,19 +185,18 @@ float destinationForNoise(NoiseSettings::Operation operation, double noise,
 }
 
 template <typename Sampler>
-std::vector<std::size_t> applyNoiseSamples(
+std::vector<std::size_t> applyNoiseSamplesBatch(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
-    Sampler&& sample, BrushApplication application = BrushApplication::Noise) {
+    Sampler&& sample, BrushApplication application) {
     validateNoiseSettings(parameters);
     const auto weights = brushWeights(grid, center, elevations, brushSettings, elapsedSeconds);
     center = glm::normalize(center);
     const double radius = PlanetRadiusInUnit(grid, brushSettings.distanceUnit);
     const float lower = std::min(parameters.rangeBetween, parameters.rangeAnd);
     const float upper = std::max(parameters.rangeBetween, parameters.rangeAnd);
-    // Sample every vertex before writing so a throwing sampler leaves elevations intact.
-    std::vector<std::pair<std::size_t, float>> updates;
-    updates.reserve(weights.size());
+    std::vector<NoiseSample> samples;
+    samples.reserve(weights.size());
     for (const auto& [index, weight] : weights) {
         const float current = elevations[index];
         if (!validElevation(current)) {
@@ -227,7 +212,22 @@ std::vector<std::size_t> applyNoiseSamples(
             radius * std::atan2(
             glm::length(glm::cross(center, noiseSample.location)),
             glm::dot(center, noiseSample.location));
-        const double value = sample(noiseSample);
+        samples.push_back(noiseSample);
+    }
+
+    const auto values = sample(std::span<const NoiseSample>(samples));
+    if (values.size() != samples.size()) {
+        throw std::invalid_argument("Brush sampler returned an incorrect result count.");
+    }
+    // Sample every vertex before writing so a throwing sampler leaves elevations intact.
+    std::vector<std::pair<std::size_t, float>> updates;
+    updates.reserve(weights.size());
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        const auto& noiseSample = samples[i];
+        const auto index = noiseSample.index;
+        const double weight = noiseSample.weight;
+        const float current = noiseSample.elevation;
+        const double value = values[i];
         if (!std::isfinite(value)) {
             throw std::invalid_argument("Brush sampler returned a non-finite value.");
         }
@@ -253,6 +253,22 @@ std::vector<std::size_t> applyNoiseSamples(
         changed.push_back(index);
     }
     return changed;
+}
+
+template <typename Sampler>
+std::vector<std::size_t> applyNoiseSamples(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
+    Sampler&& sample, BrushApplication application = BrushApplication::Noise) {
+    return applyNoiseSamplesBatch(grid, center, elevations, brushSettings, elapsedSeconds,
+        parameters, [&](std::span<const NoiseSample> samples) {
+            std::vector<double> values;
+            values.reserve(samples.size());
+            for (const auto& noiseSample : samples) {
+                values.push_back(sample(noiseSample));
+            }
+            return values;
+        }, application);
 }
 
 template <typename Sampler>
@@ -407,6 +423,17 @@ std::vector<std::size_t> ApplyNoiseSampler(
     }
     return applyNoiseSamples(grid, center, elevations, brushSettings, elapsedSeconds, parameters,
                              sample, application);
+}
+
+std::vector<std::size_t> ApplyNoiseSamplerBatch(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
+    const NoiseBatchSampler& sample, BrushApplication application) {
+    if (!sample) {
+        throw std::invalid_argument("Noise sampler is empty.");
+    }
+    return applyNoiseSamplesBatch(grid, center, elevations, brushSettings, elapsedSeconds,
+                                  parameters, sample, application);
 }
 
 std::vector<std::size_t> ElevationBrushTool::Apply(
@@ -586,11 +613,17 @@ std::vector<std::size_t> GaussianBlurBrushTool::Apply(
             throw std::invalid_argument("Gaussian blur input elevations must be finite and in range.");
         }
     }
+    std::vector<float> updatedValues(weights.size());
+    parallelFor(weights.size(), 256, [&](std::size_t i) {
+        const auto [index, brushWeight] = weights[i];
+        const float destination = static_cast<float>(SampleGaussian(grid, source, index, settings_));
+        updatedValues[i] = blendElevation(source[index], destination, brushWeight);
+    });
     std::vector<std::size_t> changed;
     changed.reserve(weights.size());
-    for (const auto& [index, brushWeight] : weights) {
-        const float destination = static_cast<float>(SampleGaussian(grid, source, index, settings_));
-        const float updated = blendElevation(source[index], destination, brushWeight);
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        const auto index = weights[i].first;
+        const auto updated = updatedValues[i];
         if (updated != source[index]) {
             elevations[index] = updated;
             changed.push_back(index);

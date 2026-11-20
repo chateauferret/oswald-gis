@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -56,8 +57,7 @@ struct ImGuiSession {
     ~ImGuiSession() { ImGui::DestroyContext(); }
 };
 
-std::string renderMemoryStatusBar(MemoryStatusBar& statusBar, double now,
-                                  const UndoStack& history,
+std::string renderMemoryStatusBar(MemoryStatusBar& statusBar, const UndoStack& history,
                                   const GlobeRenderer* renderer = nullptr) {
     std::string text;
     auto& io = ImGui::GetIO();
@@ -67,7 +67,7 @@ std::string renderMemoryStatusBar(MemoryStatusBar& statusBar, double now,
     };
     ImGui::NewFrame();
     ImGui::LogToClipboard();
-    statusBar.Render(now, history, renderer);
+    statusBar.Render(history, renderer);
     ImGui::Render();
     io.SetClipboardTextFn = nullptr;
     io.ClipboardUserData = nullptr;
@@ -78,9 +78,9 @@ void testMemoryStatusBar() {
     const ImGuiSession imgui;
     MemoryStatusBar statusBar;
     const UndoStack history;
-    const auto frame = [&](float width, double now) {
+    const auto frame = [&](float width) {
         ImGui::GetIO().DisplaySize = ImVec2(width, 600.0F);
-        const auto text = renderMemoryStatusBar(statusBar, now, history);
+        const auto text = renderMemoryStatusBar(statusBar, history);
         const auto* bar = ImGui::FindWindowByName("##MemoryStatusBar");
         check(bar && bar->Active && bar->Pos.x == 0.0F && bar->Size.x == width &&
               bar->Pos.y + bar->Size.y == 600.0F,
@@ -96,10 +96,10 @@ void testMemoryStatusBar() {
         return std::pair{text, bar->Size.y};
     };
 
-    const auto [firstText, wideHeight] = frame(800.0F, 0.0);
+    const auto [firstText, wideHeight] = frame(800.0F);
     check(firstText.find("GPU VRAM: unavailable") != std::string::npos,
           "Expected an unavailable VRAM indication without a GL driver.");
-    const auto [narrowText, narrowHeight] = frame(250.0F, 0.5);
+    const auto [narrowText, narrowHeight] = frame(250.0F);
     check(narrowText.find("GPU VRAM: unavailable") != std::string::npos &&
           narrowHeight > wideHeight,
           "Expected both readouts to fit on separate lines in a narrow window.");
@@ -177,8 +177,7 @@ void testMemoryStatusBarWithDriver() {
 
     UndoStack history;
     MemoryStatusBar statusBar;
-    // Keep the clock fixed so only history changes can trigger fresh readings.
-    const auto render = [&] { return renderMemoryStatusBar(statusBar, 0.0, history, &renderer); };
+    const auto render = [&] { return renderMemoryStatusBar(statusBar, history, &renderer); };
     const auto text = render();
     const auto gpuPosition = text.find("GPU VRAM: ");
     check(gpuPosition != std::string::npos, "Expected a GPU memory readout.");
@@ -204,17 +203,28 @@ void testMemoryStatusBarWithDriver() {
         check(pos != std::string::npos, "Expected a terrain buffer readout.");
         return std::stod(labels.substr(pos + prefix.size()));
     };
+    const auto pointCount = [](const std::string& labels) {
+        constexpr std::string_view prefix = "Data points: ";
+        const auto pos = labels.find(prefix);
+        check(pos != std::string::npos, "Expected a data point count readout.");
+        return std::stoull(labels.substr(pos + prefix.size()));
+    };
     const auto smallMiB = terrainMiB(text);
-    check(smallMiB > 0.0, "A loaded terrain must report buffer allocations.");
+    check(smallMiB > 0.0 && pointCount(text) == small.GetVertices().size(),
+          "A loaded terrain must report buffer allocations and its data point count.");
     history.Execute(std::make_unique<ResizeCommand>(renderer, small, large));
     const auto edited = render();
-    check(terrainMiB(edited) > smallMiB && edited.find("Undo: 1 / Redo: 0") != std::string::npos,
+    check(terrainMiB(edited) > smallMiB &&
+          pointCount(edited) == large.GetVertices().size() &&
+          edited.find("Undo: 1 / Redo: 0") != std::string::npos,
           "A larger mesh and new undo entry must be reflected without waiting.");
-    check(history.Undo() && terrainMiB(render()) == smallMiB,
+    check(history.Undo() && terrainMiB(render()) == smallMiB &&
+          pointCount(render()) == small.GetVertices().size(),
           "Undo must immediately reflect the smaller mesh.");
     check(render().find("Undo: 0 / Redo: 1") != std::string::npos,
           "Undo must immediately expose the redo entry.");
-    check(history.Redo() && terrainMiB(render()) == terrainMiB(edited),
+    check(history.Redo() && terrainMiB(render()) == terrainMiB(edited) &&
+          pointCount(render()) == large.GetVertices().size(),
           "Redo must immediately reflect the larger mesh.");
     renderer.UploadGrid(small);
     history.Clear();
@@ -293,13 +303,17 @@ void testDialog(bool densityOnly) {
         frame();
     };
 
-    const auto panelClick = [&](const char* label, int parameterIndex = -1) {
+    const auto panelClick = [&](const char* label, int parameterIndex = -1,
+                                int pushedId = -1) {
         frame();
         auto* panel = ImGui::FindWindowByName("###BrushParameters");
         check(panel != nullptr && panel->Active, "Brush panel is not visible.");
         ImGui::FocusWindow(panel);
-        const auto seed = parameterIndex < 0 ? panel->IDStack.back() :
+        auto seed = parameterIndex < 0 ? panel->IDStack.back() :
             ImHashData(&parameterIndex, sizeof(parameterIndex), panel->IDStack.back());
+        if (pushedId >= 0) {
+            seed = ImHashData(&pushedId, sizeof(pushedId), seed);
+        }
         const auto id = ImHashStr(label, 0, seed);
         for (float scroll = 0.0F;; scroll += panel->InnerRect.GetHeight() * 0.5F) {
             ImGui::SetScrollY(panel, std::min(scroll, panel->ScrollMax.y));
@@ -474,7 +488,7 @@ void testDialog(bool densityOnly) {
         clickDialogItem("Planet", "Point Count (N)");
         key(ImGuiKey_A);
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
-        ImGui::GetIO().AddInputCharactersUTF8("1100");
+        ImGui::GetIO().AddInputCharactersUTF8("100000");
         frame();
         key(ImGuiKey_Enter);
     };
@@ -494,8 +508,15 @@ void testDialog(bool densityOnly) {
               "Planet warning did not match the pending density change and history.");
         replaceDialogText("Planet", "Planet radius (km)", "4000");
         clickDialogItem("Planet", "Apply");
-        check(!dialogOpen() && grid.GetSnapshot()->GetVertices().size() == 1100 &&
-              grid.GetSnapshot()->GetOptions().pointCount == 1100 &&
+        const auto generationDeadline = std::chrono::steady_clock::now() +
+                                        std::chrono::seconds(25);
+        while (grid.GetSnapshot()->GetVertices().size() != 100'000 &&
+               std::chrono::steady_clock::now() < generationDeadline) {
+            frame();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(!dialogOpen() && grid.GetSnapshot()->GetVertices().size() == 100'000 &&
+              grid.GetSnapshot()->GetOptions().pointCount == 100'000 &&
               grid.GetSnapshot()->GetOptions().planetRadius == 4000.0 &&
               grid.GetSnapshot()->HasSelection(),
               "Planet Geometry did not regenerate the requested point count with its shared radius.");
@@ -1325,6 +1346,77 @@ void testDialog(bool densityOnly) {
     check(!dialogOpen(), "Could not dismiss incision after numeric overflow.");
     grid.SetPlanetRadius(6371.0);
 
+    std::vector<float> glacialTerrain(grid.GetSnapshot()->GetVertices().size(), 2600.0F);
+    glacialTerrain[0] = -1.0F;
+    grid.SetSelectionWeights(std::vector<float>(glacialTerrain.size(), 1.0F), false);
+    grid.SetElevations(glacialTerrain);
+    renderer.UploadGrid(*grid.GetSnapshot());
+    GlacialErosionFilter glacialFilter;
+    const auto glacialBefore = grid.GetSnapshot();
+    const auto glacialExpected = glacialFilter.Apply(*glacialBefore, glacialTerrain);
+    check(glacialExpected != glacialTerrain,
+          "Glacial preview fixture did not produce an erosion result.");
+    const auto glacialHistoryBefore = ui.GetUndoStack().Size();
+    const auto clickGlacialButton = [&](const char* label) {
+        frame();
+        auto* dialog = ImGui::FindWindowByName("Glacial Erosion");
+        check(dialog && dialog->Active, "Glacial Erosion dialog is not active.");
+        const auto id = dialog->GetID(label);
+        const float y = dialog->DC.CursorPosPrevLine.y + ImGui::GetFrameHeight() * 0.5F;
+        for (float x = dialog->InnerRect.Min.x; x < dialog->InnerRect.Max.x; x += 3.0F) {
+            ImGui::GetIO().AddMousePosEvent(x, y);
+            frame();
+            if (ImGui::GetCurrentContext()->HoveredId == id) {
+                click(x, y);
+                return;
+            }
+        }
+        throw std::runtime_error(std::string("Glacial dialog button was not interactive: ") + label);
+    };
+    selectErosionItem(4, "Glacial erosion...");
+    check(grid.GetSnapshot() == glacialBefore,
+          "Opening Glacial erosion changed terrain before Preview.");
+    clickGlacialButton("Preview");
+    check(grid.GetSnapshot()->GetVertices().size() == glacialExpected.size() &&
+          ui.GetUndoStack().Size() == glacialHistoryBefore,
+          "Glacial Preview changed history or returned an invalid mesh.");
+    for (std::size_t i = 0; i < glacialExpected.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == glacialExpected[i],
+              "Glacial Preview did not display the CPU filter result.");
+    }
+    replaceDialogText("Glacial Erosion", "Equator ELA (m)", "2000");
+    for (std::size_t i = 0; i < glacialTerrain.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == glacialTerrain[i],
+              "Changing Glacial parameters did not remove the stale preview.");
+    }
+    clickGlacialButton("Cancel");
+    check(!dialogOpen() && ui.GetUndoStack().Size() == glacialHistoryBefore,
+          "Cancelling Glacial preview left the dialog open or changed history.");
+    for (std::size_t i = 0; i < glacialTerrain.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == glacialTerrain[i],
+              "Cancelling Glacial preview did not restore the original terrain.");
+    }
+
+    selectErosionItem(4, "Glacial erosion...");
+    clickGlacialButton("Preview");
+    clickGlacialButton("Apply");
+    check(!dialogOpen() && ui.GetUndoStack().Size() == glacialHistoryBefore + 1,
+          "Applying Glacial preview did not create one undoable edit.");
+    for (std::size_t i = 0; i < glacialExpected.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == glacialExpected[i],
+              "Applying Glacial preview changed its displayed result.");
+    }
+    shortcut(ImGuiKey_Z);
+    for (std::size_t i = 0; i < glacialTerrain.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == glacialTerrain[i],
+              "Undo did not restore the terrain before Glacial preview.");
+    }
+    shortcut(ImGuiKey_Y);
+    for (std::size_t i = 0; i < glacialExpected.size(); ++i) {
+        check(grid.GetSnapshot()->GetVertices()[i].elevation == glacialExpected[i],
+              "Redo did not restore the exact Glacial preview result.");
+    }
+
         std::vector<float> meshSelection(grid.GetSnapshot()->GetVertices().size(), 1.0F);
         std::vector<float> uniformTerrain(meshSelection.size(), 250.0F);
         grid.SetSelectionWeights(meshSelection, true);
@@ -1570,11 +1662,14 @@ void testDialog(bool densityOnly) {
     // Scripted brush library: load, save, overwrite, export and import.
     const auto library = temporary.path / "brushes";
     std::filesystem::create_directories(library);
-    BrushScriptFile{"ridges", "Ridged relief", "ridged(x, y, z, 3, 2, 0.5, 5)"}
-        .Save(library / "ridges.toml");
-    BrushScriptFile{"imported", "From elsewhere", "simplex(x, y, z)\n* 0.5",
-                    ScriptedBrushSettings::Output::Elevation}
-        .Save(temporary.path / "outside.toml");
+    BrushScriptFile libraryFile{"ridges", "Ridged relief",
+                                "ridged(x, y, z, 3, 2, 0.5, 5)"};
+    libraryFile.gpuScript = "return ridged(x, y, z, 3.0, 2.0, 0.5, 5);";
+    libraryFile.Save(library / "ridges.toml");
+    BrushScriptFile importedFile{"imported", "From elsewhere", "simplex(x, y, z)\n* 0.5",
+                                 ScriptedBrushSettings::Output::Elevation};
+    importedFile.gpuScript = "return simplex(x, y, z) * 0.5;";
+    importedFile.Save(temporary.path / "outside.toml");
     ui.SetBrushScriptDirectory(library);
     selectMenuItem(3, 8, "Custom");
     ImGui::SetWindowPos("###BrushParameters", ImVec2(40.0F, 40.0F));
@@ -1601,12 +1696,18 @@ void testDialog(bool densityOnly) {
         click(list->DC.CursorStartPos.x + 10.0F,
               list->DC.CursorStartPos.y + ImGui::GetTextLineHeight() * 0.5F);
     }
-    panelClick("Load");
+    // Choosing an item from the dropdown immediately loads its CPU and GPU bodies.
+    panelClick("##BrushGpuScript", -1, 1);
+    const auto* gpuScriptInput = ImGui::GetInputTextState(ImGui::GetActiveID());
+    check(gpuScriptInput != nullptr &&
+          std::string_view(gpuScriptInput->TextA.Data) == *libraryFile.gpuScript,
+          "Loading a library brush did not refresh the GPU GLSL editor.");
     replacePanelText("Name", "ridges copy");
     panelClick("Save to library");
     const auto copy = BrushScriptFile::Load(library / "ridges_copy.toml");
     check(copy.name == "ridges copy" && copy.description == "Ridged relief" &&
           copy.script == "ridged(x, y, z, 3, 2, 0.5, 5)" &&
+          copy.gpuScript == libraryFile.gpuScript &&
           copy.output == ScriptedBrushSettings::Output::Normalized,
           "Loading from the library and saving under a new name lost the script.");
     replacePanelText("Description", "Changed");
@@ -1631,7 +1732,8 @@ void testDialog(bool densityOnly) {
     panelClick("Save to library");
     const auto imported = BrushScriptFile::Load(library / "imported.toml");
     check(imported.description == "From elsewhere" && imported.script == "simplex(x, y, z)\n* 0.5" &&
-          imported.output == ScriptedBrushSettings::Output::Elevation,
+          imported.output == ScriptedBrushSettings::Output::Elevation &&
+          imported.gpuScript == importedFile.gpuScript,
           "Imported brush script did not replace the editor contents and output mode.");
 
     const auto parameterized = BrushScriptFile::Parse(

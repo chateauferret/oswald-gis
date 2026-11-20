@@ -5,6 +5,11 @@ script = '''
 var h := fbm(x, y, z, Frequency, Lacunarity, Persistence, Octaves);
 Billowed == 'Yes' ? 2 * abs(h) - 1 : h
 '''
+gpu_script = '''
+float h = fbm(x, y, z, param_Frequency, param_Lacunarity,
+              param_Persistence, int(param_Octaves));
+return param_Billowed > 0.5 ? 2.0 * abs(h) - 1.0 : h;
+'''
 
 [[parameter]]
 name = "Frequency"

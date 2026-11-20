@@ -33,8 +33,9 @@ void validateOptions(const GridOptions& options) {
     if (!std::isfinite(options.planetRadius) || options.planetRadius <= 0.0) {
         throw std::invalid_argument("Planet radius must be finite and positive.");
     }
-    if (options.pointCount < 1000 || options.pointCount > 1'000'000) {
-        throw std::invalid_argument("Point count must be between 1,000 and 1,000,000.");
+    if (options.pointCount < GridOptions::minimumSupportedPointCount ||
+        options.pointCount > GridOptions::maximumPointCount) {
+        throw std::invalid_argument("Point count must be between 1,000 and 10,000,000.");
     }
     if (options.relaxationIterations > 100) {
         throw std::invalid_argument("Relaxation iterations must be between 0 and 100.");
@@ -606,14 +607,14 @@ SphericalGridSnapshot::SphericalGridSnapshot(const GridOptions& options,
 
 std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::RefineSelectedRegion(
     std::size_t maxNewPoints) const {
-    if (maxNewPoints > 1'000'000) {
-        throw std::invalid_argument("Refinement point limit cannot exceed 1,000,000.");
+    if (maxNewPoints > GridOptions::maximumPointCount) {
+        throw std::invalid_argument("Refinement point limit cannot exceed 10,000,000.");
     }
     if (!selectionActive_) {
         return nullptr;
     }
-    if (vertices_.size() >= 1'000'000) {
-        throw std::runtime_error("The spherical mesh has reached its 1,000,000-vertex limit.");
+    if (vertices_.size() >= GridOptions::maximumPointCount) {
+        throw std::runtime_error("The spherical mesh has reached its 10,000,000-vertex limit.");
     }
     struct CandidateFace {
         double area;
@@ -682,8 +683,8 @@ std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::RefineSelect
     const std::size_t insertCount = maxNewPoints == 0
                                         ? selectedFaces.size()
                                         : std::min(maxNewPoints, selectedFaces.size());
-    if (insertCount > 1'000'000 - vertices_.size()) {
-        throw std::runtime_error("Refinement would exceed the 1,000,000-vertex mesh limit. "
+    if (insertCount > GridOptions::maximumPointCount - vertices_.size()) {
+        throw std::runtime_error("Refinement would exceed the 10,000,000-vertex mesh limit. "
                                  "Select a smaller region or use a point limit.");
     }
     std::vector<RefinedPoint> points;
@@ -725,8 +726,8 @@ std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::CoarsenSelec
         maximumElevationDifference > 65534.0F) {
         throw std::invalid_argument("Coarsening elevation tolerance must be finite and in [0, 65534].");
     }
-    if (maxRemovedVertices > 1'000'000) {
-        throw std::invalid_argument("Coarsening vertex limit cannot exceed 1,000,000.");
+    if (maxRemovedVertices > GridOptions::maximumPointCount) {
+        throw std::invalid_argument("Coarsening vertex limit cannot exceed 10,000,000.");
     }
     if (!selectionActive_ || vertices_.size() <= 4) {
         return nullptr;
@@ -884,8 +885,8 @@ std::shared_ptr<const SphericalGridSnapshot> SphericalGridSnapshot::CoarsenSelec
                 selectedFaces.push_back({corners, selectedArea, interior});
             }
         }
-        regeneratedPointCount = std::min(regeneratedPointCount,
-            1'000'000 - vertices.size());
+        regeneratedPointCount = std::min(
+            regeneratedPointCount, GridOptions::maximumPointCount - vertices.size());
         if (selectedFaces.empty() || regeneratedPointCount == 0) {
             return nullptr;
         }

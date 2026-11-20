@@ -96,10 +96,12 @@ void formatMemory(std::array<char, 80>& label, const char* name,
 
 } // namespace
 
-void MemoryStatusBar::Render(double now, const UndoStack& history,
-                             const GlobeRenderer* renderer) {
-    if (now >= nextSampleTime_ || sampledRevision_ != history.Revision()) {
-        auto& [cpu, gpu, process, terrain, edits] = labels_;
+void MemoryStatusBar::Render(const UndoStack& history, const GlobeRenderer* renderer) {
+    const auto terrainBytes = renderer ? renderer->GetTerrainBufferBytes() : 0;
+    const auto pointCount = renderer ? renderer->GetTerrainPointCount() : 0;
+    if (!sampled_ || sampledRevision_ != history.Revision() ||
+        sampledTerrainBytes_ != terrainBytes || sampledPointCount_ != pointCount) {
+        auto& [cpu, gpu, process, terrain, points, edits] = labels_;
         formatMemory(cpu, "CPU RAM", readCpuMemory());
         formatMemory(gpu, "GPU VRAM", readGpuMemory());
         if (const auto rss = readProcessMemory()) {
@@ -110,13 +112,16 @@ void MemoryStatusBar::Render(double now, const UndoStack& history,
         }
         if (renderer) {
             std::snprintf(terrain.data(), terrain.size(), "Terrain buffers: %.2f MiB",
-                          static_cast<double>(renderer->GetTerrainBufferBytes()) /
-                              (1024.0 * 1024.0));
+                          static_cast<double>(terrainBytes) / (1024.0 * 1024.0));
+            std::snprintf(points.data(), points.size(), "Data points: %zu",
+                          pointCount);
         }
         std::snprintf(edits.data(), edits.size(), "Undo: %zu / Redo: %zu",
                       history.UndoCount(), history.Size() - history.UndoCount());
         sampledRevision_ = history.Revision();
-        nextSampleTime_ = now + 1.0;
+        sampledTerrainBytes_ = terrainBytes;
+        sampledPointCount_ = pointCount;
+        sampled_ = true;
     }
 
     auto* viewport = ImGui::GetMainViewport();

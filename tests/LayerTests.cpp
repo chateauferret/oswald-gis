@@ -47,8 +47,10 @@ void testLayerMetadataAndGridSynchronization() {
 
     const auto count = grid.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(count, 123.5F);
+    const auto valueRevision = grid.GetElevationLayer().GetValuesRevision();
     grid.SetElevations(elevations);
     check(grid.GetElevationLayer().GetValueCount() == count &&
+              grid.GetElevationLayer().GetValuesRevision() > valueRevision &&
               std::abs(grid.GetElevationLayer().GetValues()[0] - 123.5F) < 1e-5F &&
               grid.GetSnapshot()->GetVertices()[0].elevation == 123.5F,
           "Elevation layer values did not stay synchronized with the grid.");
@@ -57,10 +59,12 @@ void testLayerMetadataAndGridSynchronization() {
     check(grid.GetActiveLayer().GetColorMap() == "relief.map",
           "Elevation layer metadata did not retain its colour map.");
     grid.SetActiveLayer("Elevation");
+    const auto revisionBeforeSelection = grid.GetElevationLayer().GetValuesRevision();
     std::vector<float> selection(count, 0.0F);
     selection[0] = 1.0F;
     grid.SetSelectionWeights(selection);
     check(grid.GetElevationLayer().GetValues()[0] == 123.5F &&
+              grid.GetElevationLayer().GetValuesRevision() == revisionBeforeSelection &&
               grid.GetSnapshot()->GetVertices()[0].selectionWeight == 1.0F,
           "Selection data was stored in or changed the elevation layer.");
 

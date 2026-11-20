@@ -1,9 +1,16 @@
+#include "ComputeContext.hpp"
+#include "BrushScriptFile.hpp"
+#include "ElevationRaster.hpp"
+#include "Filter.hpp"
 #include "GlobeRenderer.hpp"
+#include "SelectionTool.hpp"
+#include "ScriptedBrushTool.hpp"
 
 #include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -157,6 +164,457 @@ glm::vec3 expectedColor(float elevation) {
     throw std::logic_error("Expected colour lookup failed.");
 }
 
+void testComputeInfrastructure(const std::filesystem::path& shaderDirectory,
+                               const std::filesystem::path& temporaryDirectory) {
+    GridOptions options;
+    options.pointCount = GridOptions::minimumSupportedPointCount;
+    SphericalGrid grid(options);
+    const auto snapshot = grid.GetSnapshot();
+
+    ComputeContext compute;
+    auto& mesh = compute.MeshFor(snapshot);
+    check(&mesh == &compute.MeshFor(snapshot),
+          "Compute context did not reuse the cached GPU mesh.");
+    check(mesh.VertexCount() == snapshot->GetVertices().size() &&
+          mesh.DirectedEdgeCount() == snapshot->GetHalfEdges().size(),
+          "GPU mesh dimensions did not match the grid snapshot.");
+
+    ScriptedBrushTool scripted("GLSL test");
+    ScriptParameter scale;
+    scale.name = "scale";
+    scale.minimum = 0.0;
+    scale.maximum = 2.0;
+    scale.defaultValue = 1.0;
+    scripted.SetScript("x * scale", {scale}, {1.5});
+    scripted.SetGpuScript("return x * param_scale;");
+    scripted.GetSettings().application = BrushApplication::Elevation;
+    scripted.GetSettings().output = ScriptedBrushSettings::Output::Elevation;
+    scripted.GetSettings().seed = 42;
+    BrushSettings scriptBrush;
+    scriptBrush.coverage = BrushCoverage::Selection;
+    scriptBrush.raiseLowerRate = 100.0;
+    std::vector<float> cpuScriptResult(snapshot->GetVertices().size(), 0.0F);
+    std::vector<float> gpuScriptResult = cpuScriptResult;
+    scripted.Apply(*snapshot, {0.0, 0.0, 1.0}, cpuScriptResult, scriptBrush, 0.0);
+    scripted.ApplyGpu(compute, *snapshot, {0.0, 0.0, 1.0}, gpuScriptResult,
+                      scriptBrush, 0.0);
+    check(cpuScriptResult.size() == gpuScriptResult.size(),
+          "GPU brush body returned an incorrect vertex count.");
+    for (std::size_t i = 0; i < cpuScriptResult.size(); ++i) {
+        check(std::abs(cpuScriptResult[i] - gpuScriptResult[i]) <= 1.0e-4F,
+              "GPU brush body inputs or parameter values differed from exprtk.");
+    }
+
+    scripted.SetGpuScript(
+        "return fbm(x, y, z, param_scale, 2.0, 0.5, 4) + "
+        "valuefbm(x, y, z, 2.0, 2.0, 0.5, 3) + "
+        "billow(x, y, z, 1.0, 2.0, 0.5, 2) + "
+        "ridged(x, y, z, 1.0, 2.0, 0.5, 2) + valuenoise(x, y, z) + simplex(x, y, z);");
+    std::fill(gpuScriptResult.begin(), gpuScriptResult.end(), 0.0F);
+    scripted.ApplyGpu(compute, *snapshot, {0.0, 0.0, 1.0}, gpuScriptResult,
+                      scriptBrush, 0.0);
+    check(std::all_of(gpuScriptResult.begin(), gpuScriptResult.end(),
+                      [](float value) { return std::isfinite(value); }),
+          "GLSL noise functions returned non-finite results.");
+    scripted.SetGpuScript(
+        "return spectral(x,y,z,4.0,2.0,16.0) + "
+        "warp_x(x,y,z,4.0,1.25,2.0,0.5,3) + "
+        "warp_y(x,y,z,4.0,1.25,2.0,0.5,3) + "
+        "warp_z(x,y,z,4.0,1.25,2.0,0.5,3);");
+    std::fill(gpuScriptResult.begin(), gpuScriptResult.end(), 0.0F);
+    scripted.ApplyGpu(compute, *snapshot, {0.0, 0.0, 1.0}, gpuScriptResult,
+                      scriptBrush, 0.0);
+    check(std::all_of(gpuScriptResult.begin(), gpuScriptResult.end(),
+                      [](float value) { return std::isfinite(value); }),
+          "GLSL spectral or domain-warp functions returned non-finite results.");
+
+    const auto brushLibrary = BrushScriptLibrary::Scan(OSWALD_BRUSH_SCRIPT_DIR);
+    check(brushLibrary.errors.empty() && brushLibrary.entries.size() == 10,
+          "Every shipped brush must load successfully.");
+    for (const auto& entry : brushLibrary.entries) {
+        check(entry.file.gpuScript.has_value(),
+              ("Brush has no gpu_script: " + entry.file.name).c_str());
+        ScriptedBrushTool brush(entry.file.name);
+        brush.SetScript(entry.file.script, entry.file.parameters);
+        brush.SetGpuScript(entry.file.gpuScript);
+        brush.GetSettings().application = entry.file.application;
+        brush.GetSettings().output = entry.file.output.value_or(
+            ScriptedBrushSettings::Output::Normalized);
+        brush.GetSettings().rangeBetween = -1000.0F;
+        brush.GetSettings().rangeAnd = 1000.0F;
+        auto parameters = brush.GetParameters();
+        for (std::size_t i = 0; i < parameters.size(); ++i) {
+            if (entry.file.name == "Gaussian Blur" && parameters[i].name == "Range") {
+                brush.SetParameterValue(i, 5000.0);
+            } else if (entry.file.name == "Gaussian Blur" &&
+                       parameters[i].name == "Sigma") {
+                brush.SetParameterValue(i, 2000.0);
+            }
+        }
+        std::vector<float> cpuValues(snapshot->GetVertices().size());
+        for (std::size_t i = 0; i < cpuValues.size(); ++i) {
+            cpuValues[i] = static_cast<float>(static_cast<int>(i % 37) - 18) * 100.0F;
+        }
+        std::vector<float> gpuValues = cpuValues;
+        brush.Apply(*snapshot, {0.0, 0.0, 1.0}, cpuValues, scriptBrush, 1.0);
+        brush.ApplyGpu(compute, *snapshot, {0.0, 0.0, 1.0}, gpuValues,
+                       scriptBrush, 1.0);
+        check(gpuValues.size() == snapshot->GetVertices().size() &&
+              std::all_of(gpuValues.begin(), gpuValues.end(),
+                          [](float value) { return std::isfinite(value); }),
+              ("GPU brush body failed: " + entry.file.name).c_str());
+        if (entry.file.application != BrushApplication::Noise ||
+            entry.file.name == "Gaussian Blur") {
+            for (std::size_t i = 0; i < cpuValues.size(); ++i) {
+                check(std::abs(cpuValues[i] - gpuValues[i]) <= 0.1F,
+                      ("GPU brush body differed from CPU script: " + entry.file.name).c_str());
+            }
+        }
+    }
+
+    std::vector<std::uint32_t> offsets(mesh.VertexCount() + 1);
+    std::vector<std::uint32_t> neighbors(mesh.DirectedEdgeCount());
+    std::vector<float> distances(mesh.DirectedEdgeCount());
+    std::vector<double> preciseDistances(mesh.DirectedEdgeCount());
+    glGetNamedBufferSubData(mesh.NeighborOffsets(), 0,
+        static_cast<GLsizeiptr>(offsets.size() * sizeof(offsets[0])), offsets.data());
+    glGetNamedBufferSubData(mesh.Neighbors(), 0,
+        static_cast<GLsizeiptr>(neighbors.size() * sizeof(neighbors[0])), neighbors.data());
+    glGetNamedBufferSubData(mesh.EdgeDistancesKm(), 0,
+        static_cast<GLsizeiptr>(distances.size() * sizeof(distances[0])), distances.data());
+    glGetNamedBufferSubData(mesh.PreciseEdgeDistancesKm(), 0,
+        static_cast<GLsizeiptr>(preciseDistances.size() * sizeof(preciseDistances[0])),
+        preciseDistances.data());
+    check(glGetError() == GL_NO_ERROR, "GPU mesh readback failed.");
+    check(offsets.front() == 0 && offsets.back() == neighbors.size(),
+          "GPU mesh CSR offsets did not cover all directed edges.");
+
+    const double radiusKm = snapshot->GetOptions().planetRadius;
+    for (std::size_t vertex = 0; vertex < mesh.VertexCount(); ++vertex) {
+        const auto from = glm::normalize(glm::dvec3(snapshot->GetVertices()[vertex].position));
+        for (std::size_t edge = offsets[vertex]; edge < offsets[vertex + 1]; ++edge) {
+            check(neighbors[edge] < mesh.VertexCount() && std::isfinite(distances[edge]),
+                  "GPU mesh contains an invalid neighbor or edge distance.");
+            const auto to = glm::normalize(glm::dvec3(
+                snapshot->GetVertices()[neighbors[edge]].position));
+            const double expected = radiusKm * std::acos(
+                std::clamp(glm::dot(from, to), -1.0, 1.0));
+            check(std::abs(static_cast<double>(distances[edge]) - expected) < 1e-3,
+                  "GPU edge distance exceeded the CPU precision tolerance.");
+            check(std::abs(preciseDistances[edge] - expected) < 1e-10,
+                  "GPU glacial edge distance exceeded the CPU double-precision tolerance.");
+        }
+    }
+
+    const auto shader = temporaryDirectory / "compute_test.comp";
+    {
+        std::ofstream output(shader);
+        output << "#version 450 core\n"
+                  "layout(local_size_x = 256) in;\n"
+                  "layout(std430, binding = 0) readonly buffer Source { float source[]; };\n"
+                  "layout(std430, binding = 1) writeonly buffer Target { float target[]; };\n"
+                  "layout(std430, binding = 2) buffer Error { uint code; uint index; };\n"
+                  "uniform uint count;\n"
+                  "void main() {\n"
+                  "  uint i = gl_GlobalInvocationID.x;\n"
+                  "  if (i >= count) return;\n"
+                  "  float value = source[i];\n"
+                  "  if (isnan(value) || isinf(value)) {\n"
+                  "    if (atomicCompSwap(code, 0u, 1u) == 0u) index = i;\n"
+                  "    return;\n"
+                  "  }\n"
+                  "  target[i] = value + 0.125;\n"
+                  "}\n";
+        output.close();
+        check(static_cast<bool>(output), "Failed to write compute test shader.");
+    }
+    const GLuint program = compute.LoadProgram(shader);
+    constexpr std::size_t count = 513;
+    const GLuint sourceBuffer = compute.Scratch(count, 0);
+    const GLuint targetBuffer = compute.Scratch(count, 1);
+    std::vector<float> source(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        source[i] = static_cast<float>(i) / 7.0F;
+    }
+    glNamedBufferSubData(sourceBuffer, 0,
+        static_cast<GLsizeiptr>(source.size() * sizeof(source[0])), source.data());
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sourceBuffer);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, targetBuffer);
+    glProgramUniform1ui(program, glGetUniformLocation(program, "count"),
+                        static_cast<GLuint>(count));
+    compute.ClearErrors();
+    compute.Dispatch1D(program, count);
+    check(!compute.CheckErrors(), "Valid compute dispatch unexpectedly set an error flag.");
+    const auto result = compute.Readback(targetBuffer, count);
+    for (std::size_t i = 0; i < count; ++i) {
+        check(std::abs(result[i] - (source[i] + 0.125F)) <= 1e-3F,
+              "GPU compute output exceeded the CPU comparison tolerance.");
+    }
+
+    source[17] = std::numeric_limits<float>::infinity();
+    glNamedBufferSubData(sourceBuffer, 0,
+        static_cast<GLsizeiptr>(source.size() * sizeof(source[0])), source.data());
+    compute.ClearErrors();
+    compute.Dispatch1D(program, count);
+    const auto error = compute.CheckErrors();
+    check(error && error->code == ComputeError::Code::NonFinite && error->index == 17,
+          "GPU compute error flag did not report the non-finite value and vertex.");
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, ComputeContext::errorBufferBinding, 0);
+
+    std::vector<float> elevations(mesh.VertexCount());
+    for (std::size_t i = 0; i < elevations.size(); ++i) {
+        const auto position = snapshot->GetVertices()[i].position;
+        elevations[i] = 1000.0F + 700.0F * position.x + 250.0F * position.y;
+    }
+    const auto terrain = std::make_shared<SphericalGridSnapshot>(*snapshot, elevations);
+    auto verifyFilter = [&](const Filter& filter, const char* name) {
+        const auto verifySnapshot = [&](const auto& testSnapshot) {
+            const auto expected = filter.Apply(*testSnapshot, elevations);
+            const auto actual = compute.ApplyFilter(
+                filter, testSnapshot, elevations, shaderDirectory);
+            check(actual.size() == expected.size(),
+                  "GPU filter returned an incorrect result size.");
+            float maximumDifference = 0.0F;
+            std::size_t maximumDifferenceIndex = 0;
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                const float difference = std::abs(actual[i] - expected[i]);
+                if (difference > maximumDifference) {
+                    maximumDifference = difference;
+                    maximumDifferenceIndex = i;
+                }
+            }
+            check(maximumDifference <= 1e-3F,
+                  (std::string("GPU filter exceeded its comparison tolerance: ") + name +
+                   " difference=" + std::to_string(maximumDifference) +
+                   " vertex=" + std::to_string(maximumDifferenceIndex) +
+                   " expected=" + std::to_string(expected[maximumDifferenceIndex]) +
+                   " actual=" + std::to_string(actual[maximumDifferenceIndex]) +
+                   " selected=" + std::to_string(testSnapshot->HasSelection())).c_str());
+        };
+        verifySnapshot(terrain);
+        std::vector<float> selectionWeights(elevations.size());
+        for (std::size_t i = 0; i < selectionWeights.size(); ++i) {
+            selectionWeights[i] = static_cast<float>(i % 5) * 0.25F;
+        }
+        const auto selectedTerrain = std::make_shared<SphericalGridSnapshot>(
+            *terrain, elevations, selectionWeights, true);
+        verifySnapshot(selectedTerrain);
+    };
+
+    FillFilter fill;
+    fill.SetSettings({FillOperation::Raise, 23.5F});
+    verifyFilter(fill, "Fill");
+    PrecipitonFilter precipiton;
+    precipiton.SetSettings({0.025});
+    verifyFilter(precipiton, "Precipiton");
+    ThermalWeatheringFilter thermal;
+    thermal.SetSettings({15.0});
+    verifyFilter(thermal, "Thermal weathering");
+    CratonicGroovingFilter grooving;
+    grooving.SetSettings({glm::dvec3(0.3, 0.7, -0.2), 0.35, 0.8, 0.02});
+    verifyFilter(grooving, "Cratonic grooving");
+    CratonicScourFilter scour;
+    scour.SetSettings({glm::dvec3(-0.2, 0.8, 0.4), 0.3, 0.015, 0.08, 150.0, 0.002});
+    verifyFilter(scour, "Cratonic scour");
+    GlacialErosionFilter glacial;
+    GlacialErosionSettings glacialSettings;
+    glacialSettings.equilibriumLineAltitude = 1200.0;
+    glacialSettings.elaLatitudeGradient = 8.0;
+    glacialSettings.accumulationRate = 0.015;
+    glacialSettings.ablationRate = 0.025;
+    glacialSettings.initialIceThickness = 20.0;
+    glacialSettings.durationYears = 3.0;
+    glacialSettings.glacialErodibility = 0.0002;
+    glacialSettings.iceViscosityFactor = 0.003;
+    glacialSettings.thicknessExponent = 1.0;
+    glacialSettings.velocityExponent = 2.0;
+    glacialSettings.troughHalfWidth = 1500.0;
+    glacial.SetSettings(glacialSettings);
+    auto glacialStaticLoad = glacialSettings;
+    glacialStaticLoad.durationYears = 0.0;
+    glacialStaticLoad.glacialErodibility = 0.0;
+    glacial.SetSettings(glacialStaticLoad);
+    verifyFilter(glacial, "Glacial static load");
+    auto glacialLoadOnly = glacialSettings;
+    glacialLoadOnly.glacialErodibility = 0.0;
+    glacial.SetSettings(glacialLoadOnly);
+    verifyFilter(glacial, "Glacial loading");
+    auto glacialFractional = glacialSettings;
+    glacialFractional.thicknessExponent = 1.3;
+    glacialFractional.velocityExponent = 1.7;
+    glacial.SetSettings(glacialFractional);
+    verifyFilter(glacial, "Glacial fractional exponents");
+    glacial.SetSettings(glacialSettings);
+    verifyFilter(glacial, "Glacial erosion");
+    AbsoluteMagnitudeNoiseFilter noise;
+    noise.SetAmplitudeFeet(500.0F);
+    const auto noisyElevations = compute.ApplyFilter(noise, terrain, elevations, shaderDirectory);
+    bool noiseChangedElevation = false;
+    check(noisyElevations.size() == elevations.size(),
+          "GPU absolute-magnitude noise returned an incorrect result size.");
+    for (std::size_t i = 0; i < noisyElevations.size(); ++i) {
+        const float value = noisyElevations[i];
+        check(std::isfinite(value) && value >= -32767.0F && value <= 32767.0F &&
+              std::abs(value - elevations[i]) <= 152.4F + 1e-3F,
+              "GPU absolute-magnitude noise exceeded its amplitude or elevation range.");
+        noiseChangedElevation |= value != elevations[i];
+    }
+    check(noiseChangedElevation, "GPU absolute-magnitude noise did not alter any elevation.");
+    auto invalidElevations = elevations;
+    invalidElevations[23] = std::numeric_limits<float>::quiet_NaN();
+    expectFailure([&] {
+        compute.ApplyFilter(fill, terrain, invalidElevations, shaderDirectory);
+    });
+
+    const auto weights = std::vector<float>(elevations.size(), 0.0F);
+    const auto selectedByValue = compute.ApplySelection(
+        SelectionComputeOperation::ByValue, terrain, weights,
+        500.0, 1200.0, 35.0, shaderDirectory);
+    const auto expectedSelection = SelectByValue(*terrain, 500.0, 1200.0, 35.0);
+    for (std::size_t i = 0; i < selectedByValue.size(); ++i) {
+        check(std::abs(selectedByValue[i] - expectedSelection[i]) <= 1e-3F,
+              "GPU value selection exceeded the 1e-3 tolerance.");
+    }
+    auto activeTerrain = std::make_shared<SphericalGridSnapshot>(
+        *terrain, elevations, std::vector<float>(elevations.size(), 0.25F), true);
+    const auto activeWeights = std::vector<float>(elevations.size(), 0.25F);
+    const auto inverted = compute.ApplySelection(
+        SelectionComputeOperation::Invert, activeTerrain, activeWeights,
+        0.0, 0.0, 0.0, shaderDirectory);
+    const auto cleared = compute.ApplySelection(
+        SelectionComputeOperation::Clear, activeTerrain, activeWeights,
+        0.0, 0.0, 0.0, shaderDirectory);
+    check(std::all_of(inverted.begin(), inverted.end(),
+                      [](float value) { return value == 0.75F; }) &&
+          std::all_of(cleared.begin(), cleared.end(),
+                      [](float value) { return value == 0.0F; }),
+          "GPU invert or clear selection returned an incorrect result.");
+    const auto invertedInactive = compute.ApplySelection(
+        SelectionComputeOperation::Invert, terrain, weights,
+        0.0, 0.0, 0.0, shaderDirectory);
+    check(std::all_of(invertedInactive.begin(), invertedInactive.end(),
+                      [](float value) { return value == 1.0F; }),
+          "GPU invert did not select all sites when no selection was active.");
+    SelectionSettings radiusSettings;
+    radiusSettings.radius = 1400.0;
+    radiusSettings.falloffPercent = 30.0;
+    std::vector<float> expectedRadiusWeights(elevations.size(), 0.1F);
+    auto actualRadiusWeights = expectedRadiusWeights;
+    RadiusSelectionTool radiusTool;
+    radiusTool.Apply(*terrain, {1.0, 0.0, 0.0}, expectedRadiusWeights, radiusSettings);
+    actualRadiusWeights = compute.ApplyRadiusSelection(
+        terrain, actualRadiusWeights, {1.0, 0.0, 0.0}, radiusSettings.radius,
+        radiusSettings.falloffPercent, terrain->GetOptions().planetRadius, shaderDirectory);
+    for (std::size_t i = 0; i < actualRadiusWeights.size(); ++i) {
+        check(std::abs(actualRadiusWeights[i] - expectedRadiusWeights[i]) <= 1e-3F,
+              "GPU radius selection exceeded the 1e-3 tolerance.");
+    }
+    radiusSettings.falloffPercent = 0.0;
+    std::vector<float> hardRadiusExpected(elevations.size(), 0.0F);
+    std::vector<float> hardRadiusActual(elevations.size(), 0.0F);
+    radiusTool.Apply(*terrain, {1.0, 0.0, 0.0}, hardRadiusExpected, radiusSettings);
+    hardRadiusActual = compute.ApplyRadiusSelection(
+        terrain, hardRadiusActual, {1.0, 0.0, 0.0}, radiusSettings.radius,
+        radiusSettings.falloffPercent, terrain->GetOptions().planetRadius, shaderDirectory);
+    check(hardRadiusActual == hardRadiusExpected,
+          "GPU radius selection with no falloff included points outside its radius.");
+
+    const std::array polygon{
+        glm::dvec3(1.0, -0.4, -0.4), glm::dvec3(1.0, 0.4, -0.4),
+        glm::dvec3(1.0, 0.4, 0.4), glm::dvec3(1.0, -0.4, 0.4)};
+    const auto actualPolygon = compute.ApplyPolygonSelection(terrain, polygon, shaderDirectory);
+    const auto expectedPolygon = SelectSphericalPolygon(*terrain, polygon);
+    check(actualPolygon == expectedPolygon,
+          "GPU polygon selection differs from the CPU winding reference.");
+    const auto histogram = compute.Histogram(elevations, shaderDirectory);
+    std::array<float, 32> expectedHistogram{};
+    for (const float value : elevations) {
+        const auto bin = static_cast<std::size_t>(std::clamp(
+            (value + 32767.0F) / 65534.0F * 32.0F, 0.0F, 31.0F));
+        expectedHistogram[bin] += 1.0F;
+    }
+    check(histogram == expectedHistogram,
+          "GPU histogram bins differ from the CPU reference.");
+
+    const auto rasterPath = temporaryDirectory / "gpu_sampling.ppm";
+    {
+        std::ofstream output(rasterPath, std::ios::binary);
+        output << "P6\n4 2\n255\n";
+        const std::array<unsigned char, 24> pixels{
+            0, 0, 0, 255, 0, 0, 0, 255, 0, 255, 255, 255,
+            255, 255, 255, 0, 255, 0, 255, 0, 0, 0, 0, 0};
+        output.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
+        output.close();
+        check(static_cast<bool>(output), "Failed to write GPU raster sampling fixture.");
+    }
+    const auto raster = ElevationRaster::Load(rasterPath);
+    const auto cpuRasterSamples = raster.SampleElevations(*terrain);
+    const auto gpuRasterSamples = raster.SampleElevations(
+        *terrain, compute, shaderDirectory);
+    check(cpuRasterSamples.size() == gpuRasterSamples.size(),
+          "GPU raster sampling returned an incorrect result size.");
+    float maximumRasterDifference = 0.0F;
+    std::size_t maximumRasterIndex = 0;
+    for (std::size_t i = 0; i < cpuRasterSamples.size(); ++i) {
+        const float difference = std::abs(cpuRasterSamples[i] - gpuRasterSamples[i]);
+        if (difference > maximumRasterDifference) {
+            maximumRasterDifference = difference;
+            maximumRasterIndex = i;
+        }
+    }
+    check(maximumRasterDifference <= 0.05F,
+          ("GPU raster bilinear sampling exceeded its 0.05 m tolerance: " +
+           std::to_string(maximumRasterDifference) + " at " +
+           std::to_string(maximumRasterIndex) + " cpu=" +
+           std::to_string(cpuRasterSamples[maximumRasterIndex]) + " gpu=" +
+           std::to_string(gpuRasterSamples[maximumRasterIndex])).c_str());
+
+    std::vector<float> exportSelection(elevations.size());
+    for (std::size_t i = 0; i < exportSelection.size(); ++i) {
+        exportSelection[i] = static_cast<float>(i % 5) * 0.25F;
+    }
+    const auto exportSnapshot = std::make_shared<SphericalGridSnapshot>(
+        *terrain, elevations, exportSelection, true);
+    const auto colorMap = ColorMap::Load(resources / "assets/colormaps/default.map");
+    const auto selectionMap = ColorMap::Load(resources / "assets/colormaps/default.map");
+    constexpr int exportWidth = 128;
+    constexpr int exportHeight = 64;
+    const auto gpuExport = compute.SampleExport(exportSnapshot, elevations, exportSelection,
+        exportWidth, exportHeight, &colorMap, &selectionMap, shaderDirectory);
+    check(gpuExport.elevations.size() == static_cast<std::size_t>(exportWidth * exportHeight) &&
+          gpuExport.rgb.size() == gpuExport.elevations.size(),
+          "GPU export returned incorrect elevation or RGB dimensions.");
+    for (int y = 0; y < exportHeight; ++y) {
+        const double latitude = std::acos(-1.0) *
+            (0.5 - (y + 0.5) / exportHeight);
+        const double radial = std::cos(latitude);
+        for (int x = 0; x < exportWidth; ++x) {
+            const double longitude = 2.0 * std::acos(-1.0) *
+                ((x + 0.5) / exportWidth - 0.5);
+            const glm::dvec3 point(radial * std::cos(longitude),
+                                   radial * std::sin(longitude), std::sin(latitude));
+            const auto site = exportSnapshot->FindNearest(point);
+            const auto pixelIndex = static_cast<std::size_t>(y) * exportWidth + x;
+            check(gpuExport.elevations[pixelIndex] == elevations[site],
+                  "GPU nearest-site export differed from the CPU reference.");
+            auto color = glm::mix(selectionMap.Sample(elevations[site]),
+                                  colorMap.Sample(elevations[site]),
+                                  exportSelection[site]);
+            for (std::size_t channel = 0; channel < 3; ++channel) {
+                const auto expected = static_cast<unsigned int>(
+                    std::lround(std::clamp(color[static_cast<glm::length_t>(channel)],
+                                           0.0F, 1.0F) * 255));
+                const auto actual = (gpuExport.rgb[pixelIndex] >>
+                    (16 - static_cast<unsigned int>(channel) * 8)) & 0xFFu;
+                check(actual == expected,
+                      "GPU export color map differed from the CPU reference.");
+            }
+        }
+    }
+}
+
 void testGpu() {
     const GlfwSession session;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
@@ -186,6 +644,8 @@ void testGpu() {
         "void main() { color = vElevation; }\n");
     expectFailure([&] { GlobeRenderer invalidLink(temporary.path); });
     check(glGetError() == GL_NO_ERROR, "Shader failure leaked OpenGL errors.");
+
+    testComputeInfrastructure(resources / "shaders/compute", temporary.path);
 
     GlobeRenderer renderer(resources / "shaders");
     expectFailure([&] { renderer.Draw(width, height); });

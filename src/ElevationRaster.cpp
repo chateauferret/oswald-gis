@@ -6,6 +6,7 @@
 #include "ElevationRaster.hpp"
 #include "AtomicFile.hpp"
 #include "ColorMap.hpp"
+#include "ParallelFor.hpp"
 #include <tiffio.h>
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <locale>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -243,15 +245,33 @@ void ElevationRaster::Export(const std::filesystem::path& path, const SphericalG
     ExportRaster(path, grid, width, height, tiffSampleType, nullptr, nullptr);
 }
 
+void ElevationRaster::Export(const std::filesystem::path& path, const SphericalGrid& grid,
+                             int width, int height, TiffSampleType tiffSampleType,
+                             RasterComputeBackend& compute,
+                             const std::filesystem::path& shaderDirectory) {
+    ExportRaster(path, grid, width, height, tiffSampleType, nullptr, nullptr,
+                 &compute, shaderDirectory);
+}
+
 void ElevationRaster::ExportImage(const std::filesystem::path& path, const SphericalGrid& grid,
                                   const ColorMap& colorMap, const ColorMap* selectionColorMap,
                                   int width, int height) {
     ExportRaster(path, grid, width, height, TiffSampleType::Grayscale8, &colorMap, selectionColorMap);
 }
 
+void ElevationRaster::ExportImage(const std::filesystem::path& path, const SphericalGrid& grid,
+                                  const ColorMap& colorMap, const ColorMap* selectionColorMap,
+                                  int width, int height, RasterComputeBackend& compute,
+                                  const std::filesystem::path& shaderDirectory) {
+    ExportRaster(path, grid, width, height, TiffSampleType::Grayscale8, &colorMap,
+                 selectionColorMap, &compute, shaderDirectory);
+}
+
 void ElevationRaster::ExportRaster(const std::filesystem::path& path, const SphericalGrid& grid,
                                    int width, int height, TiffSampleType tiffSampleType,
-                                   const ColorMap* colorMap, const ColorMap* selectionColorMap) {
+                                   const ColorMap* colorMap, const ColorMap* selectionColorMap,
+                                   RasterComputeBackend* compute,
+                                   const std::filesystem::path& shaderDirectory) {
     if (!grid.HasActiveLayer()) {
         throw std::logic_error("Activate an elevation layer before exporting.");
     }
@@ -273,37 +293,57 @@ void ElevationRaster::ExportRaster(const std::filesystem::path& path, const Sphe
     for (std::size_t i = 0; i < elevations.size(); ++i) {
         elevations[i] = grid.GetActiveCompositedElevation(i);
     }
-    std::vector<glm::vec3> colors;
-    if (colorMap != nullptr) {
-        colors.reserve(elevations.size());
-        for (std::size_t i = 0; i < elevations.size(); ++i) {
-            auto color = colorMap->Sample(elevations[i]);
-            if (selectionColorMap != nullptr && snapshot->HasSelection()) {
-                color = glm::mix(selectionColorMap->Sample(elevations[i]), color,
-                                 snapshot->GetVertices()[i].selectionWeight);
-            }
-            colors.push_back(color);
-        }
-    }
     std::vector<float> pixels(static_cast<std::size_t>(width) * height);
     std::vector<unsigned char> rgb(colorMap == nullptr ? 0 : pixels.size() * 3);
-    for (int y = 0; y < height; ++y) {
-        const double latitude = pi * (0.5 - (y + 0.5) / height);
-        const double radial = std::cos(latitude);
-        for (int x = 0; x < width; ++x) {
-            const double longitude = 2.0 * pi * ((x + 0.5) / width - 0.5);
-            const glm::dvec3 point(radial * std::cos(longitude),
-                                   radial * std::sin(longitude), std::sin(latitude));
-            const auto site = snapshot->FindNearest(point);
-            const auto pixel = static_cast<std::size_t>(y) * width + x;
-            pixels[pixel] = elevations[site];
-            if (colorMap != nullptr) {
-                for (int channel = 0; channel < 3; ++channel) {
-                    rgb[pixel * 3 + channel] = static_cast<unsigned char>(
-                        std::lround(std::clamp(colors[site][channel], 0.0F, 1.0F) * 255));
-                }
+    if (compute != nullptr) {
+        std::vector<float> selectionWeights;
+        selectionWeights.reserve(snapshot->GetVertices().size());
+        for (const auto& vertex : snapshot->GetVertices()) {
+            selectionWeights.push_back(snapshot->HasSelection()
+                ? vertex.selectionWeight : 1.0F);
+        }
+        auto sampled = compute->SampleExport(snapshot, elevations, selectionWeights,
+            width, height, colorMap, selectionColorMap, shaderDirectory);
+        pixels = std::move(sampled.elevations);
+        if (colorMap != nullptr) {
+            for (std::size_t i = 0; i < sampled.rgb.size(); ++i) {
+                rgb[i * 3] = static_cast<unsigned char>((sampled.rgb[i] >> 16) & 0xFF);
+                rgb[i * 3 + 1] = static_cast<unsigned char>((sampled.rgb[i] >> 8) & 0xFF);
+                rgb[i * 3 + 2] = static_cast<unsigned char>(sampled.rgb[i] & 0xFF);
             }
         }
+    } else {
+        std::vector<glm::vec3> colors;
+        if (colorMap != nullptr) {
+            colors.reserve(elevations.size());
+            for (std::size_t i = 0; i < elevations.size(); ++i) {
+                auto color = colorMap->Sample(elevations[i]);
+                if (selectionColorMap != nullptr && snapshot->HasSelection()) {
+                    color = glm::mix(selectionColorMap->Sample(elevations[i]), color,
+                                     snapshot->GetVertices()[i].selectionWeight);
+                }
+                colors.push_back(color);
+            }
+        }
+        parallelFor(static_cast<std::size_t>(height), 4, [&](std::size_t row) {
+            const int y = static_cast<int>(row);
+            const double latitude = pi * (0.5 - (y + 0.5) / height);
+            const double radial = std::cos(latitude);
+            for (int x = 0; x < width; ++x) {
+                const double longitude = 2.0 * pi * ((x + 0.5) / width - 0.5);
+                const glm::dvec3 point(radial * std::cos(longitude),
+                                       radial * std::sin(longitude), std::sin(latitude));
+                const auto site = snapshot->FindNearest(point);
+                const auto pixel = static_cast<std::size_t>(y) * width + x;
+                pixels[pixel] = elevations[site];
+                if (colorMap != nullptr) {
+                    for (int channel = 0; channel < 3; ++channel) {
+                        rgb[pixel * 3 + channel] = static_cast<unsigned char>(
+                            std::lround(std::clamp(colors[site][channel], 0.0F, 1.0F) * 255));
+                    }
+                }
+            }
+        });
     }
     AtomicFile file(path);
     if (isTiff(path)) {
@@ -459,4 +499,21 @@ std::vector<float> ElevationRaster::SampleElevations(const SphericalGridSnapshot
         elevations.push_back(elevationSamples_ ? value : -32767.0F + value * 65534.0F);
     }
     return elevations;
+}
+
+std::vector<float> ElevationRaster::SampleElevations(
+    const SphericalGridSnapshot& grid, RasterComputeBackend& compute,
+    const std::filesystem::path& shaderDirectory) const {
+    if (width_ <= 0 || height_ <= 0 ||
+        samples_.size() != static_cast<std::size_t>(width_) * height_) {
+        throw std::logic_error("Raster has not been initialized.");
+    }
+    std::vector<float> currentElevations;
+    currentElevations.reserve(grid.GetVertices().size());
+    for (const auto& vertex : grid.GetVertices()) {
+        currentElevations.push_back(vertex.elevation);
+    }
+    auto snapshot = std::make_shared<SphericalGridSnapshot>(grid, currentElevations);
+    return compute.SampleRaster(std::move(snapshot), samples_, width_, height_,
+                                elevationSamples_, shaderDirectory);
 }

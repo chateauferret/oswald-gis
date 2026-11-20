@@ -109,6 +109,125 @@ std::string ScriptedBrushTool::GetScript() const {
     return script_->GetSource();
 }
 
+std::optional<std::string> ScriptedBrushTool::GetGpuScript() const {
+    std::lock_guard lock(mutex_);
+    return gpuScript_;
+}
+
+void ScriptedBrushTool::SetGpuScript(std::optional<std::string> source) {
+    if (source && (source->empty() || source->size() > 64 * 1024)) {
+        throw std::invalid_argument("GPU brush body must contain between 1 byte and 64 KiB of GLSL.");
+    }
+    std::lock_guard lock(mutex_);
+    gpuScript_ = std::move(source);
+}
+
+bool ScriptedBrushTool::HasGpuScript() const {
+    std::lock_guard lock(mutex_);
+    return gpuScript_.has_value();
+}
+
+std::vector<std::size_t> ScriptedBrushTool::ApplyGpu(
+    BrushScriptComputeBackend& compute,
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& settings, double elapsedSeconds) const {
+    std::lock_guard lock(mutex_);
+    if (!gpuScript_) {
+        throw std::logic_error("This brush does not define a GPU GLSL body.");
+    }
+    const auto& parameters = settings_;
+    const double lower = std::min(parameters.rangeBetween, parameters.rangeAnd);
+    const double upper = std::max(parameters.rangeBetween, parameters.rangeAnd);
+    if (parameters.output != ScriptedBrushSettings::Output::Normalized &&
+        parameters.output != ScriptedBrushSettings::Output::Elevation) {
+        throw std::invalid_argument("Scripted brush output mode is invalid.");
+    }
+    if (!std::isfinite(settings.raiseLowerRate) || settings.raiseLowerRate <= 0.0) {
+        throw std::invalid_argument("Brush rate must be finite and positive.");
+    }
+    if (elevations.size() != grid.GetVertices().size()) {
+        throw std::invalid_argument("Brush elevation count must match the grid vertex count.");
+    }
+
+    std::vector<GpuScriptParameter> gpuParameters;
+    gpuParameters.reserve(parameters_.size());
+    for (std::size_t i = 0; i < parameters_.size(); ++i) {
+        const auto& definition = parameters_[i];
+        const auto& value = parameterValues_[i];
+        float numericValue = 0.0F;
+        if (definition.type == ScriptParameter::Type::Choice) {
+            const auto& choice = std::get<std::string>(value);
+            const auto found = std::find(definition.choices.begin(), definition.choices.end(), choice);
+            if (found == definition.choices.end()) {
+                throw std::invalid_argument("GPU brush choice parameter has an invalid value.");
+            }
+            numericValue = static_cast<float>(std::distance(definition.choices.begin(), found));
+        } else {
+            numericValue = static_cast<float>(std::get<double>(value));
+            if (!std::isfinite(numericValue)) {
+                throw std::invalid_argument("GPU brush numeric parameter exceeds the GLSL float range.");
+            }
+        }
+        gpuParameters.push_back({definition.name, numericValue});
+    }
+    const auto common = parameters.application == BrushApplication::Noise ?
+        static_cast<const NoiseSettings&>(parameters) : NoiseSettings{};
+    std::vector<GpuScriptTerrainVertex> terrainVertices;
+    std::vector<float> terrainElevations;
+    terrainVertices.reserve(grid.GetVertices().size());
+    terrainElevations.reserve(grid.GetVertices().size());
+    for (std::size_t i = 0; i < grid.GetVertices().size(); ++i) {
+        const auto position = glm::normalize(glm::dvec3(grid.GetVertices()[i].position));
+        terrainVertices.push_back({{
+            static_cast<float>(position.x), static_cast<float>(position.y),
+            static_cast<float>(position.z), 0.0F}});
+        terrainElevations.push_back(elevations[i]);
+    }
+    return ApplyNoiseSamplerBatch(grid, center, elevations, settings, elapsedSeconds, common,
+        [&](std::span<const NoiseSample> samples) {
+            std::vector<GpuScriptInput> inputs;
+            inputs.reserve(samples.size());
+            const auto toFloat = [](double value) {
+                const float result = static_cast<float>(value);
+                if (!std::isfinite(result)) {
+                    throw std::invalid_argument("GPU brush input exceeds the GLSL float range.");
+                }
+                return result;
+            };
+            for (const auto& sample : samples) {
+                GpuScriptInput input{};
+                input.positionAndLatitude = {
+                    toFloat(sample.position.x), toFloat(sample.position.y),
+                    toFloat(sample.position.z),
+                    toFloat(glm::degrees(std::atan2(sample.location.z,
+                        std::hypot(sample.location.x, sample.location.y))))};
+                input.terrain = {
+                    toFloat(glm::degrees(std::atan2(sample.location.y, sample.location.x))),
+                    sample.elevation, toFloat(sample.weight), toFloat(sample.distance)};
+                input.brush = {toFloat(settings.radius), toFloat(lower), toFloat(upper),
+                               toFloat(elapsedSeconds)};
+                input.timing = {toFloat(settings.raiseLowerRate), 0.0F, 0.0F, 0.0F};
+                if (sample.index > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::length_error("GPU brush vertex index exceeds the GLSL range.");
+                }
+                input.vertexIndex = static_cast<std::uint32_t>(sample.index);
+                inputs.push_back(input);
+            }
+            auto values = compute.EvaluateBrushScript(*gpuScript_, inputs, gpuParameters,
+                parameters.seed, terrainVertices, terrainElevations,
+                grid.GetOptions().planetRadius);
+            if (parameters.application == BrushApplication::Noise &&
+                parameters.output == ScriptedBrushSettings::Output::Elevation &&
+                upper != lower) {
+                for (auto& value : values) {
+                    value = (std::clamp(static_cast<double>(value), lower, upper) - lower) /
+                        (upper - lower) * 2.0 - 1.0;
+                }
+            }
+            return std::vector<double>(values.begin(), values.end());
+        }, parameters.application);
+}
+
 void ScriptedBrushTool::SetScript(std::string_view source) {
     std::lock_guard lock(mutex_);
     auto compiled = engine_.Compile(source);

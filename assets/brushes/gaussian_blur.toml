@@ -3,6 +3,7 @@ description = "Smooth elevations using a Gaussian-weighted spherical neighbourho
 application = "elevation"
 output = "elevation"
 script = "gaussian(Range, Sigma, 0)"
+gpu_script = "return gaussian(param_Range, param_Sigma, 0.0);"
 
 [[parameter]]
 name = "Units"

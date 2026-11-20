@@ -1,6 +1,7 @@
 #include "Filter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -310,7 +311,7 @@ void checkIncisionFormula(const SphericalGridSnapshot& grid, const std::vector<f
 }
 
 void testInciseFlowFormulaAndSelection() {
-    SphericalGrid model({1000, 0.0, 96});
+    SphericalGrid model({2200, 0.0, 96});
     const auto size = model.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(size);
     for (std::size_t i = 0; i < size; ++i) {
@@ -458,7 +459,7 @@ void testInciseFlowValidation() {
     }
 
     void testPrecipitonDiffusion() {
-        SphericalGrid model({1000, 0.0, 96});
+        SphericalGrid model({2200, 0.0, 96});
         const auto size = model.GetSnapshot()->GetVertices().size();
         model.SetPlanetRadius(1200.0);
         std::vector<float> elevations(size);
@@ -546,7 +547,7 @@ void testInciseFlowValidation() {
 }
 
 void testThermalWeathering() {
-    SphericalGrid model({1000, 0.0, 100});
+    SphericalGrid model({2200, 0.0, 100});
     model.SetPlanetRadius(1200.0);
     const auto size = model.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(size, 100.0F);
@@ -652,7 +653,7 @@ void testThermalWeathering() {
 }
 
 void testGlacialErosion() {
-    SphericalGrid model({1000, 0.0, 100});
+    SphericalGrid model({2200, 0.0, 100});
     model.SetPlanetRadius(900.0);
     const auto size = model.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(size);
@@ -857,7 +858,7 @@ void testGlacialErosion() {
 }
 
 void testCratonicGrooving() {
-    SphericalGrid model({1000, 0.0, 101});
+    SphericalGrid model({2200, 0.0, 101});
     model.SetPlanetRadius(1200.0);
     const auto size = model.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(size);
@@ -937,7 +938,7 @@ void testCratonicGrooving() {
 }
 
 void testCratonicScourAndPlanation() {
-    SphericalGrid model({1000, 0.0, 102});
+    SphericalGrid model({2200, 0.0, 102});
     const auto size = model.GetSnapshot()->GetVertices().size();
     std::vector<float> elevations(size);
     for (std::size_t i = 0; i < size; ++i) {
@@ -1087,6 +1088,33 @@ void testAbsoluteMagnitudeNoise() {
     }
 }
 
+void testParallelFilterDeterminism() {
+    SphericalGrid model({2200, 0.0, 124});
+    const auto snapshot = model.GetSnapshot();
+    std::vector<float> elevations(snapshot->GetVertices().size());
+    for (std::size_t i = 0; i < elevations.size(); ++i) {
+        elevations[i] = i % 17 == 0 ? -100.0F : 200.0F + static_cast<float>((i * 193) % 4000);
+    }
+    const auto original = elevations;
+    PrecipitonFilter precipiton;
+    ThermalWeatheringFilter thermal;
+    GlacialErosionFilter glacial;
+    auto settings = glacial.GetSettings();
+    settings.initialIceThickness = 100.0;
+    glacial.SetSettings(settings);
+    CratonicGroovingFilter grooving;
+    CratonicScourFilter scour;
+    InciseFlowFilter incise;
+    const std::array<const Filter*, 6> filters{
+        &precipiton, &thermal, &glacial, &grooving, &scour, &incise};
+    for (const auto* filter : filters) {
+        const auto first = filter->Apply(*snapshot, elevations);
+        const auto second = filter->Apply(*snapshot, elevations);
+        check(first == second, "Parallel stencil filter produced non-deterministic results.");
+        check(elevations == original, "Parallel stencil filter modified its input.");
+    }
+}
+
 }
 
 int main() {
@@ -1104,6 +1132,7 @@ int main() {
         testGlacialErosion();
         testCratonicGrooving();
         testCratonicScourAndPlanation();
+        testParallelFilterDeterminism();
         testAbsoluteMagnitudeNoise();
         std::cout << "Filter tests passed.\n";
         return 0;

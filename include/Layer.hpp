@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -73,6 +74,7 @@ public:
 
     std::span<const float> GetValues() const { return values_; }
     std::size_t GetValueCount() const override { return values_.size(); }
+    std::uint64_t GetValuesRevision() const { return valuesRevision_; }
 
 protected:
     void SetValues(std::span<const float> values);
@@ -80,6 +82,7 @@ protected:
 private:
     friend class SphericalGrid;
     std::vector<float> values_;
+    std::uint64_t valuesRevision_ = 0;
 };
 
 class ElevationLayer final : public RasterLayer {

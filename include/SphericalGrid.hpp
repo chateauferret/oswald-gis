@@ -28,7 +28,12 @@ struct HalfEdge {
 };
 
 struct GridOptions {
-    std::size_t pointCount = 10'000;
+    static constexpr std::size_t minimumPointCount = 100'000;
+    static constexpr std::size_t defaultPointCount = minimumPointCount;
+    static constexpr std::size_t maximumPointCount = 10'000'000;
+    static constexpr std::size_t minimumSupportedPointCount = 1'000;
+
+    std::size_t pointCount = defaultPointCount;
     // Higher values reduce the Poisson exclusion radius and allow more spacing variation.
     double poissonVariability = 0.5;
     std::uint32_t seed = 42;

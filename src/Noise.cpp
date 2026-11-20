@@ -120,6 +120,44 @@ double Value(glm::dvec3 point, std::uint64_t seed) {
     return std::clamp(sample(*generators().value, point, seed), -1.0, 1.0);
 }
 
+glm::dvec3 DomainWarp(glm::dvec3 point, std::uint64_t seed,
+                      const DomainWarpParameters& parameters) {
+    constexpr double maximumFrequency = 1.0e4;
+    if (!std::isfinite(parameters.frequency) || parameters.frequency <= 0.0 ||
+        parameters.frequency > maximumFrequency ||
+        !std::isfinite(parameters.strength) || parameters.strength < 0.0 ||
+        parameters.strength > 10.0 ||
+        !std::isfinite(parameters.lacunarity) || parameters.lacunarity < 1.0 ||
+        parameters.lacunarity > 4.0 ||
+        !std::isfinite(parameters.persistence) || parameters.persistence < 0.0 ||
+        parameters.persistence > 1.0 || parameters.octaves < 1 ||
+        parameters.octaves > 16) {
+        throw std::invalid_argument("Domain warp parameters are invalid.");
+    }
+    validatePoint(point);
+    if (parameters.strength == 0.0) {
+        return point;
+    }
+
+    glm::dvec3 displacement(0.0);
+    double frequency = parameters.frequency;
+    double amplitude = 1.0;
+    double totalAmplitude = 0.0;
+    for (int octave = 0; octave < parameters.octaves; ++octave) {
+        const glm::dvec3 domain = point * frequency;
+        const auto octaveSeed = seed +
+            (0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(octave + 1));
+        displacement += glm::dvec3(
+            Simplex(domain, octaveSeed ^ 0x9e3779b97f4a7c15ULL),
+            Simplex(domain, octaveSeed ^ 0xbf58476d1ce4e5b9ULL),
+            Simplex(domain, octaveSeed ^ 0x94d049bb133111ebULL)) * amplitude;
+        totalAmplitude += amplitude;
+        frequency *= parameters.lacunarity;
+        amplitude *= parameters.persistence;
+    }
+    return point + (displacement / totalAmplitude) * parameters.strength;
+}
+
 double SimplexFbm(glm::dvec3 point, std::uint64_t seed, const FractalParameters& fractal) {
     return fractalSample(*generators().simplexFbm, point, seed, fractal);
 }

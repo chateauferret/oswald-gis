@@ -541,6 +541,7 @@ void UIManager::RescanScriptLibrary() {
             }
             auto tool = std::make_unique<ScriptedBrushTool>(entry.file.name);
             tool->SetScript(entry.file.script, entry.file.parameters);
+            tool->SetGpuScript(entry.file.gpuScript);
             tool->GetSettings().output = entry.file.output.value_or(ScriptedBrushSettings::Output::Normalized);
             tool->GetSettings().application = entry.file.application;
             tool->GetSettings().continuous = entry.file.continuous;
@@ -563,6 +564,8 @@ void UIManager::LoadScriptIntoEditor(const BrushScriptFile& file) {
     scriptName_ = file.name;
     scriptDescription_ = file.description;
     scriptDraft_ = file.script;
+    gpuScriptDraft_ = file.gpuScript.value_or("");
+    ++gpuScriptEditorRevision_;
     scriptApplication_ = file.application;
     scriptContinuous_ = file.continuous;
     scriptParameters_ = file.parameters;
@@ -583,6 +586,7 @@ void UIManager::LoadScriptIntoEditor(const BrushScriptFile& file) {
     // using the last compiled script.
     try {
         scriptedTool_->SetScript(file.script, scriptParameters_, scriptParameterValues_);
+        scriptedTool_->SetGpuScript(file.gpuScript);
         scriptedTool_->GetSettings().application = scriptApplication_;
         scriptedTool_->GetSettings().continuous = scriptContinuous_;
         scriptParametersInstalled_ = true;
@@ -599,8 +603,14 @@ BrushScriptFile UIManager::CurrentScriptFile() const {
     if (scriptedTool_ != nullptr) {
         output = scriptedTool_->GetSettings().output;
     }
+    std::optional<std::string> gpuScript;
+    if (gpuScriptDraft_ && !gpuScriptDraft_->empty()) {
+        gpuScript = *gpuScriptDraft_;
+    } else if (!gpuScriptDraft_ && scriptedTool_ != nullptr) {
+        gpuScript = scriptedTool_->GetGpuScript();
+    }
     return {scriptName_, scriptDescription_, std::move(script), output, scriptParameters_,
-            scriptApplication_, scriptContinuous_};
+            scriptApplication_, scriptContinuous_, std::move(gpuScript)};
 }
 
 void UIManager::SaveScriptToLibrary(const std::filesystem::path& path) {
@@ -640,16 +650,14 @@ void UIManager::RenderScriptLibrary() {
             if (ImGui::Selectable(entry.file.name.c_str(), selected,
                                   ImGuiSelectableFlags_AllowDoubleClick)) {
                 selectedLibraryScript_ = static_cast<int>(index);
-                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    try {
-                        const auto file = BrushScriptFile::Load(entry.path);
-                        LoadScriptIntoEditor(file);
-                        scriptLibraryMessage_ = "Loaded " + file.name + ".";
-                        scriptLibraryMessageIsError_ = false;
-                    } catch (const std::exception& error) {
-                        scriptLibraryMessage_ = error.what();
-                        scriptLibraryMessageIsError_ = true;
-                    }
+                try {
+                    const auto file = BrushScriptFile::Load(entry.path);
+                    LoadScriptIntoEditor(file);
+                    scriptLibraryMessage_ = "Loaded " + file.name + ".";
+                    scriptLibraryMessageIsError_ = false;
+                } catch (const std::exception& error) {
+                    scriptLibraryMessage_ = error.what();
+                    scriptLibraryMessageIsError_ = true;
                 }
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
@@ -877,15 +885,35 @@ void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
     if (!scriptDraft_) {
         scriptDraft_ = compiled;
     }
+    if (!gpuScriptDraft_) {
+        gpuScriptDraft_ = tool.GetGpuScript().value_or("");
+    }
     ImGui::TextUnformatted("Script");
     ImGui::InputTextMultiline("##BrushScript", &*scriptDraft_,
                               ImVec2(-1.0F, ImGui::GetTextLineHeight() * 10.0F),
                               ImGuiInputTextFlags_AllowTabInput);
-    const bool modified = *scriptDraft_ != compiled || !matchingParameters;
+    ImGui::TextUnformatted("GPU GLSL body (optional; returns a float)");
+    ImGui::TextWrapped(
+        "Use x/y/z, lat/lon, elevation, weight, distance, radius, lower/upper, elapsed, rate, "
+        "and param_<name>. Choice parameters are zero-based indices. The GPU shader compiles "
+        "on first use.");
+    ImGui::PushID(gpuScriptEditorRevision_);
+    ImGui::InputTextMultiline("##BrushGpuScript", &*gpuScriptDraft_,
+                              ImVec2(-1.0F, ImGui::GetTextLineHeight() * 8.0F),
+                              ImGuiInputTextFlags_AllowTabInput);
+    ImGui::PopID();
+    const auto installedGpuScript = tool.GetGpuScript().value_or("");
+    const bool modified = *scriptDraft_ != compiled || !matchingParameters ||
+                          *gpuScriptDraft_ != installedGpuScript;
     ImGui::BeginDisabled(!modified);
     if (ImGui::Button("Compile")) {
         try {
+            if (!gpuScriptDraft_->empty() && gpuScriptDraft_->size() > 64 * 1024) {
+                throw std::invalid_argument("GPU brush body cannot exceed 64 KiB.");
+            }
             tool.SetScript(*scriptDraft_, scriptParameters_, scriptParameterValues_);
+            tool.SetGpuScript(gpuScriptDraft_->empty() ? std::nullopt :
+                              std::optional<std::string>(*gpuScriptDraft_));
             tool.GetSettings().application = scriptApplication_;
             tool.GetSettings().continuous = scriptContinuous_;
             scriptParametersInstalled_ = true;
@@ -893,11 +921,14 @@ void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
             brushError_.clear();
         } catch (const ScriptError& error) {
             scriptErrors_ = scriptDiagnostics(error);
+        } catch (const std::exception& error) {
+            brushError_ = error.what();
         }
     }
     ImGui::SameLine();
     if (ImGui::Button("Revert")) {
         scriptDraft_ = compiled;
+        gpuScriptDraft_ = installedGpuScript;
         scriptParameters_ = tool.GetParameters();
         scriptParameterValues_ = tool.GetParameterValues();
         scriptApplication_ = tool.GetSettings().application;
@@ -910,6 +941,7 @@ void UIManager::RenderScriptEditor(ScriptedBrushTool& tool) {
     ImGui::SameLine();
     if (ImGui::Button("Default")) {
         scriptDraft_ = std::string(ScriptedBrushTool::DefaultScript);
+        gpuScriptDraft_->clear();
     }
     if (modified) {
         ImGui::TextColored(ImVec4(1.0F, 0.72F, 0.32F, 1.0F),
@@ -961,7 +993,21 @@ void UIManager::FillSelection(SphericalGrid& grid, GlobeRenderer& renderer) {
         auto after = before;
         auto settings = brushTools_.GetSettings();
         settings.coverage = BrushCoverage::Selection;
-        brushTools_.GetSelectedTool().Apply(*snapshot, {0.0, 0.0, 1.0}, after, settings, 1.0);
+        const auto& tool = brushTools_.GetSelectedTool();
+        if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+            if (const auto* scripted = dynamic_cast<const ScriptedBrushTool*>(&tool);
+                scripted != nullptr && scripted->HasGpuScript()) {
+                if (!computeContext_) {
+                    computeContext_ = std::make_unique<ComputeContext>();
+                }
+                scripted->ApplyGpu(*computeContext_, *snapshot,
+                                   {0.0, 0.0, 1.0}, after, settings, 1.0);
+            } else {
+                tool.Apply(*snapshot, {0.0, 0.0, 1.0}, after, settings, 1.0);
+            }
+        } else {
+            tool.Apply(*snapshot, {0.0, 0.0, 1.0}, after, settings, 1.0);
+        }
         if (before != after) {
             undoStack_.Execute(std::make_unique<BrushStrokeCommand>(
                 grid, renderer, std::move(before), std::move(after)));
@@ -1209,8 +1255,21 @@ void UIManager::RenderValueSelectionDialog(SphericalGrid& grid,
                     std::swap(selectionLowerBound_, selectionUpperBound_);
                 }
                 const auto snapshot = grid.GetSnapshot();
-                auto after = SelectByValue(*snapshot, selectionLowerBound_,
+                std::vector<float> after;
+                if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+                    if (!computeContext_) {
+                        computeContext_ = std::make_unique<ComputeContext>();
+                    }
+                    const auto shaderDirectory = colorMapDirectory_.parent_path().parent_path() /
+                        "shaders/compute";
+                    after = computeContext_->ApplySelection(
+                        SelectionComputeOperation::ByValue, snapshot,
+                        selectionWeightsOf(*snapshot), selectionLowerBound_,
+                        selectionUpperBound_, selectionFeatherPercent_, shaderDirectory);
+                } else {
+                    after = SelectByValue(*snapshot, selectionLowerBound_,
                                           selectionUpperBound_, selectionFeatherPercent_);
+                }
                 undoStack_.Execute(std::make_unique<SelectionCommand>(
                     grid, renderer, selectionWeightsOf(*snapshot), snapshot->HasSelection(),
                     std::move(after), true));
@@ -1236,7 +1295,17 @@ void UIManager::ApplyTerrainFilter(const Filter& filter, SphericalGrid& grid,
     for (const auto& vertex : snapshot->GetVertices()) {
         before.push_back(vertex.elevation);
     }
-    auto after = filter.Apply(*snapshot, before);
+    auto after = computeBackendPreference_ == ComputeBackendPreference::Gpu
+        ? [&] {
+              if (!computeContext_) {
+                  computeContext_ = std::make_unique<ComputeContext>();
+              }
+              const auto shaderDirectory = colorMapDirectory_.parent_path().parent_path() /
+                  "shaders/compute";
+              return computeContext_->ApplyFilter(
+                  filter, snapshot, before, shaderDirectory);
+          }()
+        : filter.Apply(*snapshot, before);
     if (before != after) {
         undoStack_.Execute(std::make_unique<TerrainFilterCommand>(
             grid, renderer, std::move(before), std::move(after)));
@@ -1460,30 +1529,44 @@ void UIManager::RenderGlacialErosionDialog(SphericalGrid& grid, GlobeRenderer& r
                                 ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
     }
-    ImGui::InputDouble("Equator ELA (m)",
+    const auto restorePreview = [&] {
+        if (glacialPreviewBefore_) {
+            grid.SetElevations(*glacialPreviewBefore_);
+            renderer.UpdateLayerElevations(
+                grid.GetElevationLayer(), *glacialPreviewBefore_);
+            glacialPreviewBefore_.reset();
+            glacialPreviewAfter_.reset();
+        }
+        glacialPreviewSnapshot_.reset();
+    };
+    bool settingsChanged = false;
+    settingsChanged |= ImGui::InputDouble("Equator ELA (m)",
         &pendingGlacialErosionSettings_.equilibriumLineAltitude, 0.0, 0.0, "%.6g");
-    ImGui::InputDouble("ELA drop per latitude degree (m)",
+    settingsChanged |= ImGui::InputDouble("ELA drop per latitude degree (m)",
         &pendingGlacialErosionSettings_.elaLatitudeGradient, 0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Accumulation rate", &pendingGlacialErosionSettings_.accumulationRate,
+    settingsChanged |= ImGui::InputDouble("Accumulation rate", &pendingGlacialErosionSettings_.accumulationRate,
         0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Ablation rate", &pendingGlacialErosionSettings_.ablationRate,
+    settingsChanged |= ImGui::InputDouble("Ablation rate", &pendingGlacialErosionSettings_.ablationRate,
         0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Initial ice thickness (m)",
+    settingsChanged |= ImGui::InputDouble("Initial ice thickness (m)",
         &pendingGlacialErosionSettings_.initialIceThickness, 0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Duration (years)", &pendingGlacialErosionSettings_.durationYears,
+    settingsChanged |= ImGui::InputDouble("Duration (years)", &pendingGlacialErosionSettings_.durationYears,
         0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Glacial erodibility (Kg)",
+    settingsChanged |= ImGui::InputDouble("Glacial erodibility (Kg)",
         &pendingGlacialErosionSettings_.glacialErodibility, 0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Ice viscosity factor (Bg)",
+    settingsChanged |= ImGui::InputDouble("Ice viscosity factor (Bg)",
         &pendingGlacialErosionSettings_.iceViscosityFactor, 0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Ice thickness exponent (a)",
+    settingsChanged |= ImGui::InputDouble("Ice thickness exponent (a)",
         &pendingGlacialErosionSettings_.thicknessExponent, 0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Velocity exponent (b)",
+    settingsChanged |= ImGui::InputDouble("Velocity exponent (b)",
         &pendingGlacialErosionSettings_.velocityExponent, 0.0, 0.0, "%.6g");
-    ImGui::InputDouble("Trough half-width (km)",
+    settingsChanged |= ImGui::InputDouble("Trough half-width (km)",
         &pendingGlacialErosionSettings_.troughHalfWidth, 0.0, 0.0, "%.6g");
+    if (settingsChanged) {
+        restorePreview();
+    }
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 600.0F);
-    ImGui::TextWrapped("One pass computes latitude-dependent ELA, updates ice mass balance from the configured initial thickness, routes ice down every lower 1-ring neighbor, and applies Glen-law erosion. Erosion is distributed over the orthogonal 1-ring profile with normalized parabolic weights; isostatic depression uses ice/mantle densities 917/3300.");
+    ImGui::TextWrapped("Preview runs the multi-pass glacial simulation against the current terrain. It computes latitude-dependent ELA and mass balance, routes ice down lower 1-ring neighbors, applies Glen-law erosion, spreads trough erosion with normalized parabolic weights, and includes isostatic depression using ice/mantle densities 917/3300.");
     ImGui::TextWrapped("All rates, thicknesses, exponents, and duration must be finite and non-negative; trough width must be finite and positive. Sea-level/ocean sinks and unselected outlets remain fixed; selection weights blend the final displacement. Updated elevations are limited to [-32767, 32767] m.");
     if (!glacialErosionError_.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
@@ -1491,12 +1574,65 @@ void UIManager::RenderGlacialErosionDialog(SphericalGrid& grid, GlobeRenderer& r
         ImGui::PopStyleColor();
     }
     ImGui::PopTextWrapPos();
+    if (ImGui::Button("Preview")) {
+        try {
+            auto& filter = dynamic_cast<GlacialErosionFilter&>(
+                filters_.GetFilter("Glacial erosion"));
+            filter.SetSettings(pendingGlacialErosionSettings_);
+            std::vector<float> before;
+            if (glacialPreviewBefore_) {
+                before = *glacialPreviewBefore_;
+            } else {
+                const auto snapshot = grid.GetSnapshot();
+                before.reserve(snapshot->GetVertices().size());
+                for (const auto& vertex : snapshot->GetVertices()) {
+                    before.push_back(vertex.elevation);
+                }
+            }
+            auto snapshot = glacialPreviewSnapshot_;
+            if (!snapshot) {
+                snapshot = std::make_shared<SphericalGridSnapshot>(
+                    *grid.GetSnapshot(), before);
+            }
+            std::vector<float> after;
+            if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+                if (!computeContext_) {
+                    computeContext_ = std::make_unique<ComputeContext>();
+                }
+                const auto shaderDirectory =
+                    colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+                after = computeContext_->ApplyFilter(filter, snapshot, before, shaderDirectory);
+            } else {
+                after = filter.Apply(*snapshot, before);
+            }
+            glacialPreviewBefore_ = std::move(before);
+            glacialPreviewAfter_ = std::move(after);
+            glacialPreviewSnapshot_ = std::move(snapshot);
+            grid.SetElevations(*glacialPreviewAfter_);
+            renderer.UpdateLayerElevations(
+                grid.GetElevationLayer(), *glacialPreviewAfter_);
+            glacialErosionError_.clear();
+        } catch (const std::exception& error) {
+            glacialErosionError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
     if (ImGui::Button("Apply")) {
         try {
             auto& filter = dynamic_cast<GlacialErosionFilter&>(
                 filters_.GetFilter("Glacial erosion"));
             filter.SetSettings(pendingGlacialErosionSettings_);
-            ApplyTerrainFilter(filter, grid, renderer);
+            if (glacialPreviewBefore_ && glacialPreviewAfter_) {
+                if (*glacialPreviewBefore_ != *glacialPreviewAfter_) {
+                    undoStack_.Execute(std::make_unique<TerrainFilterCommand>(
+                        grid, renderer, *glacialPreviewBefore_, *glacialPreviewAfter_));
+                }
+                glacialPreviewBefore_.reset();
+                glacialPreviewAfter_.reset();
+                glacialPreviewSnapshot_.reset();
+            } else {
+                ApplyTerrainFilter(filter, grid, renderer);
+            }
             glacialErosionError_.clear();
             ImGui::CloseCurrentPopup();
         } catch (const std::exception& error) {
@@ -1505,6 +1641,7 @@ void UIManager::RenderGlacialErosionDialog(SphericalGrid& grid, GlobeRenderer& r
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        restorePreview();
         glacialErosionError_.clear();
         ImGui::CloseCurrentPopup();
     }
@@ -1644,6 +1781,10 @@ const ColorMap& UIManager::GetColorMap(const std::string& name) {
 }
 
 void UIManager::RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer) {
+    std::erase_if(histogramCache_, [&](const auto& entry) {
+        return std::none_of(grid.GetLayers().begin(), grid.GetLayers().end(),
+            [&](const auto& layer) { return layer.get() == entry.first; });
+    });
     const auto colorMaps = [&]() {
         std::vector<std::filesystem::path> maps;
         if (colorMapDirectory_.empty()) {
@@ -1868,13 +2009,31 @@ void UIManager::RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer) {
                 renderMapChoice("Selected legend",
                                 std::string(layer.GetSelectionColorMap()), &layer);
                 if (!layer.GetValues().empty()) {
-                    std::array<float, 32> bins{};
-                    for (const float value : layer.GetValues()) {
-                        const auto bin = static_cast<std::size_t>(std::clamp(
-                            (value + 32767.0F) / 65534.0F * static_cast<float>(bins.size()),
-                            0.0F, static_cast<float>(bins.size() - 1)));
-                        bins[bin] += 1.0F;
+                    const bool useGpu = computeBackendPreference_ == ComputeBackendPreference::Gpu;
+                    auto& cached = histogramCache_[&layer];
+                    if (cached.revision != layer.GetValuesRevision() || cached.gpu != useGpu) {
+                        cached.bins.fill(0.0F);
+                        if (useGpu) {
+                            if (!computeContext_) {
+                                computeContext_ = std::make_unique<ComputeContext>();
+                            }
+                            const auto shaderDirectory =
+                                colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+                            cached.bins = computeContext_->Histogram(layer.GetValues(),
+                                                                     shaderDirectory);
+                        } else {
+                            for (const float value : layer.GetValues()) {
+                                const auto bin = static_cast<std::size_t>(std::clamp(
+                                    (value + 32767.0F) / 65534.0F *
+                                        static_cast<float>(cached.bins.size()),
+                                    0.0F, static_cast<float>(cached.bins.size() - 1)));
+                                cached.bins[bin] += 1.0F;
+                            }
+                        }
+                        cached.revision = layer.GetValuesRevision();
+                        cached.gpu = useGpu;
                     }
+                    auto& bins = cached.bins;
                     float peakFrequency = 0.0F;
                     const float valueCount = static_cast<float>(layer.GetValues().size());
                     for (auto& frequency : bins) {
@@ -2007,7 +2166,18 @@ void UIManager::SyncLayerStack(SphericalGrid& grid, GlobeRenderer& renderer) {
 void UIManager::FinishPolygonSelection(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (polygonPoints_.size() >= 3) {
         const auto snapshot = grid.GetSnapshot();
-        auto after = SelectSphericalPolygon(*snapshot, polygonPoints_);
+        std::vector<float> after;
+        if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+            if (!computeContext_) {
+                computeContext_ = std::make_unique<ComputeContext>();
+            }
+            const auto shaderDirectory =
+                colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+            after = computeContext_->ApplyPolygonSelection(
+                snapshot, polygonPoints_, shaderDirectory);
+        } else {
+            after = SelectSphericalPolygon(*snapshot, polygonPoints_);
+        }
         auto before = selectionWeightsOf(*snapshot);
         if (polygonAdditive_ && snapshot->HasSelection()) {
             std::transform(after.begin(), after.end(), before.begin(), after.begin(),
@@ -2080,8 +2250,23 @@ void UIManager::ProcessBrushInput(SphericalGrid& grid, GlobeRenderer& renderer,
         // Tools leave their output untouched when Apply throws, so a failed dab is skipped.
         const auto applyTool = [&](std::vector<float>& values) {
             try {
-                auto result = tool.Apply(*snapshot, *cursorCenter, values,
-                                         brushTools_.GetSettings(), io.DeltaTime);
+                std::vector<std::size_t> result;
+                if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+                    if (const auto* scripted = dynamic_cast<const ScriptedBrushTool*>(&tool);
+                        scripted != nullptr && scripted->HasGpuScript()) {
+                        if (!computeContext_) {
+                            computeContext_ = std::make_unique<ComputeContext>();
+                        }
+                        result = scripted->ApplyGpu(*computeContext_, *snapshot,
+                            *cursorCenter, values, brushTools_.GetSettings(), io.DeltaTime);
+                    } else {
+                        result = tool.Apply(*snapshot, *cursorCenter, values,
+                            brushTools_.GetSettings(), io.DeltaTime);
+                    }
+                } else {
+                    result = tool.Apply(*snapshot, *cursorCenter, values,
+                        brushTools_.GetSettings(), io.DeltaTime);
+                }
                 brushError_.clear();
                 return result;
             } catch (const std::exception& error) {
@@ -2189,8 +2374,27 @@ void UIManager::ProcessSelectionInput(SphericalGrid& grid, GlobeRenderer& render
     if (radiusMode && selectionStroke_ && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
         !captured && cursorCenter) {
         const auto snapshot = grid.GetSnapshot();
-        const auto changed = radiusSelectionTool_.Apply(
-            *snapshot, *cursorCenter, selectionStroke_->working, selectionSettings_);
+        std::vector<std::size_t> changed;
+        if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+            if (!computeContext_) {
+                computeContext_ = std::make_unique<ComputeContext>();
+            }
+            const auto shaderDirectory =
+                colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+            const auto updated = computeContext_->ApplyRadiusSelection(
+                snapshot, selectionStroke_->working, *cursorCenter, selectionSettings_.radius,
+                selectionSettings_.falloffPercent,
+                PlanetRadiusInUnit(*snapshot, selectionSettings_.distanceUnit), shaderDirectory);
+            for (std::size_t i = 0; i < updated.size(); ++i) {
+                if (updated[i] > selectionStroke_->working[i]) {
+                    selectionStroke_->working[i] = updated[i];
+                    changed.push_back(i);
+                }
+            }
+        } else {
+            changed = radiusSelectionTool_.Apply(
+                *snapshot, *cursorCenter, selectionStroke_->working, selectionSettings_);
+        }
         if (!changed.empty()) {
             for (std::size_t i = 0; i < selectionStroke_->working.size(); ++i) {
                 selectionStroke_->renderVertices[i].selectionWeight =
@@ -2328,14 +2532,36 @@ void UIManager::PerformProjectAction(SphericalGrid& grid, GlobeRenderer& rendere
         ProjectFile::Save(path, grid);
         projectPath_ = std::filesystem::absolute(path);
     } else if (projectAction_ == ProjectAction::Export) {
-        ElevationRaster::Export(path, grid, exportWidth_, exportWidth_ / 2,
-            static_cast<ElevationRaster::TiffSampleType>(exportTiffSampleType_));
+        if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+            if (!computeContext_) {
+                computeContext_ = std::make_unique<ComputeContext>();
+            }
+            const auto shaderDirectory =
+                colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+            ElevationRaster::Export(path, grid, exportWidth_, exportWidth_ / 2,
+                static_cast<ElevationRaster::TiffSampleType>(exportTiffSampleType_),
+                *computeContext_, shaderDirectory);
+        } else {
+            ElevationRaster::Export(path, grid, exportWidth_, exportWidth_ / 2,
+                static_cast<ElevationRaster::TiffSampleType>(exportTiffSampleType_));
+        }
     } else if (projectAction_ == ProjectAction::ExportImage) {
         const auto& layer = grid.GetActiveLayer();
         const auto& map = GetColorMap(std::string(layer.GetColorMap()));
         const auto* selectionMap = exportSelectionHighlight_ ?
             &GetColorMap(std::string(layer.GetSelectionColorMap())) : nullptr;
-        ElevationRaster::ExportImage(path, grid, map, selectionMap, exportWidth_, exportWidth_ / 2);
+        if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+            if (!computeContext_) {
+                computeContext_ = std::make_unique<ComputeContext>();
+            }
+            const auto shaderDirectory =
+                colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+            ElevationRaster::ExportImage(path, grid, map, selectionMap, exportWidth_,
+                exportWidth_ / 2, *computeContext_, shaderDirectory);
+        } else {
+            ElevationRaster::ExportImage(path, grid, map, selectionMap,
+                                         exportWidth_, exportWidth_ / 2);
+        }
     } else {
         auto loaded = ProjectFile::Load(path);
         std::vector<GlobeRenderLayer> renderLayers;
@@ -2385,7 +2611,9 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
         if (ImGui::BeginTabBar("PlanetTabs")) {
             if (ImGui::BeginTabItem("Geometry")) {
                 ImGui::InputDouble("Planet radius (km)", &pendingPlanetRadius_, 0.0, 0.0, "%.6g");
-                ImGui::SliderInt("Point Count (N)", &pendingPointCount_, 1'000, 1'000'000,
+                ImGui::SliderInt("Point Count (N)", &pendingPointCount_,
+                                 static_cast<int>(GridOptions::minimumPointCount),
+                                 static_cast<int>(GridOptions::maximumPointCount),
                                  "%d", ImGuiSliderFlags_AlwaysClamp);
                 ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 480.0F);
                 ImGui::TextWrapped("Changing point count interpolates the existing terrain layers and selection onto the new grid. Changing radius alone leaves the grid intact.");
@@ -2413,8 +2641,10 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
                 if (!std::isfinite(pendingPlanetRadius_) || pendingPlanetRadius_ <= 0.0) {
                     throw std::invalid_argument("Planet radius must be finite and positive.");
                 }
-                if (pendingPointCount_ < 1000 || pendingPointCount_ > 1'000'000) {
-                    throw std::invalid_argument("Point count must be between 1,000 and 1,000,000.");
+                if (pointCountChanged &&
+                    (pendingPointCount_ < static_cast<int>(GridOptions::minimumPointCount) ||
+                     pendingPointCount_ > static_cast<int>(GridOptions::maximumPointCount))) {
+                    throw std::invalid_argument("Point count must be between 100,000 and 10,000,000.");
                 }
                 options_ = grid.GetSnapshot()->GetOptions();
                 options_.planetRadius = pendingPlanetRadius_;
@@ -2784,7 +3014,19 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                 const auto snapshot = grid.GetSnapshot();
                 if (snapshot->HasSelection()) {
                     auto before = selectionWeightsOf(*snapshot);
-                    std::vector<float> after(before.size(), 0.0F);
+                    std::vector<float> after;
+                    if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+                        if (!computeContext_) {
+                            computeContext_ = std::make_unique<ComputeContext>();
+                        }
+                        const auto shaderDirectory =
+                            colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+                        after = computeContext_->ApplySelection(
+                            SelectionComputeOperation::Clear, snapshot, before,
+                            0.0, 0.0, 0.0, shaderDirectory);
+                    } else {
+                        after.assign(before.size(), 0.0F);
+                    }
                     undoStack_.Execute(std::make_unique<SelectionCommand>(
                         grid, renderer, std::move(before), true, std::move(after), false));
                 }
@@ -2792,12 +3034,24 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
             if (ImGui::MenuItem("Invert Selection")) {
                 const auto snapshot = grid.GetSnapshot();
                 auto before = selectionWeightsOf(*snapshot);
-                auto after = before;
-                if (snapshot->HasSelection()) {
-                    std::transform(after.begin(), after.end(), after.begin(),
-                                   [](float weight) { return 1.0F - weight; });
+                std::vector<float> after;
+                if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+                    if (!computeContext_) {
+                        computeContext_ = std::make_unique<ComputeContext>();
+                    }
+                    const auto shaderDirectory =
+                        colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+                    after = computeContext_->ApplySelection(
+                        SelectionComputeOperation::Invert, snapshot, before,
+                        0.0, 0.0, 0.0, shaderDirectory);
                 } else {
-                    std::fill(after.begin(), after.end(), 1.0F);
+                    after = before;
+                    if (snapshot->HasSelection()) {
+                        std::transform(after.begin(), after.end(), after.begin(),
+                                       [](float weight) { return 1.0F - weight; });
+                    } else {
+                        std::fill(after.begin(), after.end(), 1.0F);
+                    }
                 }
                 undoStack_.Execute(std::make_unique<SelectionCommand>(
                     grid, renderer, std::move(before), snapshot->HasSelection(),
@@ -3132,7 +3386,18 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
             try {
                 const auto path = selectedRasterPath_;
                 auto loaded = std::make_shared<ElevationRaster>(ElevationRaster::Load(path));
-                auto elevations = loaded->SampleElevations(*grid.GetSnapshot());
+                std::vector<float> elevations;
+                if (computeBackendPreference_ == ComputeBackendPreference::Gpu) {
+                    if (!computeContext_) {
+                        computeContext_ = std::make_unique<ComputeContext>();
+                    }
+                    const auto shaderDirectory =
+                        colorMapDirectory_.parent_path().parent_path() / "shaders/compute";
+                    elevations = loaded->SampleElevations(
+                        *grid.GetSnapshot(), *computeContext_, shaderDirectory);
+                } else {
+                    elevations = loaded->SampleElevations(*grid.GetSnapshot());
+                }
                 std::vector<float> previousElevations;
                 const auto& previousVertices = grid.GetSnapshot()->GetVertices();
                 previousElevations.reserve(previousVertices.size());
@@ -3167,6 +3432,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
 
     if (settingsOpen_) {
         pendingRaiseLowerRate_ = brushTools_.GetSettings().raiseLowerRate;
+        pendingComputeBackend_ = computeBackendPreference_;
         pendingGraticuleColor_ = graticuleColor_;
         pendingHighlightedGraticuleColor_ = highlightedGraticuleColor_;
         pendingWireframeColor_ = wireframeColor_;
@@ -3182,6 +3448,11 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
         }
         ImGui::InputDouble("Raise/Lower speed (units/s)", &pendingRaiseLowerRate_,
                            1.0, 1024.0, "%.0f");
+        int computeBackend = static_cast<int>(pendingComputeBackend_);
+        if (ImGui::Combo("Compute backend", &computeBackend, "Auto\0CPU\0GPU\0")) {
+            pendingComputeBackend_ = static_cast<ComputeBackendPreference>(computeBackend);
+        }
+        ImGui::TextWrapped("GPU runs the G2 filters and selection operations; other terrain operations remain on the CPU.");
         int relaxation = static_cast<int>(options_.relaxationIterations);
         if (ImGui::SliderInt("Relaxation Passes (Lloyd)", &relaxation, 0, 20)) {
             options_.relaxationIterations = static_cast<std::uint32_t>(relaxation);
@@ -3211,6 +3482,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                     throw std::invalid_argument("Raise/Lower speed must be finite and positive.");
                 }
                 brushTools_.GetSettings().raiseLowerRate = pendingRaiseLowerRate_;
+                computeBackendPreference_ = pendingComputeBackend_;
                 renderer.SetGraticuleColors(pendingGraticuleColor_,
                                             pendingHighlightedGraticuleColor_);
                 renderer.SetWireframeColors(pendingWireframeColor_,

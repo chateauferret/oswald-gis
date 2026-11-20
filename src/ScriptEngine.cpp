@@ -159,6 +159,15 @@ struct ScriptEngine::Impl {
         addFunction("ridged", 7, 7, [this](std::span<const double> a) {
             return noise::Ridged({a[0], a[1], a[2]}, noiseSeed, fractalArguments(a, "ridged"));
         });
+        const auto addWarpComponent = [this](std::string_view name, int component) {
+            addFunction(name, 8, 8, [this, component](std::span<const double> a) {
+                return noise::DomainWarp({a[0], a[1], a[2]}, noiseSeed,
+                    {a[3], a[4], a[5], a[6], octaveCount(a[7], "warp")})[component];
+            });
+        };
+        addWarpComponent("warp_x", 0);
+        addWarpComponent("warp_y", 1);
+        addWarpComponent("warp_z", 2);
     }
 };
 

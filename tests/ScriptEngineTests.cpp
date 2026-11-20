@@ -167,7 +167,11 @@ void testNoiseFunctions() {
     const auto value = engine.Compile("valuenoise(x, y, z)");
     const auto valueFbm = engine.Compile("valuefbm(x, y, z, 4, 2, 0.5, 5)");
     const auto ridged = engine.Compile("ridged(x, y, z, 4, 2, 0.5, 5)");
+    const auto warpX = engine.Compile("warp_x(x, y, z, 4, 1.25, 2, 0.5, 3)");
+    const auto warpY = engine.Compile("warp_y(x, y, z, 4, 1.25, 2, 0.5, 3)");
+    const auto warpZ = engine.Compile("warp_z(x, y, z, 4, 1.25, 2, 0.5, 3)");
     const noise::FractalParameters fractal{4.0, 2.0, 0.5, 5};
+    const noise::DomainWarpParameters warp{4.0, 1.25, 2.0, 0.5, 3};
 
     for (const std::uint64_t seed : {0ULL, 42ULL, 0xfedcba9876543210ULL}) {
         engine.SetNoiseSeed(seed);
@@ -188,6 +192,10 @@ void testNoiseFunctions() {
                   "valuefbm() differs.");
             check(ridged.Evaluate() == noise::Ridged(p, seed, fractal),
                   "ridged() differs.");
+            const auto warped = noise::DomainWarp(p, seed, warp);
+            check(warpX.Evaluate() == warped.x && warpY.Evaluate() == warped.y &&
+                  warpZ.Evaluate() == warped.z,
+                  "Script domain-warp functions differ from the shared noise implementation.");
             for (const auto* script : {&simplex, &fbm, &billow, &value, &valueFbm, &ridged}) {
                 const double result = script->Evaluate();
                 check(std::isfinite(result) && result >= -1.0 && result <= 1.0,
@@ -214,8 +222,16 @@ void testNoiseFunctions() {
           "Excessive octave count was accepted.");
     check(throws<ScriptError>([&] { engine.Evaluate("fbm(x, y, z, 1/0, 2, 0.5, 3)"); }),
           "Infinite frequency was accepted.");
+    check(throws<ScriptError>([&] {
+              engine.Evaluate("warp_x(x, y, z, 4, 1.25, 2, 0.5, 2.5)");
+          }), "Fractional warp octave count was accepted.");
+    check(throws<ScriptError>([&] {
+              engine.Evaluate("warp_z(x, y, z, 4, 11, 2, 0.5, 3)");
+          }), "Out-of-range warp strength was accepted.");
     check(throws<ScriptError>([&] { engine.Compile("simplex(x, y)"); }),
           "Noise call with missing arguments compiled.");
+    check(throws<ScriptError>([&] { engine.Compile("warp_x(x, y, z, 4, 1, 2, 0.5)"); }),
+          "Domain-warp call with missing arguments compiled.");
     check(throws<ScriptError>([&] { engine.Compile("ridged(x, y, z, 4, 2, 0.5, 5, 1, 2)"); }),
           "Removed ridge offset/gain arguments were silently accepted.");
 }

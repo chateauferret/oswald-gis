@@ -1,4 +1,5 @@
 #include "BrushTool.hpp"
+#include "../src/ParallelFor.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -538,6 +539,39 @@ void testGaussianBlurBrush() {
     check(std::all_of(constant.begin(), constant.end(),
                       [](float value) { return value == 123.5F; }),
           "Gaussian blur did not preserve a constant field.");
+
+    settings.coverage = BrushCoverage::Selection;
+    brush.GetSettings().range = 1500.0;
+    brush.GetSettings().sigma = 700.0F;
+    auto varied = elevationsOf(grid);
+    for (std::size_t i = 0; i < varied.size(); ++i) {
+        varied[i] = static_cast<float>(static_cast<int>(i % 101) - 50);
+    }
+    const auto source = varied;
+    std::vector<float> expected(source.size());
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        expected[i] = static_cast<float>(SampleGaussian(grid, source, i, brush.GetSettings()));
+    }
+    brush.Apply(grid, {0, 0, 1}, varied, settings, 0.0);
+    check(varied == expected, "Gaussian blur differs from serial neighbourhood sampling.");
+}
+
+void testParallelFor() {
+    std::vector<int> values(1024, 0);
+    parallelFor(values.size(), 1, [&](std::size_t i) { values[i] = 1; });
+    check(std::all_of(values.begin(), values.end(), [](int value) { return value == 1; }),
+          "Parallel iteration skipped an index.");
+    bool caught = false;
+    try {
+        parallelFor(values.size(), 1, [](std::size_t i) {
+            if (i == 500) {
+                throw std::runtime_error("parallel failure");
+            }
+        });
+    } catch (const std::runtime_error& error) {
+        caught = std::string_view(error.what()) == "parallel failure";
+    }
+    check(caught, "Parallel iteration did not propagate a worker exception.");
 }
 
 void testClampBrush() {
@@ -749,6 +783,7 @@ int main() {
         testPhase18NoiseTools();
         testFullRangeBlendStaysInRange();
         testGaussianBlurBrush();
+        testParallelFor();
         testClampBrush();
         testAdditionalBrushSelectionWeights();
         testValidation();

@@ -4,6 +4,7 @@ application = "delta"
 continuous = true
 output = "elevation"
 script = "(Operation == 'Raise' ? 1 : -1) * rate * (Intensity / 100) * elapsed"
+gpu_script = "return (param_Operation < 0.5 ? 1.0 : -1.0) * rate * (param_Intensity / 100.0) * elapsed;"
 
 [[parameter]]
 name = "Operation"

@@ -59,6 +59,27 @@ void testDefaultMatchesSimplexBrush() {
     }
 }
 
+void testScriptDomainWarpMatchesNativeBrush() {
+    SphericalGrid model({1000, 0.0, 29});
+    const auto& grid = *model.GetSnapshot();
+    ScriptedBrushTool scripted;
+    SimplexNoiseBrushTool simplex;
+    scripted.SetScript(
+        "fbm(warp_x(x, y, z, 4, 1.25, 2, 0.5, 3), "
+        "warp_y(x, y, z, 4, 1.25, 2, 0.5, 3), "
+        "warp_z(x, y, z, 4, 1.25, 2, 0.5, 3), 4, 2, 0.5, 6)");
+    scripted.GetSettings().output = ScriptedBrushSettings::Output::Normalized;
+    scripted.GetSettings().seed = 419;
+    simplex.GetSettings().seed = 419;
+    simplex.GetSettings().octaves = 6;
+    simplex.GetSettings().domainWarpEnabled = true;
+
+    auto expected = elevationsOf(grid);
+    simplex.Apply(grid, {0.0, 0.0, 1.0}, expected, wholeGlobe(), 0.0);
+    check(paint(scripted, grid) == expected,
+          "Script-callable domain warp differs from the native noise brush.");
+}
+
 void testInputs() {
     SphericalGrid model({1000, 0.0, 17});
     const auto& grid = *model.GetSnapshot();
@@ -460,6 +481,7 @@ void testParameters() {
 int main() {
     try {
         testDefaultMatchesSimplexBrush();
+        testScriptDomainWarpMatchesNativeBrush();
         testInputs();
         testOutputsAndOperations();
         testSeed();

@@ -2,6 +2,7 @@ name = "Ridge Noise"
 description = "FastNoise2 ridged fractal Simplex noise."
 output = "normalized"
 script = "ridged(x, y, z, Frequency, Lacunarity, Persistence, Octaves)"
+gpu_script = "return ridged(x, y, z, param_Frequency, param_Lacunarity, param_Persistence, int(param_Octaves));"
 
 [[parameter]]
 name = "Frequency"

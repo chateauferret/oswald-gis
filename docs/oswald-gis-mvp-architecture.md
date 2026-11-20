@@ -1,7 +1,7 @@
 # Project Architecture & Technical Specification: oswald-gis MVP
 
 This is the maintained architecture document, retaining its original MVP filename.
-The implementation now includes the post-MVP features in [roadmap.md](./roadmap.md),
+The implementation now includes the post-MVP features in [roadmap.md](../roadmap.md),
 including layers, persistence/export, projections, FastNoise2, and TOML-driven tools.
 
 ## 1. System Vision & Architectural Strategy
@@ -128,9 +128,12 @@ The software is structured strictly around a Model-View-Controller design patter
   * That pipeline samples all vertices before writing. A failing script, a non-finite result, or a loop-limit violation therefore leaves the layer unchanged.
   * The UI catches the error and shows it in the brush panel.
   * `gaussian(range, sigma, unit)` samples a Gaussian-weighted spherical neighbourhood from immutable pre-dab values; unit 0 means kilometres and 1 means miles. Invalid arguments fail the dab without partial writes.
+  * Noise callbacks (`simplex`, `valuenoise`, `fbm`, `billow`, `valuefbm`, `ridged`, and `spectral`) are C++ functions shared with native CPU noise tools. `warp_x`, `warp_y`, and `warp_z` expose the same seeded domain-warp function used by native brushes. They remain exprtk callbacks on the CPU when GPU compute is selected, so script source and results do not depend on the compute-backend preference.
+  * Brush TOML files may add a multiline `gpu_script` GLSL body containing statements and a `return` expression. The generated compute shader exposes `x`, `y`, `z`, `lat`, `lon`, `elevation`, `weight`, `distance`, `radius`, `lower`, `upper`, `elapsed`, `rate`, plus numeric `param_<name>` values; choice values are zero-based indices. `x`, `y`, and `z` include configured brush domain warping. `simplex`, `valuenoise`, `fbm`, `billow`, `valuefbm`, `ridged`, `spectral`, and `warp_x/y/z` GLSL helpers are available. When GPU is selected, this body runs instead of exprtk; otherwise the exprtk script is unchanged and remains the CPU fallback. GPU helper noise is not bit-identical to FastNoise2. GPU bodies are trusted GLSL and should use bounded loops.
+  * All bundled brushes define `gpu_script`. The current GPU `gaussian()` helper checks every terrain vertex for every affected vertex, so its work grows as O(affected vertices × terrain vertices); a spatial index is needed for large grids.
   * `UIManager` builds the registry from library scripts and retains a separate `Custom` instance (formerly Scripted Brush). Native brush classes remain reference implementations for tests, not automatically registered Brushes entries. `oswald_model` remains independent of exprtk.
   * Only Custom exposes the draft editor, Compile/Revert/Default, library Load/Save, and Import/Export. Library tools expose generated parameters without the editor. A failed compile keeps the previous script and parameters active; Revert restores them.
-* **Brush script files (`BrushScriptFile`, `BrushScriptLibrary`)**: Scripts are saved as TOML files with root keys `name`, `description`, `output`, `script`, optional `application` and boolean `continuous`, followed by optional `[[parameter]]` tables, as in [assets/brushes/fbm.toml](./assets/brushes/fbm.toml). Root keys must precede the parameter tables.
+* **Brush script files (`BrushScriptFile`, `BrushScriptLibrary`)**: Scripts are saved as TOML files with root keys `name`, `description`, `output`, `script`, optional `application` and boolean `continuous`, followed by optional `[[parameter]]` tables, as in [assets/brushes/fbm.toml](../assets/brushes/fbm.toml). Root keys must precede the parameter tables.
   * `name` and `script` are required; `description` and `output` are optional, and unknown keys are ignored.
   * `output` is `"normalized"` (`"normalised"` is also accepted, case-insensitively) or `"elevation"`. Loading into Custom without it keeps the current Script output setting; standalone library tools default to normalized. UI saves write the current output setting.
   * Parameters are `float`, `integer`, or `choice`, with valid unique script identifiers that cannot shadow inputs/functions/constants/reserved words. Numeric parameters require `control` (`slider`, `spin`, `text`), `min < max`, and a valid `default`; numeric strings and TOML numbers are accepted. Integers use 32-bit bounds. Floats optionally use linear (default) or logarithmic scale; logarithmic bounds must be positive. Float slider bounds are limited to half the maximum finite double magnitude.
@@ -365,17 +368,17 @@ glVertexArrayElementBuffer(vao, ebo);
 ### 7.2 GLSL Shading Pipeline
 
 The maintained GLSL 450 core globe pipeline is
-[globe.vert](./shaders/globe.vert), [globe.geom](./shaders/globe.geom), and
-[globe.frag](./shaders/globe.frag). The geometry stage handles projection-specific
+[globe.vert](../shaders/globe.vert), [globe.geom](../shaders/globe.geom), and
+[globe.frag](../shaders/globe.frag). The geometry stage handles projection-specific
 triangle output, including equirectangular seam wrapping. The separate
-[elevation.comp](./shaders/elevation.comp) shader composes visible layers;
+[elevation.comp](../shaders/elevation.comp) shader composes visible layers;
 `wire.vert`/`wire.geom`/`wire.frag` render the optional wireframe.
 
 Selection weights are uploaded as a separate per-vertex attribute and passed
 to the fragment shader. With an active selection, the shader blends from the
 selected palette at weight zero to the unselected palette at weight one. The
-initial palettes are [grayscale.map](./assets/colormaps/grayscale.map) and
-[default.map](./assets/colormaps/default.map), respectively. Each palette has
+initial palettes are [grayscale.map](../assets/colormaps/grayscale.map) and
+[default.map](../assets/colormaps/default.map), respectively. Each palette has
 its own stop list and is evaluated at the same elevation.
 Without an active selection, the unselected palette is used everywhere.
 Brush edits multiply their falloff by the active selection weight.
@@ -401,7 +404,7 @@ elevation: there is no ocean/land split or implicit sea-level threshold.
 
 ### 7.3 External Colour-Map Format
 
-[default.map](./assets/colormaps/default.map) retains the original colours,
+[default.map](../assets/colormaps/default.map) retains the original colours,
 with an explicit narrow blue-to-green transition. Each map contains a single
 list of elevation/RGB stops, without section headers:
 
@@ -513,7 +516,8 @@ changing elevations; Cancel or Escape dismisses the dialog without applying.
   blur, radius selection, and their viewport rings; miles use the same radius
   converted from kilometres. Changing radius alone preserves terrain, layers,
   selection, and undo history.
-* **Point Count ($N$)**: Int slider controlling target base vertex density ($1,000$ to $1,000,000$).
+* **Point Count ($N$)**: Int slider controlling target base vertex density
+  ($100,000$ to $10,000,000$; default $100,000$).
   Applying a new count regenerates the grid and transfers all current elevation
   layers and selection weights by linear interpolation across the old mesh
   triangles. This preserves edits to imported terrain rather than reloading the
@@ -564,14 +568,14 @@ definitions replace all eight original menu tools:
 
 | Tool | Definition | Application |
 | --- | --- | --- |
-| Elevation Brush | [elevation.toml](./assets/brushes/elevation.toml) | Direct height; Replace/Minimum/Maximum choice |
-| Raise/Lower Brush | [raise_lower.toml](./assets/brushes/raise_lower.toml) | Continuous delta using `rate * elapsed * intensity / 100` |
-| Simplex Noise | [simplex.toml](./assets/brushes/simplex.toml) | Normalized fBm, optional billowed output |
-| Value Noise | [value.toml](./assets/brushes/value.toml) | Normalized Value fBm with amplitude |
-| Ridge Noise | [ridge.toml](./assets/brushes/ridge.toml) | Normalized native ridged fractal |
-| Power-Law Spectral Noise | [spectral.toml](./assets/brushes/spectral.toml) | Normalized periodic spectral field |
-| Gaussian Blur | [gaussian_blur.toml](./assets/brushes/gaussian_blur.toml) | Direct Gaussian neighbourhood height |
-| Clamp | [clamp.toml](./assets/brushes/clamp.toml) | Direct height clamped between ordered parameter bounds |
+| Elevation Brush | [elevation.toml](../assets/brushes/elevation.toml) | Direct height; Replace/Minimum/Maximum choice |
+| Raise/Lower Brush | [raise_lower.toml](../assets/brushes/raise_lower.toml) | Continuous delta using `rate * elapsed * intensity / 100` |
+| Simplex Noise | [simplex.toml](../assets/brushes/simplex.toml) | Normalized fBm, optional billowed output |
+| Value Noise | [value.toml](../assets/brushes/value.toml) | Normalized Value fBm with amplitude |
+| Ridge Noise | [ridge.toml](../assets/brushes/ridge.toml) | Normalized native ridged fractal |
+| Power-Law Spectral Noise | [spectral.toml](../assets/brushes/spectral.toml) | Normalized periodic spectral field |
+| Gaussian Blur | [gaussian_blur.toml](../assets/brushes/gaussian_blur.toml) | Direct Gaussian neighbourhood height |
+| Clamp | [clamp.toml](../assets/brushes/clamp.toml) | Direct height clamped between ordered parameter bounds |
 
 Other valid library files also appear in Brushes. Custom is a separate persistent
 editor/tool, not a file-backed preset name. Definitions and defaults are edited
@@ -744,6 +748,24 @@ selection weights blend the final displacement. Elevations are clamped to
 unchanged. Apply records one undoable active-layer edit; Cancel leaves terrain
 untouched.
 
+When the GPU compute backend is selected, glacial erosion uses separate
+mass-balance, surface, flow/rate, gather-spread, and final-displacement
+dispatches with double-precision intermediate values and edge distances. The
+dialog's Preview temporarily updates the active layer without adding history;
+changing a parameter or pressing Cancel restores the saved terrain, and Apply
+stores the preview as a single undoable edit.
+
+When GPU compute is selected, raster import uploads the source samples as an
+`R32F` texture and samples vertices with longitude wrapping, latitude clamping,
+and bilinear interpolation. UV coordinates are prepared in double precision on
+the CPU; the compute shader fetches the four surrounding texels and interpolates
+them to retain CPU-compatible sampling at sharp raster transitions. Raster
+export computes equirectangular pixel directions, nearest-site elevations,
+colour-map values, and optional selection blending on the GPU. A coarse CPU
+nearest-site seed grid initializes a GPU greedy walk over the spherical
+Delaunay 1-ring; the CPU import and export implementations remain available
+when the GPU backend is not selected.
+
 ---
 
 ## 10. CMake Configuration & Directory Layout
@@ -753,6 +775,8 @@ untouched.
 ```
 oswald-gis/
 ├── CMakeLists.txt
+├── roadmap.md               # Implementation roadmap
+├── docs/                    # Architecture, erosion, tectonic and GPU compute papers
 ├── include/                 # Public model, renderer, controller and scripting headers
 ├── src/                     # Implementations, main.cpp and internal file helpers
 ├── tests/                   # CPU tests plus hidden-context GPU/UI integration tests
@@ -771,7 +795,7 @@ generated/populated inside the build directory.
 
 ### 10.2 Production CMake Configuration
 
-The maintained build configuration is [CMakeLists.txt](./CMakeLists.txt).
+The maintained build configuration is [CMakeLists.txt](../CMakeLists.txt).
 It pins the dependencies in Section 2.1 via `FetchContent`, generates GLAD,
 builds `imgui_lib` with the GLFW/OpenGL3 backends, and exposes `oswald_model`
 as an OpenGL-independent C++20 library. The `oswald_gis` executable links the

@@ -1,0 +1,121 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SiteElevations { float siteElevations[]; };
+layout(std430, binding = 1) readonly buffer Selection { float selection[]; };
+layout(std430, binding = 2) buffer Error { uint code; uint index; };
+layout(std430, binding = 3) writeonly buffer PixelElevations { float pixelElevations[]; };
+layout(std430, binding = 4) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 5) readonly buffer NeighborOffsets { uint offsets[]; };
+layout(std430, binding = 6) readonly buffer Neighbors { uint neighbors[]; };
+layout(std430, binding = 8) readonly buffer Seeds { uint seeds[]; };
+layout(std430, binding = 9) writeonly buffer PixelColors { uint pixelColors[]; };
+layout(std430, binding = 10) readonly buffer ColorStops { vec4 colorStops[]; };
+layout(std430, binding = 11) readonly buffer SelectionColorStops { vec4 selectionColorStops[]; };
+
+uniform uint uVertexCount;
+uniform uint uPixelCount;
+uniform int uWidth;
+uniform int uHeight;
+uniform int uSeedWidth;
+uniform int uSeedHeight;
+uniform int uHasSelection;
+uniform int uUseColor;
+uniform int uUseSelectionColor;
+uniform int uColorStopCount;
+uniform int uSelectionColorStopCount;
+
+const float PI = 3.14159265358979323846;
+
+void reportError(uint errorCode, uint pixel) {
+    if (atomicCompSwap(code, 0u, errorCode) == 0u) {
+        index = pixel;
+    }
+}
+
+vec3 sampleMap(float elevation, bool selected) {
+    int count = selected ? uSelectionColorStopCount : uColorStopCount;
+    vec4 first = selected ? selectionColorStops[0] : colorStops[0];
+    if (elevation <= first.x) {
+        return first.yzw;
+    }
+    vec4 previous = first;
+    for (int i = 1; i < count; ++i) {
+        vec4 current = selected ? selectionColorStops[i] : colorStops[i];
+        if (elevation <= current.x) {
+            float t = (elevation - previous.x) / (current.x - previous.x);
+            return mix(previous.yzw, current.yzw, t);
+        }
+        previous = current;
+    }
+    return previous.yzw;
+}
+
+uint encodeRgb(vec3 color) {
+    uvec3 channels = uvec3(round(clamp(color, 0.0, 1.0) * 255.0));
+    return (channels.r << 16u) | (channels.g << 8u) | channels.b;
+}
+
+void main() {
+    uint pixel = gl_GlobalInvocationID.x;
+    if (pixel >= uPixelCount) {
+        return;
+    }
+    uint x = pixel % uint(uWidth);
+    uint y = pixel / uint(uWidth);
+    float latitude = PI * (0.5 - (float(y) + 0.5) / float(uHeight));
+    float longitude = 2.0 * PI * ((float(x) + 0.5) / float(uWidth) - 0.5);
+    vec3 point = vec3(cos(latitude) * cos(longitude),
+                      cos(latitude) * sin(longitude), sin(latitude));
+
+    uint seedX = min(uint(uSeedWidth - 1),
+                     x * uint(uSeedWidth) / uint(uWidth));
+    uint seedY = min(uint(uSeedHeight - 1),
+                     y * uint(uSeedHeight) / uint(uHeight));
+    uint site = seeds[seedY * uint(uSeedWidth) + seedX];
+    if (site >= uVertexCount) {
+        reportError(3u, pixel);
+        return;
+    }
+
+    float bestDot = dot(point, normalize(positions[site].xyz));
+    bool converged = false;
+    for (uint step = 0u; step < uVertexCount; ++step) {
+        uint bestSite = site;
+        float candidateDot = bestDot;
+        for (uint edge = offsets[site]; edge < offsets[site + 1u]; ++edge) {
+            uint neighbor = neighbors[edge];
+            float neighborDot = dot(point, normalize(positions[neighbor].xyz));
+            if (neighborDot > candidateDot ||
+                (neighborDot == candidateDot && neighbor < bestSite)) {
+                bestSite = neighbor;
+                candidateDot = neighborDot;
+            }
+        }
+        if (bestSite == site) {
+            converged = true;
+            break;
+        }
+        site = bestSite;
+        bestDot = candidateDot;
+    }
+    if (!converged) {
+        reportError(2u, pixel);
+        return;
+    }
+
+    float elevation = siteElevations[site];
+    if (isnan(elevation) || isinf(elevation)) {
+        reportError(1u, pixel);
+        return;
+    }
+    pixelElevations[pixel] = elevation;
+    if (uUseColor != 0) {
+        vec3 color = sampleMap(elevation, false);
+        if (uUseSelectionColor != 0 && uHasSelection != 0) {
+            color = mix(sampleMap(elevation, true), color, selection[site]);
+        }
+        pixelColors[pixel] = encodeRgb(color);
+    }
+}

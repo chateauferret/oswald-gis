@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ComputeContext.hpp"
 #include "GlobeRenderer.hpp"
 #include "ElevationRaster.hpp"
 #include "RasterFileBrowser.hpp"
@@ -13,7 +14,9 @@
 
 #include <filesystem>
 #include <array>
+#include <cstdint>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,6 +44,9 @@ public:
     bool IsBrushActive() const { return brushTools_.IsActive() || selectionMode_ != SelectionMode::None; }
     void SetCameraController(CameraController* camera) { camera_ = camera; }
     CameraController* GetCameraController() const { return camera_; }
+    ComputeBackendPreference GetComputeBackendPreference() const {
+        return computeBackendPreference_;
+    }
     // Folder supplying Brushes menu entries and the Custom brush's script library.
     void SetBrushScriptDirectory(std::filesystem::path directory);
 
@@ -61,6 +67,12 @@ private:
         std::vector<float> working;
         std::vector<GridVertex> renderVertices;
         bool wasActive = false;
+    };
+
+    struct HistogramCacheEntry {
+        std::uint64_t revision = std::numeric_limits<std::uint64_t>::max();
+        bool gpu = false;
+        std::array<float, 32> bins{};
     };
 
     enum class GridTransfer { ReloadRaster, PreserveLayers };
@@ -118,7 +130,7 @@ private:
     bool planetOpen_ = false;
     ProjectMetadata pendingMetadata_;
     double pendingPlanetRadius_ = 6371.0;
-    int pendingPointCount_ = 10'000;
+    int pendingPointCount_ = static_cast<int>(GridOptions::defaultPointCount);
     std::string planetError_;
     std::string projectFileName_;
     std::string projectDirectory_;
@@ -168,6 +180,9 @@ private:
     bool glacialErosionOpen_ = false;
     GlacialErosionSettings pendingGlacialErosionSettings_;
     std::string glacialErosionError_;
+    std::optional<std::vector<float>> glacialPreviewBefore_;
+    std::optional<std::vector<float>> glacialPreviewAfter_;
+    std::shared_ptr<const SphericalGridSnapshot> glacialPreviewSnapshot_;
     bool cratonicGroovingOpen_ = false;
     CratonicGroovingSettings pendingCratonicGroovingSettings_;
     std::string cratonicGroovingError_;
@@ -179,6 +194,8 @@ private:
     std::string absoluteMagnitudeNoiseError_;
     std::string simplexSeedError_;
     std::optional<std::string> scriptDraft_;
+    std::optional<std::string> gpuScriptDraft_;
+    unsigned int gpuScriptEditorRevision_ = 0;
     std::vector<ScriptParameter> scriptParameters_;
     std::vector<ScriptParameterValue> scriptParameterValues_;
     bool scriptParametersInstalled_ = true;
@@ -200,6 +217,10 @@ private:
     std::filesystem::path scriptOverwritePath_;
     bool settingsOpen_ = false;
     double pendingRaiseLowerRate_ = BrushSettings{}.raiseLowerRate;
+    ComputeBackendPreference computeBackendPreference_ = ComputeBackendPreference::Auto;
+    ComputeBackendPreference pendingComputeBackend_ = ComputeBackendPreference::Auto;
+    std::unique_ptr<ComputeContext> computeContext_;
+    std::unordered_map<const ElevationLayer*, HistogramCacheEntry> histogramCache_;
     CameraController* camera_ = nullptr;
     bool viewportWireframe_ = false;
     bool viewportGraticule_ = true;

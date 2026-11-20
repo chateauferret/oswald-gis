@@ -1,6 +1,7 @@
 #pragma once
 
 #include "BrushTool.hpp"
+#include "BrushScriptComputeBackend.hpp"
 #include "ScriptEngine.hpp"
 #include "ScriptParameter.hpp"
 
@@ -55,6 +56,14 @@ public:
     const ScriptedBrushSettings& GetSettings() const { return settings_; }
 
     std::string GetScript() const;
+    std::optional<std::string> GetGpuScript() const;
+    void SetGpuScript(std::optional<std::string> source);
+    bool HasGpuScript() const;
+    std::vector<std::size_t> ApplyGpu(
+        BrushScriptComputeBackend& compute,
+        const SphericalGridSnapshot& grid, glm::dvec3 center,
+        std::vector<float>& elevations, const BrushSettings& settings,
+        double elapsedSeconds) const;
     // Compiles and installs a script. On ScriptError the previous script remains active.
     void SetScript(std::string_view source);
     // Atomically replaces the script and its parameters; omitted values use the defaults.
@@ -97,6 +106,7 @@ private:
     Inputs inputs_;
     std::shared_ptr<EvaluationContext> context_;
     std::optional<CompiledScript> script_;
+    std::optional<std::string> gpuScript_;
     std::vector<ScriptParameter> parameters_;
     std::vector<ScriptParameterValue> parameterValues_;
     std::vector<std::variant<double*, std::string*>> parameterBindings_;

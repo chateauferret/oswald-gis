@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -116,6 +117,8 @@ struct NoiseSample {
 
 // Returns noise in [-1, 1]; values outside it are clamped.
 using NoiseSampler = std::function<double(const NoiseSample&)>;
+using NoiseBatchSampler =
+    std::function<std::vector<double>(std::span<const NoiseSample>)>;
 
 enum class BrushApplication { Noise, Elevation, Delta };
 
@@ -125,6 +128,10 @@ std::vector<std::size_t> ApplyNoiseSampler(
     const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
     const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
     const NoiseSampler& sample, BrushApplication application = BrushApplication::Noise);
+std::vector<std::size_t> ApplyNoiseSamplerBatch(
+    const SphericalGridSnapshot& grid, glm::dvec3 center, std::vector<float>& elevations,
+    const BrushSettings& brushSettings, double elapsedSeconds, const NoiseSettings& parameters,
+    const NoiseBatchSampler& sample, BrushApplication application = BrushApplication::Noise);
 
 double SampleGaussian(const SphericalGridSnapshot& grid, const std::vector<float>& source,
                       std::size_t index, const GaussianBlurSettings& settings);

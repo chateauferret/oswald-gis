@@ -231,6 +231,13 @@ BrushScriptFile BrushScriptFile::Parse(std::string_view text, std::string_view s
     file.description = requireString(table, "description", false, source);
     file.output = parseOutput(table, source);
     file.script = requireString(table, "script", true, source);
+    if (table.contains("gpu_script")) {
+        file.gpuScript = requireString(table, "gpu_script", true, source);
+        if (file.gpuScript->empty() || file.gpuScript->size() > 64 * 1024) {
+            throw std::runtime_error(describe(source) +
+                                     ": gpu_script must contain between 1 byte and 64 KiB.");
+        }
+    }
     file.parameters = parseParameters(table, source);
     if (table.contains("application")) {
         const auto application = requireString(table, "application", true, source);
@@ -280,6 +287,12 @@ std::string BrushScriptFile::ToToml() const {
                                           application == BrushApplication::Elevation ? "elevation" : "delta");
     text += continuous ? "\ncontinuous=true" : "\ncontinuous=false";
     text += "\nscript=" + tomlString(script) + "\n";
+    if (gpuScript) {
+        if (gpuScript->empty()) {
+            throw std::invalid_argument("A GPU brush body cannot be empty.");
+        }
+        text += "gpu_script=" + tomlString(*gpuScript) + "\n";
+    }
     for (const auto& parameter : parameters) {
         text += "\n[[parameter]]\nname=" + tomlString(parameter.name);
         if (!parameter.label.empty()) {

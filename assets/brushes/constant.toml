@@ -2,6 +2,7 @@ name="constant"
 description="Paint constant values"
 output="elevation"
 script="value"
+gpu_script = "return param_value;"
 
 [[parameter]]
 name="value"

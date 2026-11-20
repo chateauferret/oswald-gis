@@ -74,6 +74,22 @@ void testRoundTrip() {
     const BrushScriptFile multiline{"m", "", "a\nb"};
     check(multiline.ToToml().find("'''") != std::string::npos,
           "Multi-line scripts were not written readably.");
+
+    BrushScriptFile gpu;
+    gpu.name = "gpu body";
+    gpu.script = "x";
+    gpu.gpuScript = "return x;\n";
+    const auto gpuParsed = BrushScriptFile::Parse(gpu.ToToml());
+    check(gpuParsed.gpuScript == gpu.gpuScript,
+          "Optional multiline gpu_script did not round-trip.");
+    check(!BrushScriptFile::Parse("name='cpu only'\nscript='x'\n").gpuScript,
+          "A CPU-only script unexpectedly acquired a GPU body.");
+    check(throws([] {
+        BrushScriptFile::Parse("name='empty gpu'\nscript='x'\ngpu_script=''\n");
+    }), "Empty gpu_script was accepted.");
+    check(throws([] {
+        BrushScriptFile::Parse("name='bad gpu'\nscript='x'\ngpu_script=3\n");
+    }), "Non-string gpu_script was accepted.");
 }
 
 void testOutputMode() {

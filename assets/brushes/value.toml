@@ -2,6 +2,7 @@ name = "Value Noise"
 description = "FastNoise2 cubic Value noise with fractal octaves and amplitude."
 output = "normalized"
 script = "clamp(-1, valuefbm(x, y, z, Frequency, Lacunarity, Persistence, Octaves) * Amplitude, 1)"
+gpu_script = "return clamp(valuefbm(x, y, z, param_Frequency, param_Lacunarity, param_Persistence, int(param_Octaves)) * param_Amplitude, -1.0, 1.0);"
 
 [[parameter]]
 name = "Frequency"

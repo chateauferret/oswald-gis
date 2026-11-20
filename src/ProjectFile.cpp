@@ -226,7 +226,8 @@ std::unique_ptr<SphericalGrid> ProjectFile::Load(const std::filesystem::path& pa
     if (fileVersion >= 2) {
         options.planetRadius = reader.Double();
     }
-    if (options.pointCount < 1000 || options.pointCount > 1'000'000 ||
+    if (options.pointCount < GridOptions::minimumSupportedPointCount ||
+        options.pointCount > GridOptions::maximumPointCount ||
         options.poissonVariability < 0 || options.poissonVariability > 1 ||
         options.relaxationIterations > 100 || options.planetRadius <= 0.0) {
         throw std::runtime_error("Project grid options are invalid.");
@@ -234,7 +235,8 @@ std::unique_ptr<SphericalGrid> ProjectFile::Load(const std::filesystem::path& pa
     const auto count = reader.U32();
     const auto indexCount = reader.U32();
     const bool selectionActive = reader.Bool();
-    if (count < 4 || count > 1'000'000 || indexCount != (2 * count - 4) * 3) {
+    if (count < 4 || count > GridOptions::maximumPointCount ||
+        indexCount != (2 * count - 4) * 3) {
         throw std::runtime_error("Project mesh counts are invalid.");
     }
     reader.Require(std::uint64_t(count) * 24 + std::uint64_t(indexCount) * 4);

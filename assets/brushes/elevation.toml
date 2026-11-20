@@ -3,6 +3,13 @@ description = "Paint a fixed elevation using Replace, Minimum, or Maximum."
 application = "elevation"
 output = "elevation"
 script = "Operation == 'Minimum' ? min(elevation, Elevation) : (Operation == 'Maximum' ? max(elevation, Elevation) : Elevation)"
+gpu_script = '''
+return param_Operation < 0.5
+    ? param_Elevation
+    : (param_Operation < 1.5
+        ? min(elevation, param_Elevation)
+        : max(elevation, param_Elevation));
+'''
 
 [[parameter]]
 name = "Operation"

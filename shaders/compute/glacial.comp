@@ -1,0 +1,327 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Source { float source[]; };
+layout(std430, binding = 1) readonly buffer Selection { float selection[]; };
+layout(std430, binding = 2) buffer Error { uint code; uint index; };
+layout(std430, binding = 3) writeonly buffer Target { float target[]; };
+layout(std430, binding = 4) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 5) readonly buffer NeighborOffsets { uint offsets[]; };
+layout(std430, binding = 6) readonly buffer Neighbors { uint neighbors[]; };
+layout(std430, binding = 7) readonly buffer EdgeDistances { double edgeDistances[]; };
+layout(std430, binding = 8) buffer IceThickness { double iceThickness[]; };
+layout(std430, binding = 9) buffer IceSurface { double iceSurface[]; };
+layout(std430, binding = 10) buffer ErosionRate { double erosionRate[]; };
+layout(std430, binding = 11) buffer FlowDirection { dvec4 flowDirection[]; };
+layout(std430, binding = 12) buffer ErosionDepth { double erosionDepth[]; };
+layout(std430, binding = 13) buffer SpreadWeightSum { double spreadWeightSum[]; };
+layout(std430, binding = 14) buffer AccumulatedErosion { double accumulatedErosion[]; };
+
+uniform uint uVertexCount;
+uniform int uPass;
+uniform int uHasSelection;
+uniform int uHasSink;
+uniform double uMinimumElevation;
+uniform double uEquilibriumLineAltitude;
+uniform double uElaLatitudeGradient;
+uniform double uAccumulationRate;
+uniform double uAblationRate;
+uniform double uDurationYears;
+uniform double uGlacialErodibility;
+uniform double uIceViscosityFactor;
+uniform double uThicknessExponent;
+uniform double uVelocityExponent;
+uniform double uTroughHalfWidth;
+
+const double MIN_ELEVATION = -32767.0lf;
+const double MAX_ELEVATION = 32767.0lf;
+const double METRES_TO_DEGREES = 57.29577951308232lf;
+const double CROSS_TRACK_LIMIT = 0.7071067811865476lf;
+
+void reportError(uint errorCode, uint vertex) {
+    if (atomicCompSwap(code, 0u, errorCode) == 0u) {
+        index = vertex;
+    }
+}
+
+bool isSink(uint vertex, double elevation) {
+    return elevation <= 0.0 ||
+        (uHasSelection != 0 && selection[vertex] == 0.0) ||
+        (uHasSink == 0 && elevation == uMinimumElevation);
+}
+
+dvec3 unitPosition(uint vertex) {
+    return normalize(dvec3(positions[vertex].xyz));
+}
+
+double positivePower(double base, double exponent) {
+    if (exponent <= 64.0lf) {
+        int integerExponent = int(exponent);
+        if (double(integerExponent) == exponent) {
+            double result = 1.0lf;
+            for (int i = 0; i < integerExponent; ++i) {
+                result *= base;
+            }
+            return result;
+        }
+    }
+    return double(pow(float(base), float(exponent)));
+}
+
+double latitudeRadians(double z) {
+    double magnitude = abs(clamp(z, -1.0lf, 1.0lf));
+    if (magnitude > 0.9lf) {
+        double t = 1.0lf - magnitude;
+        double correction = 1.0lf + t * (1.0lf / 12.0lf +
+            t * (3.0lf / 160.0lf + t * (5.0lf / 896.0lf +
+            t * (35.0lf / 18432.0lf + t * 63.0lf / 90112.0lf))));
+        double result = 1.57079632679489661923lf -
+            sqrt(2.0lf * t) * correction;
+        return z < 0.0lf ? -result : result;
+    }
+    double term = magnitude;
+    double result = magnitude;
+    double square = magnitude * magnitude;
+    for (int n = 1; n < 56; ++n) {
+        double nd = double(n);
+        double factor = (2.0lf * nd - 1.0lf) * (2.0lf * nd - 1.0lf) /
+            (2.0lf * nd * (2.0lf * nd + 1.0lf));
+        term *= factor * square;
+        result += term;
+    }
+    return z < 0.0lf ? -result : result;
+}
+
+uint findEdge(uint sourceVertex, uint targetVertex) {
+    for (uint edge = offsets[sourceVertex]; edge < offsets[sourceVertex + 1u]; ++edge) {
+        if (neighbors[edge] == targetVertex) {
+            return edge;
+        }
+    }
+    return offsets[sourceVertex + 1u];
+}
+
+void main() {
+    uint vertex = gl_GlobalInvocationID.x;
+    if (vertex >= uVertexCount) {
+        return;
+    }
+
+    double elevation = double(source[vertex]);
+    float weight = selection[vertex];
+    if (uPass == 0) {
+        if (isnan(elevation) || isinf(elevation)) {
+            reportError(1u, vertex);
+            return;
+        }
+        if (elevation < MIN_ELEVATION || elevation > MAX_ELEVATION ||
+            isnan(weight) || isinf(weight) || weight < 0.0 || weight > 1.0) {
+            reportError(3u, vertex);
+            return;
+        }
+        dvec3 position = unitPosition(vertex);
+        double latitude = latitudeRadians(position.z) * METRES_TO_DEGREES;
+        double ela = uEquilibriumLineAltitude -
+            uElaLatitudeGradient * abs(latitude);
+        double surface = elevation + iceThickness[vertex];
+        double balance = uAccumulationRate * max(0.0, surface - ela) -
+            uAblationRate * max(0.0, ela - surface);
+        double updatedThickness = max(0.0,
+            iceThickness[vertex] + uDurationYears * balance);
+        if (isnan(updatedThickness) || isinf(updatedThickness)) {
+            reportError(2u, vertex);
+            return;
+        }
+        iceThickness[vertex] = updatedThickness;
+    } else if (uPass == 1) {
+        double surface = elevation + iceThickness[vertex];
+        if (isnan(surface) || isinf(surface)) {
+            reportError(2u, vertex);
+            return;
+        }
+        iceSurface[vertex] = surface;
+    } else if (uPass == 2) {
+        erosionRate[vertex] = 0.0;
+        erosionDepth[vertex] = 0.0;
+        spreadWeightSum[vertex] = 1.0;
+        flowDirection[vertex] = dvec4(0.0);
+        if (isSink(vertex, elevation) || iceThickness[vertex] <= 0.0) {
+            return;
+        }
+
+        double maximumSlope = 0.0;
+        double fallbackSlope = 0.0;
+        dvec3 weightedFlow = dvec3(0.0);
+        dvec3 fallbackDirection = dvec3(0.0);
+        dvec3 position = unitPosition(vertex);
+        for (uint edge = offsets[vertex]; edge < offsets[vertex + 1u]; ++edge) {
+            uint neighbor = neighbors[edge];
+            if (iceSurface[vertex] <= iceSurface[neighbor]) {
+                continue;
+            }
+            double distance = edgeDistances[edge];
+            if (!(distance > 0.0) || isnan(distance) || isinf(distance)) {
+                reportError(2u, vertex);
+                return;
+            }
+            dvec3 neighborPosition = unitPosition(neighbor);
+            dvec3 tangentVector = neighborPosition -
+                dot(position, neighborPosition) * position;
+            double tangentLength = length(tangentVector);
+            if (!(tangentLength > 0.0) || isnan(tangentLength) || isinf(tangentLength)) {
+                reportError(2u, vertex);
+                return;
+            }
+            dvec3 tangent = tangentVector / tangentLength;
+            double slope = (iceSurface[vertex] - iceSurface[neighbor]) / distance;
+            if (isnan(slope) || isinf(slope)) {
+                reportError(2u, vertex);
+                return;
+            }
+            weightedFlow += tangent * slope;
+            if (slope > fallbackSlope) {
+                fallbackSlope = slope;
+                fallbackDirection = tangent;
+            }
+            maximumSlope = max(maximumSlope, slope);
+        }
+        if (maximumSlope <= 0.0) {
+            return;
+        }
+        double flowLength = length(weightedFlow);
+        if (isnan(flowLength) || isinf(flowLength)) {
+            reportError(2u, vertex);
+            return;
+        }
+        dvec3 flow = flowLength > 1.0e-12lf
+            ? weightedFlow / flowLength : fallbackDirection;
+        double velocity = uIceViscosityFactor * iceThickness[vertex] *
+            maximumSlope * maximumSlope * maximumSlope;
+        double rate = uGlacialErodibility *
+            positivePower(iceThickness[vertex], uThicknessExponent) *
+            positivePower(velocity, uVelocityExponent);
+        double depth = rate * uDurationYears;
+        if (isnan(velocity) || isinf(velocity) || isnan(rate) || isinf(rate) ||
+            isnan(depth) || isinf(depth)) {
+            reportError(2u, vertex);
+            return;
+        }
+        flowDirection[vertex] = dvec4(flow, 0.0);
+        erosionRate[vertex] = rate;
+        erosionDepth[vertex] = depth;
+        if (depth > 0.0) {
+            for (uint edge = offsets[vertex]; edge < offsets[vertex + 1u]; ++edge) {
+                uint neighbor = neighbors[edge];
+                dvec3 neighborPosition = unitPosition(neighbor);
+                dvec3 tangentVector = neighborPosition -
+                    dot(position, neighborPosition) * position;
+                double tangentLength = length(tangentVector);
+                if (!(tangentLength > 0.0) || isnan(tangentLength) ||
+                    isinf(tangentLength)) {
+                    reportError(2u, vertex);
+                    return;
+                }
+                double alongFlow = dot(flow, tangentVector / tangentLength);
+                if (isSink(neighbor, source[neighbor]) ||
+                    abs(alongFlow) > CROSS_TRACK_LIMIT) {
+                    continue;
+                }
+                double perpendicularDistance = edgeDistances[edge] *
+                    sqrt(max(0.0, 1.0 - alongFlow * alongFlow));
+                double ratio = perpendicularDistance / uTroughHalfWidth;
+                double spreadWeight = max(0.0, 1.0 - ratio * ratio);
+                if (spreadWeight > 0.0) {
+                    spreadWeightSum[vertex] += spreadWeight;
+                }
+            }
+        }
+    } else if (uPass == 3) {
+        double total = 0.0;
+        uint degree = offsets[vertex + 1u] - offsets[vertex];
+        uint previous = 0u;
+        bool havePrevious = false;
+        for (uint item = 0u; item <= degree; ++item) {
+            uint candidate = uVertexCount;
+            if ((!havePrevious || vertex > previous) &&
+                (candidate == uVertexCount || vertex < candidate)) {
+                candidate = vertex;
+            }
+            for (uint edge = offsets[vertex]; edge < offsets[vertex + 1u]; ++edge) {
+                uint neighbor = neighbors[edge];
+                if ((!havePrevious || neighbor > previous) && neighbor < candidate) {
+                    candidate = neighbor;
+                }
+            }
+            if (candidate == uVertexCount) {
+                break;
+            }
+            previous = candidate;
+            havePrevious = true;
+            if (erosionDepth[candidate] <= 0.0) {
+                continue;
+            }
+            double spread = 1.0;
+            if (candidate != vertex) {
+                uint edge = findEdge(candidate, vertex);
+                if (edge >= offsets[candidate + 1u] ||
+                    neighbors[edge] != vertex) {
+                    reportError(2u, vertex);
+                    return;
+                }
+                dvec3 sourcePosition = unitPosition(candidate);
+                dvec3 targetPosition = unitPosition(vertex);
+                dvec3 tangentVector = targetPosition -
+                    dot(sourcePosition, targetPosition) * sourcePosition;
+                double tangentLength = length(tangentVector);
+                if (!(tangentLength > 0.0) || isnan(tangentLength) ||
+                    isinf(tangentLength)) {
+                    reportError(2u, vertex);
+                    return;
+                }
+                double alongFlow = dot(flowDirection[candidate].xyz,
+                                       tangentVector / tangentLength);
+                if (isSink(vertex, elevation) ||
+                    abs(alongFlow) > CROSS_TRACK_LIMIT) {
+                    continue;
+                }
+                double perpendicularDistance = edgeDistances[edge] *
+                    sqrt(max(0.0, 1.0 - alongFlow * alongFlow));
+                double ratio = perpendicularDistance / uTroughHalfWidth;
+                spread = max(0.0, 1.0 - ratio * ratio);
+                if (spread <= 0.0) {
+                    continue;
+                }
+            }
+            total += erosionDepth[candidate] *
+                (spread / spreadWeightSum[candidate]);
+            if (isnan(total) || isinf(total)) {
+                reportError(2u, vertex);
+                return;
+            }
+        }
+        accumulatedErosion[vertex] = total;
+    } else {
+        if (isnan(elevation) || isinf(elevation)) {
+            reportError(1u, vertex);
+            return;
+        }
+        if (isSink(vertex, elevation)) {
+            target[vertex] = float(elevation);
+            return;
+        }
+        double subsidence = (917.0lf / 3300.0lf) * iceThickness[vertex];
+        double desired = elevation - accumulatedErosion[vertex] - subsidence;
+        if (isnan(subsidence) || isinf(subsidence) || isnan(desired) || isinf(desired)) {
+            reportError(2u, vertex);
+            return;
+        }
+        desired = clamp(desired, MIN_ELEVATION, MAX_ELEVATION);
+        double result = elevation + (desired - elevation) * double(weight);
+        if (isnan(result) || isinf(result)) {
+            reportError(2u, vertex);
+            return;
+        }
+        target[vertex] = float(result);
+    }
+}

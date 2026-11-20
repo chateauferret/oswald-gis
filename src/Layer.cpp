@@ -126,6 +126,7 @@ RasterLayer::RasterLayer(std::string name, std::string description, std::string 
 void RasterLayer::SetValues(std::span<const float> values) {
     validateValues(values);
     values_.assign(values.begin(), values.end());
+    ++valuesRevision_;
 }
 
 ElevationLayer::ElevationLayer()

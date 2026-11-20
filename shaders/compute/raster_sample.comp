@@ -1,0 +1,56 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 2) buffer Error { uint code; uint index; };
+layout(std430, binding = 3) writeonly buffer Elevations { float elevations[]; };
+layout(std430, binding = 5) readonly buffer Coordinates { dvec2 coordinates[]; };
+
+layout(binding = 0) uniform sampler2D uRaster;
+uniform uint uVertexCount;
+uniform int uWidth;
+uniform int uHeight;
+uniform int uElevationSamples;
+
+const float MIN_ELEVATION = -32767.0;
+const float MAX_ELEVATION = 32767.0;
+const float PI = 3.14159265358979323846;
+
+void reportError(uint errorCode, uint vertex) {
+    if (atomicCompSwap(code, 0u, errorCode) == 0u) {
+        index = vertex;
+    }
+}
+
+void main() {
+    uint vertex = gl_GlobalInvocationID.x;
+    if (vertex >= uVertexCount) {
+        return;
+    }
+    dvec2 uv = coordinates[vertex];
+    double u = uv.x - floor(uv.x);
+    double v = clamp(uv.y, 0.0lf, 1.0lf);
+    double x = u * double(uWidth) - 0.5lf;
+    double y = v * double(uHeight) - 0.5lf;
+    int x0Raw = int(floor(x));
+    int y0Raw = int(floor(y));
+    int x0 = (x0Raw % uWidth + uWidth) % uWidth;
+    int x1 = (x0 + 1) % uWidth;
+    int y0 = clamp(y0Raw, 0, uHeight - 1);
+    int y1 = clamp(y0Raw + 1, 0, uHeight - 1);
+    float tx = float(x - floor(x));
+    float ty = float(y - floor(y));
+    float a = texelFetch(uRaster, ivec2(x0, y0), 0).r;
+    float b = texelFetch(uRaster, ivec2(x1, y0), 0).r;
+    float c = texelFetch(uRaster, ivec2(x0, y1), 0).r;
+    float d = texelFetch(uRaster, ivec2(x1, y1), 0).r;
+    float value = mix(mix(a, b, tx), mix(c, d, tx), ty);
+    float result = uElevationSamples != 0
+        ? clamp(value, MIN_ELEVATION, MAX_ELEVATION)
+        : clamp(MIN_ELEVATION + value * 65534.0, MIN_ELEVATION, MAX_ELEVATION);
+    if (isnan(value) || isinf(value) || isnan(result) || isinf(result)) {
+        reportError(1u, vertex);
+        return;
+    }
+    elevations[vertex] = result;
+}

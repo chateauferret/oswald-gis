@@ -5,7 +5,7 @@
 Phases 1-18 record the original implementation milestones. Phase 19 describes
 the current scripting-based brush architecture and supersedes the earlier
 native brush registration and parameter UI. See
-[the architecture specification](./oswald-gis-mvp-architecture.md) for component
+[the architecture specification](./docs/oswald-gis-mvp-architecture.md) for component
 boundaries, script format, and build/test details.
 
 1. **Phase 1: Build System & Context Setup**  

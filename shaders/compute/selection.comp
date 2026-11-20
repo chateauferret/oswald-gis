@@ -1,0 +1,78 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Elevations { float elevations[]; };
+layout(std430, binding = 1) readonly buffer CurrentWeights { float currentWeights[]; };
+layout(std430, binding = 3) writeonly buffer Result { float result[]; };
+layout(std430, binding = 4) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 5) readonly buffer Polygon { vec4 polygon[]; };
+
+uniform uint uVertexCount;
+uniform int uOperation;
+uniform int uHasSelection;
+uniform vec3 uBounds;
+uniform vec3 uCenter;
+uniform vec3 uRadius;
+uniform uint uPolygonCount;
+uniform float uReferenceWinding;
+
+bool polygonContains(vec3 point) {
+    float winding = 0.0;
+    for (uint edge = 0u; edge < uPolygonCount; ++edge) {
+        vec3 a = polygon[edge].xyz;
+        vec3 b = polygon[(edge + 1u) % uPolygonCount].xyz;
+        float numerator = dot(point, cross(a, b));
+        float denominator = dot(a, b) - dot(point, a) * dot(point, b);
+        if (length(cross(point, a)) < 1e-6 || length(cross(point, b)) < 1e-6) {
+            if (dot(point, a) > 0.0 || dot(point, b) > 0.0) {
+                return true;
+            }
+        }
+        winding += atan(numerator, denominator);
+    }
+    return abs(winding) > 3.141592653589793 &&
+        winding * uReferenceWinding > 0.0;
+}
+
+void main() {
+    uint vertex = gl_GlobalInvocationID.x;
+    if (vertex >= uVertexCount) {
+        return;
+    }
+
+    if (uOperation == 1) {
+        result[vertex] = 0.0;
+    } else if (uOperation == 2) {
+        result[vertex] = uHasSelection != 0 ? 1.0 - currentWeights[vertex] : 1.0;
+    } else if (uOperation == 3) {
+        vec3 point = normalize(positions[vertex].xyz);
+        float angle = atan(length(cross(uCenter, point)), dot(uCenter, point));
+        float distance = angle * uRadius.z;
+        float innerRadius = uRadius.x * (1.0 - uRadius.y / 100.0);
+        float weight = distance > uRadius.x ? 0.0 : 1.0;
+        if (distance <= uRadius.x && innerRadius < uRadius.x && distance > innerRadius) {
+            weight = clamp((uRadius.x - distance) / (uRadius.x - innerRadius), 0.0, 1.0);
+        }
+        result[vertex] = max(currentWeights[vertex], weight);
+    } else if (uOperation == 4) {
+        result[vertex] = polygonContains(normalize(positions[vertex].xyz)) ? 1.0 : 0.0;
+    } else {
+        float lower = uBounds.x;
+        float upper = uBounds.y;
+        float feather = uBounds.z;
+        float midpoint = (lower + upper) * 0.5;
+        float halfPlateau = (upper - lower) * 0.5 * (1.0 - feather / 100.0);
+        float innerLower = midpoint - halfPlateau;
+        float innerUpper = midpoint + halfPlateau;
+        float value = elevations[vertex];
+        float weight = 0.0;
+        if (value >= innerLower && value <= innerUpper) {
+            weight = 1.0;
+        } else if (value > lower && value < innerLower) {
+            weight = (value - lower) / (innerLower - lower);
+        } else if (value > innerUpper && value < upper) {
+            weight = (upper - value) / (upper - innerUpper);
+        }
+        result[vertex] = weight;
+    }
+}

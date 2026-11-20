@@ -24,6 +24,13 @@
 
 namespace {
 
+void warnBeforeClearingHistory(bool regenerating, const UndoStack& history) {
+    if (regenerating && history.Size() != 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.72F, 0.32F, 1.0F));
+        ImGui::TextWrapped("Warning: Regenerating the grid will clear all undo and redo history.");
+        ImGui::PopStyleColor();
+    }
+}
 
 float clipUiValue(float value, float minimum, float maximum, float fallback) {
     if (!std::isfinite(value)) {
@@ -385,22 +392,36 @@ std::shared_ptr<const SphericalGridSnapshot> buildGridSnapshot(
 } // namespace
 
 void UIManager::InstallGeneratedGrid(SphericalGrid& grid, GlobeRenderer& renderer,
-                                     std::shared_ptr<const SphericalGridSnapshot> snapshot) {
-    grid.InstallSnapshot(std::move(snapshot));
+                                     GeneratedGrid generated) {
+    if (auto* resampled = std::get_if<SphericalGrid::ResampledGrid>(&generated)) {
+        grid.InstallResampledGrid(std::move(*resampled));
+    } else {
+        grid.InstallSnapshot(std::get<std::shared_ptr<const SphericalGridSnapshot>>(
+            std::move(generated)));
+    }
     undoStack_.Clear();
     stroke_.reset();
     selectionStroke_.reset();
     polygonPoints_.clear();
     renderer.UploadGrid(*grid.GetSnapshot());
+    SyncLayerStack(grid, renderer);
     previousOptions_ = options_;
 }
 
-void UIManager::StartGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer) {
+void UIManager::StartGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer,
+                                    GridTransfer transfer) {
     const GridOptions requested = options_;
     previousOptions_ = grid.GetSnapshot()->GetOptions();
+    const auto generate = [&grid = std::as_const(grid), requested, transfer, raster = raster_]
+        (GridGenerationControl* control) -> GeneratedGrid {
+        if (transfer == GridTransfer::PreserveLayers) {
+            return grid.PrepareResampledGrid(requested, control);
+        }
+        return buildGridSnapshot(requested, raster, control);
+    };
     if (requested.pointCount <= backgroundGenerationThreshold) {
         try {
-            InstallGeneratedGrid(grid, renderer, buildGridSnapshot(requested, raster_, nullptr));
+            InstallGeneratedGrid(grid, renderer, generate(nullptr));
         } catch (...) {
             options_ = previousOptions_;
             throw;
@@ -410,10 +431,7 @@ void UIManager::StartGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer
     gridControl_ = std::make_unique<GridGenerationControl>();
     gridCancelRequested_ = false;
     gridProgressOpen_ = true;
-    gridFuture_ = std::async(std::launch::async,
-                             [requested, raster = raster_, control = gridControl_.get()] {
-                                 return buildGridSnapshot(requested, raster, control);
-                             });
+    gridFuture_ = std::async(std::launch::async, generate, gridControl_.get());
 }
 
 void UIManager::PollGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer) {
@@ -422,7 +440,11 @@ void UIManager::PollGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer)
         return;
     }
     try {
-        InstallGeneratedGrid(grid, renderer, gridFuture_.get());
+        auto generated = gridFuture_.get();
+        if (gridControl_->IsCancelled()) {
+            throw GridGenerationCancelled();
+        }
+        InstallGeneratedGrid(grid, renderer, std::move(generated));
     } catch (const GridGenerationCancelled&) {
         options_ = previousOptions_;
     } catch (const std::exception& error) {
@@ -1489,6 +1511,111 @@ void UIManager::RenderGlacialErosionDialog(SphericalGrid& grid, GlobeRenderer& r
     ImGui::EndPopup();
 }
 
+void UIManager::RenderCratonicGroovingDialog(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (cratonicGroovingOpen_) {
+        ImGui::OpenPopup("Cratonic Directional Grooving");
+        cratonicGroovingOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Cratonic Directional Grooving", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputDouble("Ice flow X", &pendingCratonicGroovingSettings_.iceFlowDirection.x,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Ice flow Y", &pendingCratonicGroovingSettings_.iceFlowDirection.y,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Ice flow Z", &pendingCratonicGroovingSettings_.iceFlowDirection.z,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Erodibility weight",
+                       &pendingCratonicGroovingSettings_.erodibility, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Groove coefficient (m)",
+                       &pendingCratonicGroovingSettings_.grooveCoefficient,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Anisotropy multiplier",
+                       &pendingCratonicGroovingSettings_.anisotropy, 0.0, 0.0, "%.6g");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 560.0F);
+    ImGui::TextWrapped("One pass applies the spec's directional incision using the mean absolute flow-parallel distance over each vertex's 1-ring. The flow vector is projected onto the local tangent plane; erodibility is the configured W(v) weight.");
+    if (!cratonicGroovingError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", cratonicGroovingError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<CratonicGroovingFilter&>(
+                filters_.GetFilter("Cratonic directional grooving"));
+            filter.SetSettings(pendingCratonicGroovingSettings_);
+            ApplyTerrainFilter(filter, grid, renderer);
+            cratonicGroovingError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            cratonicGroovingError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        cratonicGroovingError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void UIManager::RenderCratonicScourDialog(SphericalGrid& grid, GlobeRenderer& renderer) {
+    if (cratonicScourOpen_) {
+        ImGui::OpenPopup("Cratonic Scour and Planation");
+        cratonicScourOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Cratonic Scour and Planation", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputDouble("Ice flow X", &pendingCratonicScourSettings_.iceFlowDirection.x,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Ice flow Y", &pendingCratonicScourSettings_.iceFlowDirection.y,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Ice flow Z", &pendingCratonicScourSettings_.iceFlowDirection.z,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Erodibility weight",
+                       &pendingCratonicScourSettings_.erodibility, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Stoss abrasion coefficient",
+                       &pendingCratonicScourSettings_.stossAbrasionCoefficient,
+                       0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Lee plucking rate",
+                       &pendingCratonicScourSettings_.pluckingRate, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Craton elevation (m)",
+                       &pendingCratonicScourSettings_.cratonElevation, 0.0, 0.0, "%.6g");
+    ImGui::InputDouble("Planation attenuation (1/m)",
+                       &pendingCratonicScourSettings_.planationAttenuation,
+                       0.0, 0.0, "%.6g");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 560.0F);
+    ImGui::TextWrapped("One pass estimates the local tangent-plane elevation gradient, applies stoss-side Laplacian abrasion or lee-side plucking, then attenuates elevations above the craton baseline.");
+    if (!cratonicScourError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
+        ImGui::TextWrapped("%s", cratonicScourError_.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Apply")) {
+        try {
+            auto& filter = dynamic_cast<CratonicScourFilter&>(
+                filters_.GetFilter("Cratonic scour and planation"));
+            filter.SetSettings(pendingCratonicScourSettings_);
+            ApplyTerrainFilter(filter, grid, renderer);
+            cratonicScourError_.clear();
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) {
+            cratonicScourError_ = error.what();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        cratonicScourError_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void UIManager::ApplyActiveLayerColorMaps(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (!grid.HasActiveLayer()) {
         renderer.ClearLayerStack();
@@ -1852,6 +1979,10 @@ void UIManager::RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer) {
         ImGui::EndPopup();
     }
     ImGui::End();
+    SyncLayerStack(grid, renderer);
+}
+
+void UIManager::SyncLayerStack(SphericalGrid& grid, GlobeRenderer& renderer) {
     if (colorMapDirectory_.empty()) {
         renderer.ClearLayerStack();
         renderer.SetLayerVisible(grid.HasActiveLayer() && grid.GetActiveLayer().IsVisible());
@@ -2257,7 +2388,7 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
                 ImGui::SliderInt("Point Count (N)", &pendingPointCount_, 1'000, 1'000'000,
                                  "%d", ImGuiSliderFlags_AlwaysClamp);
                 ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 480.0F);
-                ImGui::TextWrapped("Changing point count regenerates the grid and clears undo history, using the loaded raster if available. Changing radius alone preserves terrain and selection.");
+                ImGui::TextWrapped("Changing point count interpolates the existing terrain layers and selection onto the new grid. Changing radius alone leaves the grid intact.");
                 ImGui::PopTextWrapPos();
                 ImGui::EndTabItem();
             }
@@ -2271,6 +2402,9 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
             }
             ImGui::EndTabBar();
         }
+        const bool pointCountChanged =
+            static_cast<std::size_t>(pendingPointCount_) != grid.GetSnapshot()->GetOptions().pointCount;
+        warnBeforeClearingHistory(pointCountChanged, undoStack_);
         if (!planetError_.empty()) {
             ImGui::TextWrapped("%s", planetError_.c_str());
         }
@@ -2285,8 +2419,8 @@ void UIManager::RenderProjectDialogs(SphericalGrid& grid, GlobeRenderer& rendere
                 options_ = grid.GetSnapshot()->GetOptions();
                 options_.planetRadius = pendingPlanetRadius_;
                 options_.pointCount = static_cast<std::size_t>(pendingPointCount_);
-                if (options_.pointCount != grid.GetSnapshot()->GetOptions().pointCount) {
-                    StartGridGeneration(grid, renderer);
+                if (pointCountChanged) {
+                    StartGridGeneration(grid, renderer, GridTransfer::PreserveLayers);
                 } else {
                     grid.SetPlanetRadius(pendingPlanetRadius_);
                     previousOptions_ = options_;
@@ -2510,7 +2644,11 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                                 camera_->GetProjection() == ViewProjection::Equirectangular);
 
     PollGridGeneration(grid, renderer);
-    const bool generating = gridFuture_.valid() || gridProgressOpen_;
+    // The generation worker reads the current layers until its result is ready.
+    if (gridFuture_.valid()) {
+        RenderGridProgressDialog();
+        return false;
+    }
     bool requestExit = false;
     const auto runHistory = [&](bool (UndoStack::*step)(), const char* name) {
         try {
@@ -2522,7 +2660,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     };
     const auto undo = [&] { runHistory(&UndoStack::Undo, "Undo"); };
     const auto redo = [&] { runHistory(&UndoStack::Redo, "Redo"); };
-    const bool projectBusy = generating || stroke_.has_value() || selectionStroke_.has_value();
+    const bool projectBusy = stroke_.has_value() || selectionStroke_.has_value();
     if (!projectBusy && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
         ImGui::GetIO().KeyCtrl && !ImGui::GetIO().WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_O)) {
@@ -2540,7 +2678,7 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
             }
         }
     }
-    if (!generating && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+    if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
         !ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
             undo();
@@ -2743,6 +2881,20 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                     pendingGlacialErosionSettings_ = filter.GetSettings();
                     glacialErosionError_.clear();
                     glacialErosionOpen_ = true;
+                }
+                if (ImGui::MenuItem("Cratonic directional grooving...")) {
+                    const auto& filter = dynamic_cast<const CratonicGroovingFilter&>(
+                        filters_.GetFilter("Cratonic directional grooving"));
+                    pendingCratonicGroovingSettings_ = filter.GetSettings();
+                    cratonicGroovingError_.clear();
+                    cratonicGroovingOpen_ = true;
+                }
+                if (ImGui::MenuItem("Cratonic scour and planation...")) {
+                    const auto& filter = dynamic_cast<const CratonicScourFilter&>(
+                        filters_.GetFilter("Cratonic scour and planation"));
+                    pendingCratonicScourSettings_ = filter.GetSettings();
+                    cratonicScourError_.clear();
+                    cratonicScourOpen_ = true;
                 }
                 ImGui::EndMenu();
             }
@@ -3042,6 +3194,12 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                           glm::value_ptr(pendingWireframeColor_));
         ImGui::ColorEdit3("Wireframe colour (selected)",
                           glm::value_ptr(pendingWireframeSelectedColor_));
+        const auto currentOptions = grid.GetSnapshot()->GetOptions();
+        const bool samplingChanged = options_.pointCount != currentOptions.pointCount ||
+            options_.poissonVariability != currentOptions.poissonVariability ||
+            options_.seed != currentOptions.seed ||
+            options_.relaxationIterations != currentOptions.relaxationIterations;
+        warnBeforeClearingHistory(samplingChanged, undoStack_);
         if (!errorMessage_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.35F, 0.3F, 1.0F));
             ImGui::TextWrapped("%s", errorMessage_.c_str());
@@ -3062,12 +3220,8 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
                 graticuleColor_ = pendingGraticuleColor_;
                 highlightedGraticuleColor_ = pendingHighlightedGraticuleColor_;
                 errorMessage_.clear();
-                const auto& currentOptions = grid.GetSnapshot()->GetOptions();
-                if (options_.pointCount != currentOptions.pointCount ||
-                    options_.poissonVariability != currentOptions.poissonVariability ||
-                    options_.seed != currentOptions.seed ||
-                    options_.relaxationIterations != currentOptions.relaxationIterations) {
-                    StartGridGeneration(grid, renderer);
+                if (samplingChanged) {
+                    StartGridGeneration(grid, renderer, GridTransfer::ReloadRaster);
                 }
                 ImGui::CloseCurrentPopup();
             } catch (const std::exception& error) {
@@ -3080,7 +3234,13 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
         }
         ImGui::EndPopup();
     }
-    RenderProjectDialogs(grid, renderer);
+    if (!gridFuture_.valid()) {
+        RenderProjectDialogs(grid, renderer);
+    }
+    if (gridFuture_.valid()) {
+        RenderGridProgressDialog();
+        return requestExit;
+    }
     const bool projectModal = ImGui::IsPopupOpen("Project File") ||
         ImGui::IsPopupOpen("Planet") || ImGui::IsPopupOpen("Project Error");
     const bool valueSelectionDialog = valueSelectionOpen_ || ImGui::IsPopupOpen("Select By Value");
@@ -3097,6 +3257,12 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     const bool glacialErosionDialog = glacialErosionOpen_ ||
         ImGui::IsPopupOpen("Glacial Erosion");
     RenderGlacialErosionDialog(grid, renderer);
+    const bool cratonicGroovingDialog = cratonicGroovingOpen_ ||
+        ImGui::IsPopupOpen("Cratonic Directional Grooving");
+    RenderCratonicGroovingDialog(grid, renderer);
+    const bool cratonicScourDialog = cratonicScourOpen_ ||
+        ImGui::IsPopupOpen("Cratonic Scour and Planation");
+    RenderCratonicScourDialog(grid, renderer);
     const bool noiseDialog = absoluteMagnitudeNoiseOpen_ ||
         ImGui::IsPopupOpen("Absolute Magnitude Noise");
     RenderAbsoluteMagnitudeNoiseDialog(grid, renderer);
@@ -3113,20 +3279,17 @@ bool UIManager::Render(SphericalGrid& grid, GlobeRenderer& renderer,
     }
     const bool fillBasinsDialog = ImGui::IsPopupOpen("Fill Basins Error");
     RenderGridProgressDialog();
-    if (generating) {
-        return requestExit;
-    }
     if (!ImGui::IsPopupOpen("Open Raster") && !ImGui::IsPopupOpen("Settings") &&
         !valueSelectionDialog && !fillFilterDialog && !fillBasinsDialog &&
         !inciseFlowDialog && !precipitonDialog && !thermalWeatheringDialog &&
-        !glacialErosionDialog &&
+        !glacialErosionDialog && !cratonicGroovingDialog && !cratonicScourDialog &&
         !noiseDialog && !projectModal) {
         RenderBrushPanel(grid, renderer);
         RenderSelectionPanel();
     }
     if (!valueSelectionDialog && !fillFilterDialog && !fillBasinsDialog &&
         !inciseFlowDialog && !precipitonDialog && !thermalWeatheringDialog &&
-        !glacialErosionDialog &&
+        !glacialErosionDialog && !cratonicGroovingDialog && !cratonicScourDialog &&
         !noiseDialog && !projectModal) {
         ProcessBrushInput(grid, renderer, modelMatrix, zoom);
         ProcessSelectionInput(grid, renderer, modelMatrix, zoom);

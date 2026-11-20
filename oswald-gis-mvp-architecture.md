@@ -514,8 +514,12 @@ changing elevations; Cancel or Escape dismisses the dialog without applying.
   converted from kilometres. Changing radius alone preserves terrain, layers,
   selection, and undo history.
 * **Point Count ($N$)**: Int slider controlling target base vertex density ($1,000$ to $1,000,000$).
-  Applying a new count regenerates the grid using the loaded raster if available,
-  remaps layers, and clears undo history, as in the former Settings control.
+  Applying a new count regenerates the grid and transfers all current elevation
+  layers and selection weights by linear interpolation across the old mesh
+  triangles. This preserves edits to imported terrain rather than reloading the
+  raster. The change clears undo history because commands refer to the old grid.
+  Planet and Settings warn before applying changes that regenerate the grid
+  when there are undo or redo entries to discard.
 * **Metadata tab**: Description, author, and read-only last-saved UTC date.
   Apply commits both tabs; Cancel/Escape discards pending changes.
 
@@ -832,6 +836,17 @@ GLAD is generated during CMake configuration for the OpenGL 4.5 core profile.
 On Linux, GLFW also needs the development packages for at least one supported
 window-system backend (X11 or Wayland).
 
+The bottom status bar refreshes in the same frame as a committed undoable edit,
+undo, redo, or history reset (including grid replacement), and once per second
+otherwise. CPU RAM and GPU VRAM show system and rendering-device used / total
+memory in MiB. CPU RAM counts reclaimable memory as available; GPU VRAM
+requires the driver's `GL_NVX_gpu_memory_info` extension. Oswald RAM shows the
+process's resident memory on Linux, which can stay flat when the allocator
+reuses memory. Terrain buffers shows the size of the application's OpenGL
+terrain buffer allocations, not their physical VRAM residency. The undo and
+redo counts show changes to history independently of allocator behavior.
+Unavailable memory readings are labeled as such.
+
 #### Debugging in VS Code
 
 Install the C/C++ and CMake Tools extensions and GDB. Open the project folder,
@@ -913,8 +928,9 @@ Regional/projected GIS rasters must first be converted externally.
 The selected image is resampled to a 2048 x 1024 equirectangular
 luminosity raster. The app maps longitude periodically across the image seam,
 clamps latitude at the poles, bilinearly samples each spherical vertex, and
-maps luminosity to elevations in [-32767, 32767]. Applying new grid settings
-resamples the currently loaded raster onto the regenerated grid. Raster
+maps luminosity to elevations in [-32767, 32767]. Changing point count in the
+Planet dialog resamples the current edited terrain layers, not the original
+raster. Changing sampling parameters in Settings can still reload the raster. Raster
 elevation replacement publishes a new immutable model snapshot and updates the
 renderer elevation buffer with `glNamedBufferSubData` without re-uploading
 positions or triangle indices.

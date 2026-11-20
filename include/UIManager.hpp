@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 class SphericalGrid;
@@ -36,6 +37,7 @@ public:
 
     bool Render(SphericalGrid& grid, GlobeRenderer& renderer,
                 const glm::mat4& modelMatrix = glm::mat4(1.0F), float zoom = 1.0F);
+    const UndoStack& GetUndoStack() const { return undoStack_; }
     bool IsBrushActive() const { return brushTools_.IsActive() || selectionMode_ != SelectionMode::None; }
     void SetCameraController(CameraController* camera) { camera_ = camera; }
     CameraController* GetCameraController() const { return camera_; }
@@ -61,12 +63,16 @@ private:
         bool wasActive = false;
     };
 
-    using GridFuture = std::future<std::shared_ptr<const SphericalGridSnapshot>>;
+    enum class GridTransfer { ReloadRaster, PreserveLayers };
+    using GeneratedGrid = std::variant<std::shared_ptr<const SphericalGridSnapshot>,
+                                       SphericalGrid::ResampledGrid>;
+    using GridFuture = std::future<GeneratedGrid>;
 
-    void StartGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer);
+    void StartGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer, GridTransfer transfer);
     void PollGridGeneration(SphericalGrid& grid, GlobeRenderer& renderer);
     void InstallGeneratedGrid(SphericalGrid& grid, GlobeRenderer& renderer,
-                              std::shared_ptr<const SphericalGridSnapshot> snapshot);
+                              GeneratedGrid generated);
+    void SyncLayerStack(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderGridProgressDialog();
     void NavigateRasterDirectory(const std::filesystem::path& directory);
     void RenderBrushPanel(SphericalGrid& grid, GlobeRenderer& renderer);
@@ -85,6 +91,8 @@ private:
     void RenderPrecipitonDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderThermalWeatheringDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderGlacialErosionDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderCratonicGroovingDialog(SphericalGrid& grid, GlobeRenderer& renderer);
+    void RenderCratonicScourDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderAbsoluteMagnitudeNoiseDialog(SphericalGrid& grid, GlobeRenderer& renderer);
     void ApplyTerrainFilter(const Filter& filter, SphericalGrid& grid, GlobeRenderer& renderer);
     void RenderLayerPanel(SphericalGrid& grid, GlobeRenderer& renderer);
@@ -160,6 +168,12 @@ private:
     bool glacialErosionOpen_ = false;
     GlacialErosionSettings pendingGlacialErosionSettings_;
     std::string glacialErosionError_;
+    bool cratonicGroovingOpen_ = false;
+    CratonicGroovingSettings pendingCratonicGroovingSettings_;
+    std::string cratonicGroovingError_;
+    bool cratonicScourOpen_ = false;
+    CratonicScourSettings pendingCratonicScourSettings_;
+    std::string cratonicScourError_;
     bool absoluteMagnitudeNoiseOpen_ = false;
     float pendingNoiseAmplitudeFeet_ = 100.0F;
     std::string absoluteMagnitudeNoiseError_;

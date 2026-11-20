@@ -1,5 +1,6 @@
 #include "UIManager.hpp"
 #include "BrushScriptFile.hpp"
+#include "MemoryStatusBar.hpp"
 #include "ProjectFile.hpp"
 
 #include <GLFW/glfw3.h>
@@ -17,7 +18,9 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -53,6 +56,55 @@ struct ImGuiSession {
     ~ImGuiSession() { ImGui::DestroyContext(); }
 };
 
+std::string renderMemoryStatusBar(MemoryStatusBar& statusBar, double now,
+                                  const UndoStack& history,
+                                  const GlobeRenderer* renderer = nullptr) {
+    std::string text;
+    auto& io = ImGui::GetIO();
+    io.ClipboardUserData = &text;
+    io.SetClipboardTextFn = [](void* data, const char* value) {
+        *static_cast<std::string*>(data) = value;
+    };
+    ImGui::NewFrame();
+    ImGui::LogToClipboard();
+    statusBar.Render(now, history, renderer);
+    ImGui::Render();
+    io.SetClipboardTextFn = nullptr;
+    io.ClipboardUserData = nullptr;
+    return text;
+}
+
+void testMemoryStatusBar() {
+    const ImGuiSession imgui;
+    MemoryStatusBar statusBar;
+    const UndoStack history;
+    const auto frame = [&](float width, double now) {
+        ImGui::GetIO().DisplaySize = ImVec2(width, 600.0F);
+        const auto text = renderMemoryStatusBar(statusBar, now, history);
+        const auto* bar = ImGui::FindWindowByName("##MemoryStatusBar");
+        check(bar && bar->Active && bar->Pos.x == 0.0F && bar->Size.x == width &&
+              bar->Pos.y + bar->Size.y == 600.0F,
+              "Memory status bar did not span the bottom of the window.");
+#ifdef __linux__
+        check(text.find("CPU RAM: ") != std::string::npos &&
+              text.find(" / ") != std::string::npos &&
+              text.find(" MiB") != std::string::npos &&
+              text.find("Oswald RAM: unavailable") == std::string::npos &&
+              text.find("Oswald RAM: ") != std::string::npos,
+              "Expected numeric used and total Linux RAM readings.");
+#endif
+        return std::pair{text, bar->Size.y};
+    };
+
+    const auto [firstText, wideHeight] = frame(800.0F, 0.0);
+    check(firstText.find("GPU VRAM: unavailable") != std::string::npos,
+          "Expected an unavailable VRAM indication without a GL driver.");
+    const auto [narrowText, narrowHeight] = frame(250.0F, 0.5);
+    check(narrowText.find("GPU VRAM: unavailable") != std::string::npos &&
+          narrowHeight > wideHeight,
+          "Expected both readouts to fit on separate lines in a narrow window.");
+}
+
 struct TemporaryDirectory {
     std::filesystem::path original = std::filesystem::current_path();
     std::filesystem::path path = std::filesystem::temp_directory_path() /
@@ -86,18 +138,98 @@ struct TemporaryDirectory {
     }
 };
 
-void testDialog() {
-    const GlfwSession glfw;
+auto createTestWindow() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-    const std::unique_ptr<GLFWwindow, decltype(&glfwDestroyWindow)> window(
+    std::unique_ptr<GLFWwindow, decltype(&glfwDestroyWindow)> window(
         glfwCreateWindow(256, 256, "Oswald dialog test", nullptr, nullptr), glfwDestroyWindow);
     check(window != nullptr, "Cannot create UI test OpenGL context.");
     glfwMakeContextCurrent(window.get());
     check(gladLoadGL(glfwGetProcAddress) != 0 && GLAD_GL_VERSION_4_5,
           "UI test requires OpenGL 4.5.");
+    return window;
+}
+
+void testMemoryStatusBarWithDriver() {
+    const GlfwSession glfw;
+    const auto window = createTestWindow();
+    const ImGuiSession imgui;
+    GlobeRenderer renderer(std::filesystem::path(OSWALD_RESOURCE_DIR) / "shaders");
+    const SphericalGridSnapshot small({1000, 0.0, 42});
+    const SphericalGridSnapshot large({2000, 0.0, 42});
+    renderer.UploadGrid(small);
+
+    class ResizeCommand final : public UndoableCommand {
+    public:
+        ResizeCommand(GlobeRenderer& renderer, const SphericalGridSnapshot& before,
+                      const SphericalGridSnapshot& after)
+            : renderer_(renderer), before_(before), after_(after) {}
+        void redo() override { renderer_.UploadGrid(after_); }
+        void undo() override { renderer_.UploadGrid(before_); }
+
+    private:
+        GlobeRenderer& renderer_;
+        const SphericalGridSnapshot& before_;
+        const SphericalGridSnapshot& after_;
+    };
+
+    UndoStack history;
+    MemoryStatusBar statusBar;
+    // Keep the clock fixed so only history changes can trigger fresh readings.
+    const auto render = [&] { return renderMemoryStatusBar(statusBar, 0.0, history, &renderer); };
+    const auto text = render();
+    const auto gpuPosition = text.find("GPU VRAM: ");
+    check(gpuPosition != std::string::npos, "Expected a GPU memory readout.");
+    GLint total = 0;
+    GLint available = -1;
+    if (GLAD_GL_NVX_gpu_memory_info) {
+        glGetIntegerv(GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &total);
+        glGetIntegerv(GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, &available);
+    }
+    if (total > 0 && available >= 0 && available <= total) {
+        const auto gpuText = std::string_view(text).substr(gpuPosition);
+        check(gpuText.find(" / ") != std::string_view::npos &&
+              gpuText.find(" MiB") != std::string_view::npos,
+              "Expected numeric used and total GPU memory readings.");
+    } else {
+        check(text.find("GPU VRAM: unavailable") != std::string::npos,
+              "Expected unavailable VRAM indication for unsupported counters.");
+    }
+
+    const auto terrainMiB = [](const std::string& labels) {
+        constexpr std::string_view prefix = "Terrain buffers: ";
+        const auto pos = labels.find(prefix);
+        check(pos != std::string::npos, "Expected a terrain buffer readout.");
+        return std::stod(labels.substr(pos + prefix.size()));
+    };
+    const auto smallMiB = terrainMiB(text);
+    check(smallMiB > 0.0, "A loaded terrain must report buffer allocations.");
+    history.Execute(std::make_unique<ResizeCommand>(renderer, small, large));
+    const auto edited = render();
+    check(terrainMiB(edited) > smallMiB && edited.find("Undo: 1 / Redo: 0") != std::string::npos,
+          "A larger mesh and new undo entry must be reflected without waiting.");
+    check(history.Undo() && terrainMiB(render()) == smallMiB,
+          "Undo must immediately reflect the smaller mesh.");
+    check(render().find("Undo: 0 / Redo: 1") != std::string::npos,
+          "Undo must immediately expose the redo entry.");
+    check(history.Redo() && terrainMiB(render()) == terrainMiB(edited),
+          "Redo must immediately reflect the larger mesh.");
+    renderer.UploadGrid(small);
+    history.Clear();
+    const auto cleared = render();
+    check(terrainMiB(cleared) == smallMiB && cleared.find("Undo: 0 / Redo: 0") != std::string::npos,
+          "Replacing the grid and clearing history must refresh the bar immediately.");
+    renderer.UploadGrid(large);
+    history.Clear();
+    check(terrainMiB(render()) == terrainMiB(edited),
+          "Grid replacement must refresh the bar even if history was already empty.");
+}
+
+void testDialog(bool densityOnly) {
+    const GlfwSession glfw;
+    const auto window = createTestWindow();
     GlobeRenderer renderer(std::filesystem::path(OSWALD_RESOURCE_DIR) / "shaders");
     SphericalGrid grid({1000, 0.0, 42});
     renderer.UploadGrid(*grid.GetSnapshot());
@@ -285,6 +417,117 @@ void testDialog() {
         frame();
         frame();
     };
+
+    const auto clickDialogItem = [&](const char* windowName, const char* label) {
+        frame();
+        auto* dialog = ImGui::FindWindowByName(windowName);
+        check(dialog && dialog->Active, "Expected project dialog is not active.");
+        auto id = dialog->GetID(label);
+        if (std::string_view(windowName) == "Planet" &&
+            std::string_view(label) != "Apply" && std::string_view(label) != "Cancel") {
+            const auto* tabs = ImGui::GetCurrentContext()->TabBars.GetByKey(dialog->GetID("PlanetTabs"));
+            check(tabs != nullptr, "Planet tabs were not rendered.");
+            id = ImHashStr(label, 0, tabs->SelectedTabId);
+        }
+        const float x = dialog->DC.CursorStartPos.x + 12;
+        const float firstY = dialog->DC.CursorStartPos.y;
+        const float lastY = dialog->Pos.y + dialog->Size.y - 8;
+        for (float y = firstY; y < lastY; y += 4) {
+            ImGui::GetIO().AddMousePosEvent(x, y);
+            frame();
+            if (ImGui::GetCurrentContext()->HoveredId == id) {
+                click(x, y);
+                return;
+            }
+        }
+        throw std::runtime_error(std::string("Project dialog item was not interactive: ") + label);
+    };
+    const auto replaceDialogText = [&](const char* window, const char* label, const char* text) {
+        clickDialogItem(window, label);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        key(ImGuiKey_A);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        ImGui::GetIO().AddInputCharactersUTF8(text);
+        frame();
+        key(ImGuiKey_Tab);
+    };
+    const auto planetTab = [&](const char* label) {
+        frame();
+        auto* dialog = ImGui::FindWindowByName("Planet");
+        check(dialog && dialog->Active, "Planet menu did not open its dialog.");
+        const auto barId = dialog->GetID("PlanetTabs");
+        const auto tabId = ImHashStr(label, 0, barId);
+        const float y = dialog->DC.CursorStartPos.y + ImGui::GetFrameHeight() * 0.5F;
+        for (float x = dialog->DC.CursorStartPos.x + 4; x < dialog->InnerRect.Max.x; x += 4) {
+            ImGui::GetIO().AddMousePosEvent(x, y);
+            frame();
+            if (ImGui::GetCurrentContext()->HoveredId == tabId) {
+                click(x, y);
+                frame();
+                return;
+            }
+        }
+        throw std::runtime_error(std::string("Planet tab is not interactive: ") + label);
+    };
+    const auto enterPointCount = [&] {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        clickDialogItem("Planet", "Point Count (N)");
+        key(ImGuiKey_A);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        ImGui::GetIO().AddInputCharactersUTF8("1100");
+        frame();
+        key(ImGuiKey_Enter);
+    };
+    const auto hasHistoryWarning = [](const char* dialogName) {
+        const auto* dialog = ImGui::FindWindowByName(dialogName);
+        check(dialog && dialog->Active, "Expected dialog is not active.");
+        const auto warningColor = ImGui::GetColorU32(ImVec4(1.0F, 0.72F, 0.32F, 1.0F));
+        return std::ranges::any_of(dialog->DrawList->VtxBuffer,
+            [&](const ImDrawVert& vertex) { return vertex.col == warningColor; });
+    };
+    const auto verifyDensityChange = [&] {
+        grid.SetSelectionWeights(std::vector<float>(grid.GetSnapshot()->GetVertices().size(), 0.25F));
+        selectMenuItem(0, 4, "Planet...");
+        planetTab("Geometry");
+        enterPointCount();
+        check(hasHistoryWarning("Planet") == (ui.GetUndoStack().Size() != 0),
+              "Planet warning did not match the pending density change and history.");
+        replaceDialogText("Planet", "Planet radius (km)", "4000");
+        clickDialogItem("Planet", "Apply");
+        check(!dialogOpen() && grid.GetSnapshot()->GetVertices().size() == 1100 &&
+              grid.GetSnapshot()->GetOptions().pointCount == 1100 &&
+              grid.GetSnapshot()->GetOptions().planetRadius == 4000.0 &&
+              grid.GetSnapshot()->HasSelection(),
+              "Planet Geometry did not regenerate the requested point count with its shared radius.");
+        for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+            check(vertex.elevation == 100.0F && vertex.selectionWeight == 0.25F,
+                  "Planet density change discarded edited terrain or selection.");
+        }
+        renderer.Draw(256, 256);
+    };
+    if (densityOnly) {
+        grid.SetElevations(std::vector<float>(grid.GetSnapshot()->GetVertices().size(), 100.0F));
+        selectMenuItem(0, 4, "Planet...");
+        planetTab("Geometry");
+        enterPointCount();
+        check(!hasHistoryWarning("Planet"), "Planet warned with empty history.");
+        key(ImGuiKey_Escape);
+        check(!dialogOpen(), "Esc did not close the Planet dialog.");
+        grid.SetSelectionWeights(std::vector<float>(grid.GetSnapshot()->GetVertices().size(), 0.25F));
+        selectMenuItem(2, 3, "Clear Selection");
+        shortcut(ImGuiKey_Z);
+        check(!ui.GetUndoStack().CanUndo() && ui.GetUndoStack().CanRedo(),
+              "Expected redo-only history for the regeneration warning test.");
+        selectMenuItem(0, 4, "Planet...");
+        planetTab("Geometry");
+        replaceDialogText("Planet", "Planet radius (km)", "4000");
+        check(!hasHistoryWarning("Planet"), "Planet warned for a radius-only change.");
+        key(ImGuiKey_Escape);
+        check(!dialogOpen(), "Esc did not close the Planet dialog.");
+        verifyDensityChange();
+        check(ui.GetUndoStack().Size() == 0, "Regeneration did not clear history.");
+        return;
+    }
 
     frame();
     frame();
@@ -1124,57 +1367,6 @@ void testDialog() {
         click(x, y);
         frame();
     };
-    const auto clickDialogItem = [&](const char* windowName, const char* label) {
-        frame();
-        auto* dialog = ImGui::FindWindowByName(windowName);
-        check(dialog && dialog->Active, "Expected project dialog is not active.");
-        auto id = dialog->GetID(label);
-        if (std::string_view(windowName) == "Planet" &&
-            std::string_view(label) != "Apply" && std::string_view(label) != "Cancel") {
-            const auto* tabs = ImGui::GetCurrentContext()->TabBars.GetByKey(dialog->GetID("PlanetTabs"));
-            check(tabs != nullptr, "Planet tabs were not rendered.");
-            id = ImHashStr(label, 0, tabs->SelectedTabId);
-        }
-        const float x = dialog->DC.CursorStartPos.x + 12;
-        const float firstY = dialog->DC.CursorStartPos.y;
-        const float lastY = dialog->Pos.y + dialog->Size.y - 8;
-        for (float y = firstY; y < lastY; y += 4) {
-            ImGui::GetIO().AddMousePosEvent(x, y);
-            frame();
-            if (ImGui::GetCurrentContext()->HoveredId == id) {
-                click(x, y);
-                return;
-            }
-        }
-        throw std::runtime_error(std::string("Project dialog item was not interactive: ") + label);
-    };
-    const auto replaceDialogText = [&](const char* window, const char* label, const char* text) {
-        clickDialogItem(window, label);
-        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
-        key(ImGuiKey_A);
-        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
-        ImGui::GetIO().AddInputCharactersUTF8(text);
-        frame();
-        key(ImGuiKey_Tab);
-    };
-    const auto planetTab = [&](const char* label) {
-        frame();
-        auto* dialog = ImGui::FindWindowByName("Planet");
-        check(dialog && dialog->Active, "Planet menu did not open its dialog.");
-        const auto barId = dialog->GetID("PlanetTabs");
-        const auto tabId = ImHashStr(label, 0, barId);
-        const float y = dialog->DC.CursorStartPos.y + ImGui::GetFrameHeight() * 0.5F;
-        for (float x = dialog->DC.CursorStartPos.x + 4; x < dialog->InnerRect.Max.x; x += 4) {
-            ImGui::GetIO().AddMousePosEvent(x, y);
-            frame();
-            if (ImGui::GetCurrentContext()->HoveredId == tabId) {
-                click(x, y);
-                frame();
-                return;
-            }
-        }
-        throw std::runtime_error(std::string("Planet tab is not interactive: ") + label);
-    };
     const auto beforePlanet = grid.GetSnapshot();
     selectMenuItem(0, 4, "Planet...");
     planetTab("Geometry");
@@ -1652,32 +1844,27 @@ void testDialog() {
     for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
         check(vertex.elevation == 100.0F, "Failed Custom fill changed the layer.");
     }
-    selectMenuItem(0, 4, "Planet...");
-    planetTab("Geometry");
-    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
-    clickDialogItem("Planet", "Point Count (N)");
-    key(ImGuiKey_A);
-    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
-    ImGui::GetIO().AddInputCharactersUTF8("1100");
-    frame();
-    key(ImGuiKey_Enter);
-    replaceDialogText("Planet", "Planet radius (km)", "4000");
-    clickDialogItem("Planet", "Apply");
-    check(!dialogOpen() && grid.GetSnapshot()->GetVertices().size() == 1100 &&
-          grid.GetSnapshot()->GetOptions().pointCount == 1100 &&
-          grid.GetSnapshot()->GetOptions().planetRadius == 4000.0,
-          "Planet Geometry did not regenerate the requested point count with its shared radius.");
+    verifyDensityChange();
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool memoryOnly = argc == 2 && std::string_view(argv[1]) == "--memory-status-bar";
+    const bool densityOnly = argc == 2 && std::string_view(argv[1]) == "--planet-density";
+    const char* suite = memoryOnly ? "Memory status bar" :
+                        densityOnly ? "Planet density" : "Raster file dialog";
     try {
-        testDialog();
-        std::cout << "Raster file dialog tests passed.\n";
+        if (memoryOnly) {
+            testMemoryStatusBar();
+            testMemoryStatusBarWithDriver();
+        } else {
+            testDialog(densityOnly);
+        }
+        std::cout << suite << " tests passed.\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "Raster file dialog test failed: " << error.what() << '\n';
+        std::cerr << suite << " test failed: " << error.what() << '\n';
         return 1;
     }
 }

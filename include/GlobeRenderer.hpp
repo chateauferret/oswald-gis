@@ -8,6 +8,7 @@
 #include <glm/glm.hpp>
 
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <span>
 #include <string>
@@ -56,6 +57,7 @@ public:
     bool IsGraticuleEnabled() const { return graticuleEnabled_; }
     void SetEquirectangular(bool enabled) { equirectangular_ = enabled; }
     bool IsEquirectangular() const { return equirectangular_; }
+    std::uint64_t GetTerrainBufferBytes() const;
     void Draw(int framebufferWidth, int framebufferHeight,
               const glm::mat4& modelMatrix = glm::mat4(1.0F), float zoom = 1.0F);
 

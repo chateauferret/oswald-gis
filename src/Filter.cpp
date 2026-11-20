@@ -104,6 +104,45 @@ void validateGlacialErosionSettings(const GlacialErosionSettings& settings) {
     }
 }
 
+bool validFlowDirection(const glm::dvec3& direction) {
+    if (!std::isfinite(direction.x) || !std::isfinite(direction.y) ||
+        !std::isfinite(direction.z)) {
+        return false;
+    }
+    const double length = glm::length(direction);
+    return std::isfinite(length) && length > 0.0;
+}
+
+void validateCratonicGroovingSettings(const CratonicGroovingSettings& settings) {
+    if (!validFlowDirection(settings.iceFlowDirection) ||
+        !std::isfinite(settings.erodibility) || settings.erodibility < 0.0 ||
+        settings.erodibility > 1.0 ||
+        !std::isfinite(settings.grooveCoefficient) || settings.grooveCoefficient < 0.0 ||
+        !std::isfinite(settings.anisotropy) || settings.anisotropy < 0.0) {
+        throw std::invalid_argument(
+            "Cratonic grooving needs a finite nonzero flow direction, erodibility in [0, 1], "
+            "and finite non-negative groove parameters.");
+    }
+}
+
+void validateCratonicScourSettings(const CratonicScourSettings& settings) {
+    if (!validFlowDirection(settings.iceFlowDirection) ||
+        !std::isfinite(settings.erodibility) || settings.erodibility < 0.0 ||
+        settings.erodibility > 1.0 ||
+        !std::isfinite(settings.stossAbrasionCoefficient) ||
+        settings.stossAbrasionCoefficient < 0.0 ||
+        !std::isfinite(settings.pluckingRate) || settings.pluckingRate < 0.0 ||
+        !std::isfinite(settings.cratonElevation) ||
+        settings.cratonElevation < minimumElevation ||
+        settings.cratonElevation > maximumElevation ||
+        !std::isfinite(settings.planationAttenuation) ||
+        settings.planationAttenuation < 0.0) {
+        throw std::invalid_argument(
+            "Cratonic scour needs a finite nonzero flow direction, erodibility in [0, 1], "
+            "and finite non-negative rates with a supported craton elevation.");
+    }
+}
+
 }
 
 void FillFilter::SetSettings(const FillFilterSettings& settings) {
@@ -643,6 +682,166 @@ std::vector<float> GlacialErosionFilter::Apply(
     return result;
 }
 
+void CratonicGroovingFilter::SetSettings(const CratonicGroovingSettings& settings) {
+    validateCratonicGroovingSettings(settings);
+    settings_ = settings;
+}
+
+std::vector<float> CratonicGroovingFilter::Apply(
+    const SphericalGridSnapshot& grid, std::span<const float> elevations) const {
+    validateCratonicGroovingSettings(settings_);
+    validateFilterElevations(grid, elevations, "Cratonic directional grooving");
+    std::vector<float> result(elevations.begin(), elevations.end());
+    if (elevations.empty() || settings_.grooveCoefficient == 0.0 ||
+        settings_.erodibility == 0.0) {
+        return result;
+    }
+
+    const auto& vertices = grid.GetVertices();
+    const auto sinks = erosionSinks(grid, elevations);
+    const auto flowDirection = glm::normalize(settings_.iceFlowDirection);
+    std::vector<double> parallelDistanceSum(vertices.size(), 0.0);
+    std::vector<std::size_t> neighborCounts(vertices.size(), 0);
+    const auto& edges = grid.GetHalfEdges();
+    for (const auto& edge : edges) {
+        const auto source = static_cast<std::size_t>(edge.originVertex);
+        const auto target = static_cast<std::size_t>(
+            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+        const double dot = std::clamp(glm::dot(from, to), -1.0, 1.0);
+        const double distance = grid.GetOptions().planetRadius * std::acos(dot);
+        const glm::dvec3 tangent = to - dot * from;
+        const double tangentLength = glm::length(tangent);
+        if (!std::isfinite(distance) || distance <= 0.0 ||
+            !std::isfinite(tangentLength) || tangentLength <= 0.0) {
+            throw std::runtime_error(
+                "Cratonic grooving encountered an invalid geodesic edge direction.");
+        }
+        glm::dvec3 localFlow = flowDirection - glm::dot(flowDirection, from) * from;
+        const double flowLength = glm::length(localFlow);
+        if (flowLength > 0.0) {
+            localFlow /= flowLength;
+            const double parallelDistance = std::abs(
+                glm::dot(tangent / tangentLength * distance, localFlow));
+            parallelDistanceSum[source] += parallelDistance;
+            if (!std::isfinite(parallelDistanceSum[source])) {
+                throw std::overflow_error(
+                    "Cratonic groove alignment exceeds the supported numeric range.");
+            }
+        }
+        ++neighborCounts[source];
+    }
+
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        if (sinks[i] || neighborCounts[i] == 0) {
+            continue;
+        }
+        const double meanParallelDistance =
+            parallelDistanceSum[i] / static_cast<double>(neighborCounts[i]);
+        const double depth = settings_.grooveCoefficient * settings_.erodibility *
+            (1.0 + settings_.anisotropy * meanParallelDistance);
+        if (!std::isfinite(depth)) {
+            throw std::overflow_error(
+                "Cratonic groove depth exceeds the supported numeric range.");
+        }
+        const double target = std::clamp(static_cast<double>(elevations[i]) - depth,
+            static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
+        const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
+        result[i] = static_cast<float>(elevations[i] + (target - elevations[i]) * weight);
+    }
+    return result;
+}
+
+void CratonicScourFilter::SetSettings(const CratonicScourSettings& settings) {
+    validateCratonicScourSettings(settings);
+    settings_ = settings;
+}
+
+std::vector<float> CratonicScourFilter::Apply(
+    const SphericalGridSnapshot& grid, std::span<const float> elevations) const {
+    validateCratonicScourSettings(settings_);
+    validateFilterElevations(grid, elevations, "Cratonic scour and planation");
+    std::vector<float> result(elevations.begin(), elevations.end());
+    if (elevations.empty()) {
+        return result;
+    }
+
+    const auto& vertices = grid.GetVertices();
+    const auto sinks = erosionSinks(grid, elevations);
+    const auto flowDirection = glm::normalize(settings_.iceFlowDirection);
+    std::vector<double> laplacian(vertices.size(), 0.0);
+    std::vector<glm::dvec3> gradient(vertices.size(), glm::dvec3(0.0));
+    std::vector<std::size_t> neighborCounts(vertices.size(), 0);
+    const auto& edges = grid.GetHalfEdges();
+    for (const auto& edge : edges) {
+        const auto source = static_cast<std::size_t>(edge.originVertex);
+        const auto target = static_cast<std::size_t>(
+            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+        const double dot = std::clamp(glm::dot(from, to), -1.0, 1.0);
+        const double distance = grid.GetOptions().planetRadius * std::acos(dot);
+        const glm::dvec3 tangent = to - dot * from;
+        const double tangentLength = glm::length(tangent);
+        if (!std::isfinite(distance) || distance <= 0.0 ||
+            !std::isfinite(tangentLength) || tangentLength <= 0.0) {
+            throw std::runtime_error(
+                "Cratonic scour encountered an invalid geodesic edge direction.");
+        }
+        const double elevationDifference =
+            static_cast<double>(elevations[target]) - elevations[source];
+        laplacian[source] += elevationDifference;
+        gradient[source] += (elevationDifference / distance) * (tangent / tangentLength);
+        ++neighborCounts[source];
+        if (!std::isfinite(laplacian[source]) ||
+            !std::isfinite(gradient[source].x) || !std::isfinite(gradient[source].y) ||
+            !std::isfinite(gradient[source].z)) {
+            throw std::overflow_error(
+                "Cratonic stoss/lee gradient exceeds the supported numeric range.");
+        }
+    }
+
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        if (sinks[i] || neighborCounts[i] == 0) {
+            continue;
+        }
+        const auto position = glm::normalize(glm::dvec3(vertices[i].position));
+        glm::dvec3 localFlow = flowDirection - glm::dot(flowDirection, position) * position;
+        const double flowLength = glm::length(localFlow);
+        double change = 0.0;
+        if (flowLength > 0.0) {
+            localFlow /= flowLength;
+            const double alpha = glm::dot(
+                gradient[i] / static_cast<double>(neighborCounts[i]), localFlow);
+            if (!std::isfinite(alpha)) {
+                throw std::overflow_error(
+                    "Cratonic stoss/lee slope exceeds the supported numeric range.");
+            }
+            if (alpha > 0.0) {
+                change += settings_.stossAbrasionCoefficient * laplacian[i];
+            } else if (alpha < 0.0) {
+                change -= settings_.pluckingRate * settings_.erodibility * std::abs(alpha);
+            }
+        }
+        double elevation = static_cast<double>(elevations[i]) + change;
+        const double heightAboveCraton =
+            std::max(0.0, elevation - settings_.cratonElevation);
+        elevation = settings_.cratonElevation +
+            (elevation - settings_.cratonElevation) /
+                (1.0 + settings_.planationAttenuation * heightAboveCraton);
+        if (!std::isfinite(elevation)) {
+            throw std::overflow_error(
+                "Cratonic planation exceeds the supported numeric range.");
+        }
+        const double target = std::clamp(elevation,
+            static_cast<double>(minimumElevation), static_cast<double>(maximumElevation));
+        const double weight = grid.HasSelection() ? vertices[i].selectionWeight : 1.0;
+        result[i] = static_cast<float>(elevations[i] + (target - elevations[i]) * weight);
+    }
+    return result;
+}
+
 FilterManager::FilterManager() {
     RegisterFilter(std::make_unique<FillFilter>());
     RegisterFilter(std::make_unique<FillBasinsFilter>());
@@ -650,6 +849,8 @@ FilterManager::FilterManager() {
     RegisterFilter(std::make_unique<PrecipitonFilter>());
     RegisterFilter(std::make_unique<ThermalWeatheringFilter>());
     RegisterFilter(std::make_unique<GlacialErosionFilter>());
+    RegisterFilter(std::make_unique<CratonicGroovingFilter>());
+    RegisterFilter(std::make_unique<CratonicScourFilter>());
     RegisterFilter(std::make_unique<AbsoluteMagnitudeNoiseFilter>());
 }
 

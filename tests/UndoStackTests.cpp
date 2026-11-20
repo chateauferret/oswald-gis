@@ -35,9 +35,13 @@ public:
 void testHistory() {
     int value = 0;
     UndoStack stack;
+    const auto revision = stack.Revision();
     check(!stack.Undo() && !stack.Redo(), "Empty history changed state.");
+    check(stack.Revision() == revision, "Empty undo/redo advanced the revision.");
     stack.Execute(std::make_unique<ValueCommand>(value, 1));
     stack.Execute(std::make_unique<ValueCommand>(value, 2));
+    check(stack.Revision() == revision + 2 && stack.UndoCount() == 2,
+          "Executing commands did not update the history revision and position.");
     check(value == 2 && stack.Size() == 2 && stack.CanUndo() && !stack.CanRedo(),
           "Commands were not applied and recorded.");
     check(stack.Undo() && value == 1, "Undo did not restore the previous state.");
@@ -59,6 +63,7 @@ void testFailedCommandsPreserveHistory() {
     UndoStack stack;
     stack.Execute(std::make_unique<ValueCommand>(value, 1));
     stack.Undo();
+    const auto revision = stack.Revision();
     try {
         stack.Execute(std::make_unique<FailingCommand>());
         throw std::runtime_error("Expected a failing command to throw.");
@@ -68,6 +73,7 @@ void testFailedCommandsPreserveHistory() {
     }
     check(value == 0 && stack.Size() == 1 && stack.CanRedo(),
           "Failed execution changed state or destroyed redo history.");
+    check(stack.Revision() == revision, "Failed execution advanced the history revision.");
     check(stack.Redo() && value == 1, "Redo history was unusable after failed execution.");
 }
 

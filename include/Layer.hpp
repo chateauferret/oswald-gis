@@ -78,6 +78,7 @@ protected:
     void SetValues(std::span<const float> values);
 
 private:
+    friend class SphericalGrid;
     std::vector<float> values_;
 };
 

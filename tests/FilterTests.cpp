@@ -104,13 +104,17 @@ void testValidationAndPluginRegistration() {
                   "Fill filter accepted a mismatched elevation buffer.");
 
     FilterManager manager;
-        check(manager.GetFilters().size() == 7 &&
+        check(manager.GetFilters().size() == 9 &&
           manager.GetFilter("Fill").GetName() == "Fill" &&
           manager.GetFilter("Fill basins").GetName() == "Fill basins" &&
           manager.GetFilter("Incise flow").GetName() == "Incise flow" &&
             manager.GetFilter("Precipiton diffusion").GetName() == "Precipiton diffusion" &&
               manager.GetFilter("Thermal weathering").GetName() == "Thermal weathering" &&
               manager.GetFilter("Glacial erosion").GetName() == "Glacial erosion" &&
+              manager.GetFilter("Cratonic directional grooving").GetName() ==
+                  "Cratonic directional grooving" &&
+              manager.GetFilter("Cratonic scour and planation").GetName() ==
+                  "Cratonic scour and planation" &&
           manager.GetFilter("Absolute Magnitude Noise").GetName() == "Absolute Magnitude Noise",
           "Filter manager did not register or return the built-in plugins.");
     expectInvalid([&] { manager.RegisterFilter(std::make_unique<FillFilter>()); },
@@ -852,6 +856,165 @@ void testGlacialErosion() {
                   "Glacial erosion accepted a mismatched elevation count.");
 }
 
+void testCratonicGrooving() {
+    SphericalGrid model({1000, 0.0, 101});
+    model.SetPlanetRadius(1200.0);
+    const auto size = model.GetSnapshot()->GetVertices().size();
+    std::vector<float> elevations(size);
+    for (std::size_t i = 0; i < size; ++i) {
+        elevations[i] = 100.0F + static_cast<float>((i * 17) % 70);
+    }
+    elevations[0] = -20.0F;
+    CratonicGroovingSettings settings;
+    settings.iceFlowDirection = {0.4, -0.3, 0.8};
+    settings.erodibility = 0.7;
+    settings.grooveCoefficient = 0.2;
+    settings.anisotropy = 0.003;
+    CratonicGroovingFilter filter;
+    filter.SetSettings(settings);
+
+    const auto snapshot = model.GetSnapshot();
+    const auto& vertices = snapshot->GetVertices();
+    const auto& edges = snapshot->GetHalfEdges();
+    const auto direction = glm::normalize(settings.iceFlowDirection);
+    std::vector<double> parallelDistance(size, 0.0);
+    std::vector<std::size_t> counts(size, 0);
+    for (const auto& edge : edges) {
+        const auto source = static_cast<std::size_t>(edge.originVertex);
+        const auto target = static_cast<std::size_t>(
+            edges[static_cast<std::size_t>(edge.nextEdge)].originVertex);
+        const auto from = glm::normalize(glm::dvec3(vertices[source].position));
+        const auto to = glm::normalize(glm::dvec3(vertices[target].position));
+        const double dot = std::clamp(glm::dot(from, to), -1.0, 1.0);
+        const double distance = snapshot->GetOptions().planetRadius * std::acos(dot);
+        const auto tangent = to - dot * from;
+        auto localFlow = direction - glm::dot(direction, from) * from;
+        if (glm::length(localFlow) > 0.0) {
+            localFlow = glm::normalize(localFlow);
+            parallelDistance[source] += std::abs(
+                glm::dot(glm::normalize(tangent) * distance, localFlow));
+        }
+        ++counts[source];
+    }
+    const auto result = filter.Apply(*snapshot, elevations);
+    bool changed = false;
+    for (std::size_t i = 0; i < size; ++i) {
+        double expected = elevations[i];
+        if (i != 0) {
+            const double meanParallelDistance = parallelDistance[i] / counts[i];
+            expected -= settings.grooveCoefficient * settings.erodibility *
+                (1.0 + settings.anisotropy * meanParallelDistance);
+        }
+        check(std::abs(result[i] - expected) < 0.001,
+              "Cratonic grooving disagreed with the directional incision formula.");
+        check(result[i] >= -32767.0F && result[i] <= 32767.0F,
+              "Cratonic grooving exceeded supported elevation limits.");
+        changed |= result[i] != elevations[i];
+    }
+    check(result[0] == elevations[0] && changed,
+          "Cratonic grooving changed a fixed sink or failed to incise terrain.");
+
+    std::vector<float> weights(size, 1.0F);
+    weights[1] = 0.0F;
+    weights[2] = 0.25F;
+    model.SetSelectionWeights(weights);
+    const auto selected = filter.Apply(*model.GetSnapshot(), elevations);
+    check(selected[1] == elevations[1],
+          "Cratonic grooving changed an unselected vertex.");
+    check(std::abs(selected[2] - elevations[2] -
+                   0.25F * (result[2] - elevations[2])) < 0.001F,
+          "Cratonic grooving did not honor selection feathering.");
+
+    for (auto invalid : {CratonicGroovingSettings{glm::dvec3(0.0), 0.5, 1.0, 1.0},
+                         CratonicGroovingSettings{{1.0, 0.0, 0.0}, 1.1, 1.0, 1.0},
+                         CratonicGroovingSettings{{1.0, 0.0, 0.0}, 0.5, -1.0, 1.0}}) {
+        expectInvalid([&] { filter.SetSettings(invalid); },
+                      "Cratonic grooving accepted invalid parameters.");
+    }
+    expectInvalid([&] {
+        filter.Apply(*model.GetSnapshot(), std::span<const float>(elevations).first(1));
+    }, "Cratonic grooving accepted a mismatched elevation count.");
+}
+
+void testCratonicScourAndPlanation() {
+    SphericalGrid model({1000, 0.0, 102});
+    const auto size = model.GetSnapshot()->GetVertices().size();
+    std::vector<float> elevations(size);
+    for (std::size_t i = 0; i < size; ++i) {
+        elevations[i] = 500.0F + static_cast<float>((i * 23) % 700);
+    }
+    elevations[0] = -10.0F;
+    elevations[1] = 100.0F;
+
+    CratonicScourSettings settings;
+    settings.iceFlowDirection = {0.0, 0.0, 1.0};
+    settings.erodibility = 0.6;
+    settings.stossAbrasionCoefficient = 0.0;
+    settings.pluckingRate = 0.0;
+    settings.cratonElevation = 300.0;
+    settings.planationAttenuation = 0.002;
+    CratonicScourFilter filter;
+    filter.SetSettings(settings);
+    const auto result = filter.Apply(*model.GetSnapshot(), elevations);
+    bool planed = false;
+    for (std::size_t i = 0; i < size; ++i) {
+        double expected = elevations[i];
+        if (i != 0) {
+            const double above = elevations[i] - settings.cratonElevation;
+            expected = settings.cratonElevation + above /
+                (1.0 + settings.planationAttenuation * std::max(0.0, above));
+        }
+        check(std::abs(result[i] - expected) < 0.001,
+              "Cratonic planation disagreed with the specified attenuation formula.");
+        check(result[i] >= -32767.0F && result[i] <= 32767.0F,
+              "Cratonic scour exceeded supported elevation limits.");
+        planed |= result[i] < elevations[i];
+    }
+    check(result[0] == elevations[0] && planed,
+          "Cratonic planation changed a fixed sink or failed to truncate high terrain.");
+    check(result[1] == elevations[1],
+          "Cratonic planation moved terrain below its baseline.");
+
+    settings.planationAttenuation = 0.0;
+    settings.stossAbrasionCoefficient = 0.05;
+    settings.pluckingRate = 0.2;
+    filter.SetSettings(settings);
+    const auto scoured = filter.Apply(*model.GetSnapshot(), elevations);
+    bool scouredChangedTerrain = false;
+    for (std::size_t i = 1; i < size; ++i) {
+        scouredChangedTerrain |= scoured[i] != elevations[i];
+    }
+    check(scouredChangedTerrain && scoured[0] == elevations[0],
+          "Cratonic stoss/lee scouring failed or changed a fixed sink.");
+
+    std::vector<float> weights(size, 1.0F);
+    weights[1] = 0.0F;
+    weights[2] = 0.5F;
+    model.SetSelectionWeights(weights);
+    const auto selected = filter.Apply(*model.GetSnapshot(), elevations);
+    check(selected[1] == elevations[1],
+          "Cratonic scour changed an unselected vertex.");
+    check(std::abs(selected[2] - elevations[2] -
+                   0.5F * (scoured[2] - elevations[2])) < 0.001F,
+          "Cratonic scour did not honor selection feathering.");
+
+    auto invalid = settings;
+    invalid.iceFlowDirection = glm::dvec3(0.0);
+    expectInvalid([&] { filter.SetSettings(invalid); },
+                  "Cratonic scour accepted a zero flow direction.");
+    invalid = settings;
+    invalid.planationAttenuation = -1.0;
+    expectInvalid([&] { filter.SetSettings(invalid); },
+                  "Cratonic scour accepted negative planation attenuation.");
+    invalid = settings;
+    invalid.cratonElevation = 32768.0;
+    expectInvalid([&] { filter.SetSettings(invalid); },
+                  "Cratonic scour accepted an unsupported craton elevation.");
+    expectInvalid([&] {
+        filter.Apply(*model.GetSnapshot(), std::span<const float>(elevations).first(1));
+    }, "Cratonic scour accepted a mismatched elevation count.");
+}
+
 void testAbsoluteMagnitudeNoise() {
     SphericalGrid model({1000, 0.0, 99});
     const auto size = model.GetSnapshot()->GetVertices().size();
@@ -939,6 +1102,8 @@ int main() {
         testPrecipitonDiffusion();
         testThermalWeathering();
         testGlacialErosion();
+        testCratonicGrooving();
+        testCratonicScourAndPlanation();
         testAbsoluteMagnitudeNoise();
         std::cout << "Filter tests passed.\n";
         return 0;

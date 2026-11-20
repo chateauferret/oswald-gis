@@ -246,6 +246,25 @@ void GlobeRenderer::UploadGrid(const SphericalGridSnapshot& snapshot) {
     UploadMesh(snapshot.GetVertices(), snapshot.GetTriangleIndices(), snapshot.HasSelection());
 }
 
+std::uint64_t GlobeRenderer::GetTerrainBufferBytes() const {
+    std::uint64_t total = 0;
+    const auto addBuffer = [&](GLuint buffer) {
+        GLint64 bytes = 0;
+        glGetNamedBufferParameteri64v(buffer, GL_BUFFER_SIZE, &bytes);
+        total += static_cast<std::uint64_t>(bytes);
+    };
+    for (const auto buffer : {resources_.positionBuffer, resources_.elevationBuffer,
+                              resources_.compositeElevationBuffer, resources_.selectionBuffer,
+                              resources_.indexBuffer, resources_.wirePositionBuffer,
+                              resources_.wireWeightBuffer}) {
+        addBuffer(buffer);
+    }
+    for (const auto& entry : resources_.layerElevationBuffers) {
+        addBuffer(entry.second);
+    }
+    return total;
+}
+
 void GlobeRenderer::UploadMesh(std::span<const GridVertex> vertices,
                                std::span<const std::uint32_t> indices, bool selectionActive) {
     if (vertices.empty() || indices.empty() || indices.size() % 3 != 0 ||

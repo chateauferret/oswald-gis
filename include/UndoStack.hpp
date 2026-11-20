@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -27,6 +28,7 @@ public:
                         commands_.end());
         commands_.push_back(std::move(command));
         ++cursor_;
+        ++revision_;
     }
 
     bool Undo() {
@@ -35,6 +37,7 @@ public:
         }
         commands_[cursor_ - 1]->undo();
         --cursor_;
+        ++revision_;
         return true;
     }
 
@@ -44,19 +47,25 @@ public:
         }
         commands_[cursor_]->redo();
         ++cursor_;
+        ++revision_;
         return true;
     }
 
     bool CanUndo() const { return cursor_ > 0; }
     bool CanRedo() const { return cursor_ < commands_.size(); }
     std::size_t Size() const { return commands_.size(); }
+    std::size_t UndoCount() const { return cursor_; }
+    std::uint64_t Revision() const { return revision_; }
 
     void Clear() {
         commands_.clear();
         cursor_ = 0;
+        // Callers also clear history when replacing the document or grid.
+        ++revision_;
     }
 
 private:
     std::vector<std::unique_ptr<UndoableCommand>> commands_;
     std::size_t cursor_ = 0;
+    std::uint64_t revision_ = 0;
 };

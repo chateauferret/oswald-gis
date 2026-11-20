@@ -120,41 +120,108 @@ struct RefinedPoint {
     float selectionWeight;
 };
 
+// Cramer's rule for direction = a*x + b*y + c*z. Normalizing the three
+// coefficients gives the planar barycentric coordinates of the radial hit.
+glm::dvec3 radialWeights(glm::dvec3 direction, glm::dvec3 a, glm::dvec3 b, glm::dvec3 c) {
+    return {glm::dot(direction, glm::cross(b, c)),
+            glm::dot(direction, glm::cross(c, a)),
+            glm::dot(direction, glm::cross(a, b))};
+}
+
 RefinedPoint interpolateFacePoint(const std::vector<GridVertex>& vertices,
                                   const std::uint32_t* face) {
     const glm::dvec3 a = unitDirection(glm::dvec3(vertices[face[0]].position));
     const glm::dvec3 b = unitDirection(glm::dvec3(vertices[face[1]].position));
     const glm::dvec3 c = unitDirection(glm::dvec3(vertices[face[2]].position));
     const glm::dvec3 direction = unitDirection(a + b + c);
-    const glm::dvec3 normal = glm::cross(b - a, c - a);
-    const double denominator = glm::dot(normal, direction);
-    if (std::abs(denominator) < 1e-14) {
+    const glm::dvec3 raw = radialWeights(direction, a, b, c);
+    const double sum = raw.x + raw.y + raw.z;
+    if (std::abs(sum) < 1e-14) {
         throw std::runtime_error("Cannot interpolate attributes across a degenerate spherical face.");
     }
-    const glm::dvec3 point = direction * (glm::dot(normal, a) / denominator);
-    const glm::dvec3 v0 = b - a;
-    const glm::dvec3 v1 = c - a;
-    const glm::dvec3 v2 = point - a;
-    const double d00 = glm::dot(v0, v0);
-    const double d01 = glm::dot(v0, v1);
-    const double d11 = glm::dot(v1, v1);
-    const double d20 = glm::dot(v2, v0);
-    const double d21 = glm::dot(v2, v1);
-    const double barycentricDenominator = d00 * d11 - d01 * d01;
-    if (std::abs(barycentricDenominator) < 1e-20) {
-        throw std::runtime_error("Cannot interpolate attributes across a degenerate spherical face.");
-    }
-    const double weightB = (d11 * d20 - d01 * d21) / barycentricDenominator;
-    const double weightC = (d00 * d21 - d01 * d20) / barycentricDenominator;
-    const double weightA = 1.0 - weightB - weightC;
+    const auto weights = raw / sum;
     const auto value = [&](auto member) {
-        return static_cast<float>(weightA * (vertices[face[0]].*member) +
-                                  weightB * (vertices[face[1]].*member) +
-                                  weightC * (vertices[face[2]].*member));
+        return static_cast<float>(weights.x * (vertices[face[0]].*member) +
+                                  weights.y * (vertices[face[1]].*member) +
+                                  weights.z * (vertices[face[2]].*member));
     };
     return {direction, value(&GridVertex::elevation),
             std::clamp(value(&GridVertex::selectionWeight), 0.0F, 1.0F)};
 }
+
+class GridInterpolator {
+public:
+    struct Sample {
+        std::array<std::uint32_t, 3> indices;
+        glm::dvec3 weights;
+
+        float Apply(auto valueAt) const {
+            return static_cast<float>(weights.x * valueAt(indices[0]) +
+                                      weights.y * valueAt(indices[1]) +
+                                      weights.z * valueAt(indices[2]));
+        }
+    };
+
+    explicit GridInterpolator(const SphericalGridSnapshot& source)
+        : source_(source), incidentFaces_(source.GetVertices().size()) {
+        const auto& indices = source_.GetTriangleIndices();
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            incidentFaces_[indices[i]] = static_cast<std::uint32_t>(i / 3);
+        }
+    }
+
+    Sample Locate(glm::vec3 point) const {
+        const auto& vertices = source_.GetVertices();
+        const auto& indices = source_.GetTriangleIndices();
+        const auto& edges = source_.GetHalfEdges();
+        const auto nearest = static_cast<std::uint32_t>(source_.FindNearest(glm::dvec3(point)));
+        if (point == vertices[nearest].position) {
+            return {{nearest, nearest, nearest}, {1.0, 0.0, 0.0}};
+        }
+        const auto faceSample = [&](std::size_t face) {
+            const auto* triangle = indices.data() + 3 * face;
+            return Sample{{triangle[0], triangle[1], triangle[2]},
+                          radialWeights(glm::dvec3(point),
+                              glm::dvec3(vertices[triangle[0]].position),
+                              glm::dvec3(vertices[triangle[1]].position),
+                              glm::dvec3(vertices[triangle[2]].position))};
+        };
+        const auto normalizeHit = [](Sample& sample) {
+            auto& w = sample.weights;
+            const double sum = w.x + w.y + w.z;
+            if (sum <= 0.0 || std::min({w.x, w.y, w.z}) < -1e-9 * sum) {
+                return false;
+            }
+            w = glm::max(w, glm::dvec3(0.0));
+            w /= w.x + w.y + w.z;
+            return true;
+        };
+        // The negative weight identifies the opposite edge to cross.
+        std::size_t face = incidentFaces_[nearest];
+        for (int step = 0; step < 64; ++step) {
+            auto sample = faceSample(face);
+            if (normalizeHit(sample)) {
+                return sample;
+            }
+            const auto& w = sample.weights;
+            const std::size_t opposite = w.x <= w.y && w.x <= w.z ? 0 : (w.y <= w.z ? 1 : 2);
+            const auto& edge = edges[3 * face + (opposite + 1) % 3];
+            face = static_cast<std::size_t>(edges[edge.twinEdge].faceIndex);
+        }
+        // On very irregular meshes, avoid relying on the walk's termination.
+        for (std::size_t i = 0; i < indices.size() / 3; ++i) {
+            auto sample = faceSample(i);
+            if (normalizeHit(sample)) {
+                return sample;
+            }
+        }
+        throw std::runtime_error("Cannot locate a containing face on the previous grid.");
+    }
+
+private:
+    const SphericalGridSnapshot& source_;
+    std::vector<std::uint32_t> incidentFaces_;
+};
 
 void insertHullPoint(std::vector<GridVertex>& vertices,
                      std::vector<std::uint32_t>& indices,
@@ -1020,6 +1087,59 @@ void SphericalGrid::InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot>
         }
     }
     snapshot_.store(std::move(snapshot));
+}
+
+SphericalGrid::ResampledGrid SphericalGrid::PrepareResampledGrid(
+    const GridOptions& options, GridGenerationControl* control) const {
+    const auto source = GetSnapshot();
+    auto target = std::make_shared<SphericalGridSnapshot>(options, control);
+    const GridInterpolator interpolator(*source);
+    ResampledGrid result;
+    std::vector<std::span<const float>> sourceValues;
+    sourceValues.reserve(layers_.size());
+    result.values.resize(layers_.size());
+    std::size_t activeIndex = layers_.size();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        const auto values = layers_[i]->GetValues();
+        if (values.size() != source->vertices_.size()) {
+            throw std::logic_error("Layer values do not match the source mesh.");
+        }
+        sourceValues.push_back(values);
+        result.values[i].reserve(target->vertices_.size());
+        if (layers_[i].get() == activeLayer_) {
+            activeIndex = i;
+        }
+    }
+
+    target->selectionActive_ = source->selectionActive_;
+    for (auto& vertex : target->vertices_) {
+        if (control && control->IsCancelled()) {
+            throw GridGenerationCancelled();
+        }
+        const auto sample = interpolator.Locate(vertex.position);
+        for (std::size_t i = 0; i < sourceValues.size(); ++i) {
+            result.values[i].push_back(sample.Apply([&](auto index) { return sourceValues[i][index]; }));
+        }
+        vertex.elevation = activeIndex < result.values.size() ? result.values[activeIndex].back()
+            : sample.Apply([&](auto index) { return source->vertices_[index].elevation; });
+        if (target->selectionActive_) {
+            vertex.selectionWeight = sample.Apply([&](auto index) {
+                return source->vertices_[index].selectionWeight;
+            });
+        }
+    }
+    result.snapshot = std::move(target);
+    return result;
+}
+
+void SphericalGrid::InstallResampledGrid(ResampledGrid result) {
+    if (!result.snapshot || result.values.size() != layers_.size()) {
+        throw std::invalid_argument("Resampled data do not match the current layers.");
+    }
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        layers_[i]->values_.swap(result.values[i]);
+    }
+    snapshot_.store(std::move(result.snapshot));
 }
 
 void SphericalGrid::SetPlanetRadius(double radiusKilometres) {

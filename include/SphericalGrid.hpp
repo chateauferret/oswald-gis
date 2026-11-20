@@ -139,9 +139,19 @@ struct ProjectMetadata {
 
 class SphericalGrid {
 public:
+    class ResampledGrid {
+        friend class SphericalGrid;
+        std::shared_ptr<const SphericalGridSnapshot> snapshot;
+        std::vector<std::vector<float>> values;
+    };
+
     explicit SphericalGrid(const GridOptions& options = {});
     void GenerateGrid(const GridOptions& options);
     void InstallSnapshot(std::shared_ptr<const SphericalGridSnapshot> snapshot);
+    // Prepare without modifying this grid. Install on the same grid, with no intervening edits.
+    ResampledGrid PrepareResampledGrid(const GridOptions& options,
+                                       GridGenerationControl* control = nullptr) const;
+    void InstallResampledGrid(ResampledGrid result);
     void SetElevations(std::span<const float> elevations);
     void SetPlanetRadius(double radiusKilometres);
     void SetSelectionWeights(std::span<const float> selectionWeights, bool active = true);

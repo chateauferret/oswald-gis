@@ -263,6 +263,8 @@ struct VertexErosionData {
    - Execute Precipiton non-linear sediment diffusion across 1-ring neighbors.
    - Apply Thermal Weathering slope repose enforcement.
 
+The application exposes the two cratonic operators independently as **Cratonic directional grooving** and **Cratonic scour and planation** filters. Both accept a globe-space ice-flow vector, projected onto each vertex's tangent plane, and a configured erodibility weight $W \in [0,1]$. The scour filter estimates the local gradient from its 1-ring neighbors and applies stoss/lee changes before planation. As with other terrain filters, sinks remain fixed and active selections blend the computed displacement.
+
 ---
 
 ## 6. Summary Specification Table

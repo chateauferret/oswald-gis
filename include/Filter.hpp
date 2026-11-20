@@ -137,6 +137,46 @@ private:
     GlacialErosionSettings settings_;
 };
 
+struct CratonicGroovingSettings {
+    glm::dvec3 iceFlowDirection{1.0, 0.0, 0.0};
+    double erodibility = 0.5;
+    double grooveCoefficient = 1.0;
+    double anisotropy = 1.0;
+};
+
+class CratonicGroovingFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Cratonic directional grooving"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+    const CratonicGroovingSettings& GetSettings() const { return settings_; }
+    void SetSettings(const CratonicGroovingSettings& settings);
+
+private:
+    CratonicGroovingSettings settings_;
+};
+
+struct CratonicScourSettings {
+    glm::dvec3 iceFlowDirection{1.0, 0.0, 0.0};
+    double erodibility = 0.5;
+    double stossAbrasionCoefficient = 0.01;
+    double pluckingRate = 0.1;
+    double cratonElevation = 0.0;
+    double planationAttenuation = 0.001;
+};
+
+class CratonicScourFilter final : public Filter {
+public:
+    std::string_view GetName() const override { return "Cratonic scour and planation"; }
+    std::vector<float> Apply(const SphericalGridSnapshot& grid,
+                             std::span<const float> elevations) const override;
+    const CratonicScourSettings& GetSettings() const { return settings_; }
+    void SetSettings(const CratonicScourSettings& settings);
+
+private:
+    CratonicScourSettings settings_;
+};
+
 class FilterManager {
 public:
     FilterManager();

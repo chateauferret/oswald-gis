@@ -600,6 +600,81 @@ void verifyPlanetRadius() {
           "Elevation edits discarded the configured radius.");
 }
 
+void verifyDensityResampling() {
+    SphericalGrid grid({1300, 0.3, 18});
+    const auto plane = [](glm::dvec3 p) { return 1000.0 + glm::dot(p, glm::dvec3(500, 300, -400)); };
+    const auto mask = [](glm::dvec3 p) { return 0.5 + 0.4 * p.z; };
+    std::vector<float> elevations;
+    std::vector<float> selection;
+    for (const auto& vertex : grid.GetSnapshot()->GetVertices()) {
+        elevations.push_back(static_cast<float>(plane(glm::dvec3(vertex.position))));
+        selection.push_back(static_cast<float>(mask(glm::dvec3(vertex.position))));
+    }
+    grid.SetElevations(elevations);
+    auto& other = grid.AddElevationLayer("Other", "default.map", "grayscale.map");
+    grid.SetActiveLayer("Other");
+    for (auto& value : elevations) {
+        value *= -3.0F;
+    }
+    grid.SetElevations(elevations);
+    other.SetBlendMode(LayerBlendMode::Add);
+    grid.SetLayerVisible("Other", false);
+    grid.SetActiveLayer("Elevation");
+    grid.SetSelectionWeights(selection);
+
+    // Test both directions. Each reference hit comes from an independent
+    // ray/plane intersection and triangle-side test.
+    for (const auto count : {1000U, 1700U}) {
+        const auto before = grid.GetSnapshot();
+        GridOptions options{count, 0.5, 23};
+        options.planetRadius = 3000.0;
+        auto prepared = grid.PrepareResampledGrid(options);
+        check(grid.GetSnapshot() == before && other.GetValueCount() == before->GetVertices().size(),
+              "Preparing a density change modified the old grid.");
+        grid.InstallResampledGrid(std::move(prepared));
+        const auto after = grid.GetSnapshot();
+        check(after->GetVertices().size() == count && after->GetOptions().planetRadius == 3000.0 &&
+              after->HasSelection() && grid.GetActiveLayer().GetName() == "Elevation" &&
+              other.GetValueCount() == count && !other.IsVisible() &&
+              other.GetBlendMode() == LayerBlendMode::Add,
+              "Density change did not preserve layer metadata, active layer or selection.");
+        const auto& indices = before->GetTriangleIndices();
+        const auto& vertices = before->GetVertices();
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& vertex = after->GetVertices()[i];
+            check(grid.GetElevationLayer().GetValues()[i] == vertex.elevation &&
+                  std::abs(other.GetValues()[i] + 3.0F * vertex.elevation) < 0.001F,
+                  "Inactive layer did not receive the same linear interpolation.");
+            if (count != 1000 || i % 10 != 0) {
+                continue;
+            }
+            const glm::dvec3 q(vertex.position);
+            bool hitFace = false;
+            for (std::size_t t = 0; t < indices.size(); t += 3) {
+                const glm::dvec3 a(vertices[indices[t]].position);
+                const glm::dvec3 b(vertices[indices[t + 1]].position);
+                const glm::dvec3 c(vertices[indices[t + 2]].position);
+                const auto n = glm::cross(b - a, c - a);
+                if (glm::dot(n, q) <= 0.0) {
+                    continue;
+                }
+                const auto p = q * (glm::dot(n, a) / glm::dot(n, q));
+                if (glm::dot(n, glm::cross(b - a, p - a)) < 0.0 ||
+                    glm::dot(n, glm::cross(c - b, p - b)) < 0.0 ||
+                    glm::dot(n, glm::cross(a - c, p - c)) < 0.0) {
+                    continue;
+                }
+                check(std::abs(vertex.elevation - plane(p)) < 0.0002 &&
+                      std::abs(vertex.selectionWeight - mask(p)) < 0.000001,
+                      "Resampled elevation or selection does not match the affine face data.");
+                hitFace = true;
+                break;
+            }
+            check(hitFace, "Reference ray did not hit an old face.");
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -629,6 +704,7 @@ int main(int argc, char** argv) {
             verifyRelaxation();
             verifyCancellation();
             verifyPlanetRadius();
+            verifyDensityResampling();
         }
         std::cout << "Spherical grid tests passed.\n";
         return 0;

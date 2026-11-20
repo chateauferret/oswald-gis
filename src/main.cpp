@@ -4,6 +4,7 @@
 
 #include "CameraController.hpp"
 #include "GlobeRenderer.hpp"
+#include "MemoryStatusBar.hpp"
 #include "UIManager.hpp"
 
 #include <imgui.h>
@@ -161,6 +162,7 @@ int runApplication() {
     activeUiManager = &ui;
     ui.SetCameraController(&camera);
     ui.SetBrushScriptDirectory(OSWALD_BRUSH_SCRIPT_DIR);
+    MemoryStatusBar memoryStatusBar;
     double previousTime = glfwGetTime();
 
     while (glfwWindowShouldClose(window.get()) == GLFW_FALSE) {
@@ -187,6 +189,7 @@ int runApplication() {
         glClearColor(0.06F, 0.08F, 0.12F, 1.0F);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         renderer.Draw(framebufferWidth, framebufferHeight, camera.GetModelMatrix(), camera.GetZoom());
+        memoryStatusBar.Render(glfwGetTime(), ui.GetUndoStack(), &renderer);
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 

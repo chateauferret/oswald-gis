@@ -178,7 +178,8 @@ foreach(colormap IN LISTS OSWALD_COLORMAP_FILES)
                    COPYONLY)
 endforeach()
 
-add_executable(oswald_gis src/main.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
+add_executable(oswald_gis src/main.cpp src/UIManager.cpp src/RasterFileBrowser.cpp
+    src/MemoryStatusBar.cpp)
 target_compile_definitions(oswald_gis PRIVATE
     GLFW_INCLUDE_NONE
     OSWALD_RESOURCE_DIR="${OSWALD_RESOURCE_DIR}"
@@ -264,7 +265,9 @@ if(BUILD_TESTING)
     target_include_directories(undo_stack_tests PRIVATE include)
     add_test(NAME undo_stack COMMAND undo_stack_tests)
 
-    add_executable(ui_manager_tests tests/UIManagerTests.cpp src/UIManager.cpp src/RasterFileBrowser.cpp)
+    add_executable(ui_manager_tests tests/UIManagerTests.cpp src/UIManager.cpp src/RasterFileBrowser.cpp
+        src/MemoryStatusBar.cpp)
+    target_include_directories(ui_manager_tests PRIVATE src)
     target_link_libraries(ui_manager_tests PRIVATE oswald_view oswald_scripting oswald_controller imgui_lib glfw Threads::Threads)
     target_compile_definitions(ui_manager_tests PRIVATE
         GLFW_INCLUDE_NONE
@@ -273,6 +276,10 @@ if(BUILD_TESTING)
     )
     add_test(NAME raster_file_dialog COMMAND ui_manager_tests)
     set_tests_properties(raster_file_dialog PROPERTIES LABELS gpu TIMEOUT 60)
+    add_test(NAME memory_status_bar COMMAND ui_manager_tests --memory-status-bar)
+    set_tests_properties(memory_status_bar PROPERTIES LABELS gpu TIMEOUT 30)
+    add_test(NAME planet_density COMMAND ui_manager_tests --planet-density)
+    set_tests_properties(planet_density PROPERTIES LABELS gpu TIMEOUT 30)
 
     add_executable(globe_renderer_tests tests/GlobeRendererTests.cpp)
     target_link_libraries(globe_renderer_tests PRIVATE oswald_view glfw)
